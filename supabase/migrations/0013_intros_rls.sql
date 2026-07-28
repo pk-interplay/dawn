@@ -1,0 +1,19 @@
+-- Revive the per-member intro frequency cap.
+--
+-- 0005 created `intros` with a comment saying RLS was "intentionally left
+-- disabled", but the live table had `relrowsecurity = true` with ZERO rows in
+-- pg_policies. Under RLS-with-no-policies every statement from the app's
+-- publishable key is denied, so:
+--
+--   * the `intros` insert in startIntroduction() silently wrote nothing (the
+--     error return was never checked), leaving the table permanently empty; and
+--   * the cadence check in /api/cron/run-matches counts exactly that table, so
+--     it always read 0 and considered every member eligible on every run.
+--
+-- The limiter existed in code but was a no-op in production. Left as-is, turning
+-- on the pg_cron schedule would re-email every member twice a day.
+--
+-- Disabling RLS here matches what 0005 documented and what 0012 did for the
+-- other v1 tables. The same HARDENING note applies: before any public exposure,
+-- re-enable RLS with policies or move server writes to the service-role key.
+alter table intros disable row level security;

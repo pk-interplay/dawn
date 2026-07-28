@@ -1,0 +1,1010 @@
+import type { SupabaseClient } from "@supabase/supabase-js";
+import Anthropic from "@anthropic-ai/sdk";
+import { anthropic, textOf } from "./anthropic";
+import type { MatchDirection, Person } from "./types";
+import {
+  AGENTMAIL_INBOX_ID,
+  sendEmail,
+  sendThreadedOrFresh,
+  type SendResult,
+} from "./agentmail";
+
+// Orchestrates the double opt-in introduction lifecycle on top of a `matches`
+// suggestion: create the introduction + conversation, email an opt-in, ingest
+// replies, and once both sides are in, coordinate a time — recording the result
+// as a durable `relationship` with proximity signal. Designed to be called from
+// the cron routes (Node) so it reuses the app's Anthropic/Supabase clients.
+
+const MODEL = "claude-opus-4-8";
+
+// Single-sided testing mode auto-opts-in person B so the flow can reach scheduling
+// with one real inbox. It must be opted INTO: the previous `!== "false"` default
+// meant forgetting the variable silently marked a real human as having consented to
+// an introduction nobody had asked them about.
+export function isSingleSided(): boolean {
+  return process.env.INTRO_TEST_SINGLE_SIDED === "true";
+}
+
+// Every Dawn-initiated email has to say how to stop it. `people.paused` and the
+// `pause` triage decision handle the request, but nothing told recipients the word
+// to use — so the only discoverable way to opt out was to ignore Dawn and hope.
+const UNSUBSCRIBE_LINE = `\n\n—\nReply "unsubscribe" and I'll stop sending you introductions.`;
+
+function withUnsubscribe(body: string): string {
+  return body.includes("unsubscribe") ? body : body + UNSUBSCRIBE_LINE;
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+// Supabase writes return `{ error }` instead of throwing, and most of the writes
+// below used to discard it. That is how the `intros` insert failed on every single
+// introduction without anyone noticing (RLS was enabled with no policies — see
+// migration 0013), quietly disabling the frequency cap. State-tracking writes now
+// at least leave a trace; the rate-limit write throws (see startIntroduction).
+function warnOnError(op: string, error: { message: string } | null) {
+  if (error) console.error(`[intro-flow] ${op} failed: ${error.message}`);
+}
+
+// ---- Person subset used in prompts / participant records --------------------
+
+export interface Party {
+  id: string;
+  name: string;
+  email: string | null;
+  headline: string | null;
+  timezone: string | null;
+}
+
+export function toParty(p: Person): Party {
+  return { id: p.id, name: p.name, email: p.email, headline: p.headline, timezone: p.timezone };
+}
+
+// ---- Email drafting (Claude, forced-tool; deterministic fallback) -----------
+
+const DRAFT_EMAIL_TOOL: Anthropic.Messages.Tool = {
+  name: "draft_email",
+  description: "Return the finished email Dawn will send.",
+  input_schema: {
+    type: "object",
+    properties: {
+      subject: { type: "string", description: "A short, specific subject line." },
+      body: { type: "string", description: "The full plain-text email body, signed off as Dawn." },
+    },
+    required: ["subject", "body"],
+  },
+};
+
+async function draftEmail(system: string, user: string): Promise<{ subject: string; body: string } | null> {
+  try {
+    const resp = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 900,
+      system,
+      tools: [DRAFT_EMAIL_TOOL],
+      tool_choice: { type: "tool", name: "draft_email" },
+      messages: [{ role: "user", content: user }],
+    });
+    const tool = resp.content.find(
+      (b): b is Anthropic.Messages.ToolUseBlock => b.type === "tool_use" && b.name === "draft_email",
+    );
+    if (!tool) return null;
+    const { subject, body } = tool.input as { subject: string; body: string };
+    return { subject, body };
+  } catch {
+    return null;
+  }
+}
+
+export async function draftOptInEmail(helped: Party, suggested: Party, rationale: string) {
+  const drafted = await draftEmail(
+    `You are Dawn, a warm, concise professional-networking agent. You write short, natural plain-text emails. No markdown, no placeholders like "[Name]" — ready to send as-is.`,
+    `Draft a double opt-in introduction email to ${helped.name}. You want to introduce them to ${suggested.name}` +
+      `${suggested.headline ? ` (${suggested.headline})` : ""}. Reason this is a strong match: ${rationale}. ` +
+      `Explain the value briefly and ask if they'd be open to the intro — tell them to just reply "yes" and you'll coordinate a time. Sign off as Dawn.`,
+  );
+  if (drafted) return drafted;
+  return {
+    subject: `An intro idea for you — ${suggested.name}`,
+    body:
+      `Hi ${helped.name},\n\n` +
+      `I came across ${suggested.name}${suggested.headline ? ` (${suggested.headline})` : ""} and think you two should meet. ` +
+      `${rationale}\n\n` +
+      `Would you be open to an introduction? Just reply "yes" and I'll coordinate a time that works.\n\n— Dawn`,
+  };
+}
+
+/**
+ * The second half of double opt-in: person A has said yes, now ask person B.
+ *
+ * Framed differently from A's invite on purpose. B did not ask for anything and may
+ * never have heard of Dawn, so the email has to establish who's asking, that A has
+ * already agreed, and what's in it for B — without implying B has committed to
+ * anything. This email did not exist before: B was auto-opted-in and never contacted.
+ */
+export async function draftSecondSideOptInEmail(helped: Party, suggested: Party, rationale: string) {
+  const drafted = await draftEmail(
+    `You are Dawn, a warm, concise professional-networking agent. You write short, natural plain-text emails. No markdown, no placeholders like "[Name]" — ready to send as-is.`,
+    `Draft an introduction request to ${suggested.name}, who has NOT heard from you before in this thread. ` +
+      `${helped.name}${helped.headline ? ` (${helped.headline})` : ""} has already said they would like to meet them. ` +
+      `Reason the two are a strong match: ${rationale}. ` +
+      `Briefly introduce yourself as an agent that makes introductions, say who wants to meet them and why it could be worth their time, ` +
+      `and make clear nothing is scheduled and they are free to decline. Ask them to reply "yes" if they're open to it and you'll coordinate a time. Sign off as Dawn.`,
+  );
+  if (drafted) return drafted;
+  return {
+    subject: `${helped.name} would like to meet you`,
+    body:
+      `Hi ${suggested.name},\n\n` +
+      `I'm Dawn — I make introductions between people who should know each other. ` +
+      `${helped.name}${helped.headline ? ` (${helped.headline})` : ""} would like to meet you. ` +
+      `${rationale}\n\n` +
+      `Nothing is scheduled and there's no obligation. If you're open to it, just reply "yes" and I'll find a time that suits you both.\n\n— Dawn`,
+  };
+}
+
+async function draftSchedulingEmail(helped: Party, suggested: Party) {
+  const tzNote = [helped.timezone, suggested.timezone].filter(Boolean).join(" and ") || "their timezones";
+  const drafted = await draftEmail(
+    `You are Dawn, coordinating a first meeting between two people who both said yes to an intro. Warm, concise, plain text, ready to send.`,
+    `Both ${helped.name} and ${suggested.name} are keen to meet, and BOTH are recipients of this email. Address them both by name. ` +
+      `Propose exactly three specific meeting time options over the next two weeks (spread across days), account for ${tzNote}, and ask them to reply with the one that works. Keep it short and sign off as Dawn.`,
+  );
+  if (drafted) return drafted;
+  return {
+    subject: `Let's find a time — ${helped.name} & ${suggested.name}`,
+    body:
+      `Hi ${helped.name} and ${suggested.name},\n\n` +
+      `Great news — you're both up for connecting!\n\n` +
+      `Here are a few times to get started (let me know which works):\n` +
+      `• Tue 10:00am\n• Wed 2:00pm\n• Thu 4:30pm\n\n` +
+      `Reply with your pick and I'll lock it in.\n\n— Dawn`,
+  };
+}
+
+// ---- Reply intent parsing (Claude, structured) ------------------------------
+
+export type PreferenceKind = "wants" | "avoids" | "timing" | "format" | "intro_style";
+
+/** A durable, reusable belief about someone — not a one-off fact about one intro. */
+export interface PreferenceSignal {
+  kind: PreferenceKind;
+  value: string;
+  confidence: number;
+}
+
+export interface ReplyIntent {
+  opted_in: "yes" | "no" | "unclear";
+  proposed_times: string[];
+  chosen_time: string | null;
+  summary: string;
+  // Everything below was previously thrown away. `decline_reason` and
+  // `preference_signals` are what let matching improve instead of repeating
+  // itself; `requests_pause` and `off_topic` are what let the inbox say no.
+  decline_reason: string | null;
+  preference_signals: PreferenceSignal[];
+  requests_pause: boolean;
+  off_topic: boolean;
+}
+
+const PREFERENCE_KINDS = ["wants", "avoids", "timing", "format", "intro_style"] as const;
+
+const INTENT_SCHEMA = {
+  type: "object",
+  properties: {
+    opted_in: { type: "string", enum: ["yes", "no", "unclear"] },
+    proposed_times: { type: "array", items: { type: "string" } },
+    chosen_time: { type: ["string", "null"] },
+    summary: { type: "string" },
+    decline_reason: { type: ["string", "null"] },
+    preference_signals: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          kind: { type: "string", enum: PREFERENCE_KINDS },
+          value: { type: "string" },
+          confidence: { type: "number" },
+        },
+        required: ["kind", "value", "confidence"],
+        additionalProperties: false,
+      },
+    },
+    requests_pause: { type: "boolean" },
+    off_topic: { type: "boolean" },
+  },
+  required: [
+    "opted_in",
+    "proposed_times",
+    "chosen_time",
+    "summary",
+    "decline_reason",
+    "preference_signals",
+    "requests_pause",
+    "off_topic",
+  ],
+  additionalProperties: false,
+} as const;
+
+export interface ReplyContext {
+  /** Whether this reply arrived inside a live introduction thread. */
+  inIntroduction?: boolean;
+  /** Who Dawn suggested, so the model can tell "not them" from "not now". */
+  suggestedName?: string | null;
+}
+
+/**
+ * One model call classifies the whole reply: the state-machine fields the intro
+ * flow needs, the durable preference signal the reranker will later consume, and
+ * the two gating booleans. Deliberately not split into separate calls — inbound
+ * email is the highest-volume LLM surface in the product and every extra call is
+ * paid per message received.
+ */
+export async function parseReplyIntent(
+  replyText: string,
+  context: ReplyContext = {},
+): Promise<ReplyIntent> {
+  const contextLine = context.inIntroduction
+    ? `This reply arrived inside a live introduction thread${
+        context.suggestedName ? ` where Dawn suggested ${context.suggestedName}` : ""
+      }.`
+    : `This reply did NOT arrive inside a live introduction thread.`;
+
+  try {
+    const resp = await anthropic.messages.create(
+      {
+        model: MODEL,
+        max_tokens: 900,
+        output_config: { format: { type: "json_schema", schema: INTENT_SCHEMA } },
+        messages: [
+          {
+            role: "user",
+            content:
+              `Someone emailed Dawn, a professional-networking agent that proposes introductions. Classify their message.\n\n` +
+              `${contextLine}\n\n` +
+              `Message:\n"""${replyText}"""\n\n` +
+              `opted_in: "yes" if they're clearly open to the intro/meeting, "no" if declining, "unclear" otherwise.\n` +
+              `proposed_times: any specific times THEY suggested. chosen_time: the single time they picked from options offered, else null.\n` +
+              `summary: one short sentence.\n` +
+              `decline_reason: if they declined, the actual reason in their own terms ("already knows them", "wrong stage", "not hiring right now"), else null. Do not invent a reason they didn't give.\n` +
+              `preference_signals: durable, reusable preferences worth remembering for FUTURE introductions. ` +
+              `"wants" / "avoids" describe kinds of people or opportunities; "timing" describes when they do or don't want intros; ` +
+              `"format" describes how they like to meet; "intro_style" describes how they want Dawn to approach them. ` +
+              `Only include something that would still be true next month — a reaction to this one person is not a preference. ` +
+              `Set confidence near 1.0 when they stated it outright and near 0.3 when you are inferring it. Return an empty array if nothing durable was said.\n` +
+              `requests_pause: true if they want Dawn to stop emailing them, unsubscribe, or take a break.\n` +
+              `off_topic: true if they are asking Dawn for something outside proposing and coordinating introductions — general questions, research, advice, or an open request to be introduced to someone unspecified.`,
+          },
+        ],
+      },
+      { timeout: 30_000 },
+    );
+    const parsed = JSON.parse(textOf(resp)) as ReplyIntent;
+    // The model can still omit array/boolean fields; normalise so callers and the
+    // DB writes downstream never see undefined.
+    return {
+      ...parsed,
+      proposed_times: parsed.proposed_times ?? [],
+      preference_signals: (parsed.preference_signals ?? []).filter(
+        (s) => s && PREFERENCE_KINDS.includes(s.kind) && typeof s.value === "string" && s.value.trim(),
+      ),
+      decline_reason: parsed.decline_reason ?? null,
+      requests_pause: Boolean(parsed.requests_pause),
+      off_topic: Boolean(parsed.off_topic),
+    };
+  } catch {
+    // Heuristic fallback so the flow never dead-ends. It cannot infer preferences,
+    // so it returns none rather than guessing — a wrong belief is worse than none.
+    const yes = /\b(yes|sure|sounds good|love to|happy to|let's|coffee|meet)\b/i.test(replyText);
+    const no = /\b(no|not interested|pass|decline|can't|cannot)\b/i.test(replyText);
+    const pause = /\b(unsubscribe|stop emailing|stop sending|opt out|take me off|pause)\b/i.test(replyText);
+    return {
+      opted_in: no ? "no" : yes ? "yes" : "unclear",
+      proposed_times: [],
+      chosen_time: null,
+      summary: "Heuristic classification (LLM parse unavailable).",
+      decline_reason: null,
+      preference_signals: [],
+      requests_pause: pause,
+      off_topic: false,
+    };
+  }
+}
+
+// ---- Outcome + preference persistence ---------------------------------------
+
+/**
+ * Close a conversation once its introduction can no longer move.
+ *
+ * `conversations.state` has existed since 0010 and nothing ever set it to
+ * 'closed'. Left open, a booked or declined thread stays a live binding target:
+ * the inbound fallback (which picks the most recent OPEN conversation a sender
+ * participates in) would keep resolving new replies onto a dead introduction.
+ */
+async function closeIntroductionConversations(client: SupabaseClient, introductionId: string) {
+  // Scoped to the introduction, not a single conversation: double opt-in gives each
+  // side its own AgentMail thread, so closing only the one a reply arrived on would
+  // leave the other still open and bindable.
+  const { error } = await client
+    .from("conversations")
+    .update({ state: "closed", updated_at: nowIso() })
+    .eq("introduction_id", introductionId);
+  warnOnError("conversations update (closed)", error);
+}
+
+function clamp01(n: number): number {
+  if (!Number.isFinite(n)) return 0.5;
+  return Math.min(1, Math.max(0, n));
+}
+
+/**
+ * Write the real-world outcome of an introduction back onto its `matches` row.
+ *
+ * This is the link that makes matching evolve rather than repeat itself.
+ * `fetchRejectedIds` and `fetchCalibration` (src/lib/candidates.ts) both read
+ * `matches.status`, and both are already wired into the run-matches cron — but
+ * until now nothing ever wrote a status from an actual email reply. Every run
+ * started from the same blank slate and could happily re-suggest someone who had
+ * already said no.
+ */
+export async function recordMatchOutcome(
+  client: SupabaseClient,
+  args: { matchId: string | null; aId: string; bId: string; status: "accepted" | "rejected" },
+) {
+  if (args.matchId) {
+    const { error } = await client
+      .from("matches")
+      .update({ status: args.status })
+      .eq("id", args.matchId);
+    warnOnError(`matches.status -> ${args.status}`, error);
+    return;
+  }
+  // Introductions started from the admin UI (and the three seeded before this
+  // existed) can have a null match_id. Fall back to the canonical pair columns,
+  // which are unique per pair as of migration 0003.
+  const low = args.aId < args.bId ? args.aId : args.bId;
+  const high = args.aId < args.bId ? args.bId : args.aId;
+  const { error } = await client
+    .from("matches")
+    .update({ status: args.status })
+    .eq("person_low", low)
+    .eq("person_high", high);
+  warnOnError(`matches.status -> ${args.status} (by pair)`, error);
+}
+
+/**
+ * Persist durable preference signal extracted from a reply.
+ *
+ * Deliberately does NOT store `decline_reason`. The classifier already separates
+ * the two: the reason someone turned down ONE person ("already knows them") versus
+ * the reusable rules that reason implies ("only operators at Series B or later"),
+ * which arrive as `preference_signals`. Filing the former as an `avoids` preference
+ * produced entries like avoid "already knows them" — useless as a filter and actively
+ * misleading in the matching prompt. The reason is still preserved verbatim on
+ * `messages.parsed` and `inbound_events.classification`, and the pair itself is
+ * excluded via `matches.status = 'rejected'`.
+ *
+ * Upserts, so someone repeating themselves across replies doesn't accumulate
+ * duplicate beliefs (unique on person_id + kind + value — see 0015).
+ */
+export async function recordPreferences(
+  client: SupabaseClient,
+  args: {
+    personId: string;
+    signals: PreferenceSignal[];
+    evidenceMessageId?: string | null;
+  },
+): Promise<number> {
+  const rows = args.signals
+    .map((s) => ({
+      person_id: args.personId,
+      kind: s.kind,
+      value: s.value.trim().replace(/\s+/g, " "),
+      source: "email_reply",
+      confidence: clamp01(s.confidence),
+      evidence_message_id: args.evidenceMessageId ?? null,
+      updated_at: nowIso(),
+    }))
+    .filter((r) => r.value.length > 0);
+
+  if (!rows.length) return 0;
+  const { error } = await client
+    .from("person_preferences")
+    .upsert(rows, { onConflict: "person_id,kind,value" });
+  warnOnError("person_preferences upsert", error);
+  return error ? 0 : rows.length;
+}
+
+/**
+ * Honour an unsubscribe. `people.paused` has existed since 0007 and is checked by
+ * the run-matches scan, but nothing ever set it — there was no way for a member to
+ * make Dawn stop.
+ */
+export async function pausePerson(client: SupabaseClient, personId: string) {
+  const { error } = await client
+    .from("people")
+    .update({ paused: true })
+    .eq("id", personId);
+  warnOnError("people.paused -> true", error);
+}
+
+// ---- Relationship + interaction helpers -------------------------------------
+
+export async function upsertRelationship(
+  client: SupabaseClient,
+  aId: string,
+  bId: string,
+  patch: { status?: string; source?: string; strengthBump?: number } = {},
+) {
+  const low = aId < bId ? aId : bId;
+  const high = aId < bId ? bId : aId;
+  const { data: existing } = await client
+    .from("relationships")
+    .select("*")
+    .eq("person_low", low)
+    .eq("person_high", high)
+    .maybeSingle();
+
+  if (existing) {
+    const { data, error } = await client
+      .from("relationships")
+      .update({
+        status: patch.status ?? existing.status,
+        last_interaction_at: nowIso(),
+        strength: Math.min(1, Number(existing.strength) + (patch.strengthBump ?? 0)),
+        updated_at: nowIso(),
+      })
+      .eq("id", existing.id)
+      .select()
+      .single();
+    warnOnError("relationships update", error);
+    return data;
+  }
+
+  const { data, error } = await client
+    .from("relationships")
+    .insert({
+      person_a_id: aId,
+      person_b_id: bId,
+      status: patch.status ?? "introduced",
+      source: patch.source ?? "dawn_intro",
+      strength: Math.min(1, 0.1 + (patch.strengthBump ?? 0)),
+    })
+    .select()
+    .single();
+  warnOnError("relationships insert", error);
+  return data;
+}
+
+export async function logInteraction(
+  client: SupabaseClient,
+  e: {
+    relationship_id: string | null;
+    person_id: string;
+    counterparty_id: string | null;
+    type: "intro_sent" | "opted_in" | "meeting_scheduled" | "meeting_completed" | "message";
+    weight?: number;
+    metadata?: Record<string, unknown>;
+  },
+) {
+  const { error } = await client.from("interactions").insert({
+    relationship_id: e.relationship_id,
+    person_id: e.person_id,
+    counterparty_id: e.counterparty_id ?? null,
+    type: e.type,
+    weight: e.weight ?? 0.1,
+    metadata: e.metadata ?? {},
+  });
+  warnOnError(`interactions insert (${e.type})`, error);
+}
+
+// ---- Kick off an introduction (called by the run-matches cron) --------------
+
+export interface StartIntroParams {
+  helped: Person; // person A — the member we're helping
+  suggested: Person; // person B — the suggested match
+  matchId?: string | null;
+  direction: MatchDirection;
+  rationale: string;
+}
+
+export interface StartIntroResult {
+  introductionId: string;
+  conversationId: string;
+  threadId: string | null;
+  state: string;
+  simulated: boolean;
+  emailedTo: string | null;
+  /** Set when the opt-in email failed to send; the introduction is `expired`. */
+  sendError?: string;
+}
+
+export async function startIntroduction(
+  client: SupabaseClient,
+  p: StartIntroParams,
+): Promise<StartIntroResult> {
+  const singleSided = isSingleSided();
+  const helped = toParty(p.helped);
+  const suggested = toParty(p.suggested);
+
+  // 1. Introduction row. In single-sided test mode, person B is auto-opted-in
+  //    so the flow can reach scheduling with a single real recipient.
+  const { data: intro, error: iErr } = await client
+    .from("introductions")
+    .insert({
+      match_id: p.matchId ?? null,
+      person_a_id: helped.id,
+      person_b_id: suggested.id,
+      state: "proposed",
+      rationale: p.rationale,
+      b_response: singleSided ? "yes" : "pending",
+    })
+    .select()
+    .single();
+  if (iErr) throw new Error(iErr.message);
+
+  // 2. Conversation (the persisted email thread).
+  const { data: convo, error: cErr } = await client
+    .from("conversations")
+    .insert({
+      introduction_id: intro.id,
+      inbox_id: AGENTMAIL_INBOX_ID,
+      purpose: "opt_in",
+      participants: [
+        { person_id: helped.id, email: helped.email, role: "helped" },
+        { person_id: suggested.id, email: suggested.email, role: "suggested" },
+      ],
+    })
+    .select()
+    .single();
+  if (cErr) throw new Error(cErr.message);
+
+  // 3. Append to the intros log BEFORE sending. This row is the rate-limit ledger
+  //    that /api/cron/run-matches counts to honour each member's intro_cadence, so
+  //    it must be durable before we cause an irreversible side effect. Failing
+  //    closed (no email) is far cheaper than failing open (re-emailing every member
+  //    on every run) — which is precisely what happened while RLS was silently
+  //    rejecting this insert. A spurious row if the send later fails is harmless:
+  //    it costs one skipped cadence window, and `introductions` records the truth.
+  const { error: introsErr } = await client.from("intros").insert({
+    requester_ref: helped.id,
+    introduced_to_id: suggested.id,
+    rationale: p.rationale,
+    channel: "email",
+  });
+  if (introsErr) {
+    throw new Error(
+      `Refusing to send: could not record this intro in the rate-limit ledger (${introsErr.message}).`,
+    );
+  }
+
+  // 4. Draft + send the opt-in email to person A only (testing).
+  const draft = await draftOptInEmail(helped, suggested, p.rationale);
+  // Compute the outgoing body ONCE and persist that exact string. Sending
+  // withUnsubscribe(body) while storing the bare draft makes `messages` a record of
+  // an email that was never sent — and the unsubscribe footer is the one part you
+  // most need to be able to prove you included.
+  const outgoing = withUnsubscribe(draft.body);
+  let send: SendResult = { messageId: null, threadId: null, simulated: true };
+  let sendError: string | null = null;
+  if (helped.email) {
+    // sendEmail throws on an AgentMail 4xx/5xx/timeout. Left unhandled it escapes
+    // startIntroduction into the /api/cron/run-matches try block, which 500s the
+    // WHOLE batch — one bad send would silently skip every remaining member.
+    // Contain it here so the batch continues, and mark this one introduction
+    // terminal below so the pair stays retryable on the next run.
+    try {
+      send = await sendEmail({ to: [helped.email], subject: draft.subject, text: outgoing });
+    } catch (err) {
+      sendError = err instanceof Error ? err.message : String(err);
+      console.error(`[intro-flow] opt-in send failed for ${helped.email}: ${sendError}`);
+    }
+  }
+
+  // 4a. Nothing reached person A. Do not record an outbound message or advance to
+  //     `a_invited` — both would claim a delivery that never happened. Marking the
+  //     introduction `expired` (terminal) frees the pair to be retried, rather than
+  //     stranding it in a non-terminal state that the duplicate guard treats as
+  //     active for the next 7 days. The `intros` ledger row from step 3 stands: it
+  //     costs this member one cadence window, which is the documented trade.
+  if (sendError !== null) {
+    warnOnError(
+      "introductions update (send failed)",
+      (
+        await client
+          .from("introductions")
+          .update({ state: "expired", updated_at: nowIso() })
+          .eq("id", intro.id)
+      ).error,
+    );
+    warnOnError(
+      "conversations update (send failed)",
+      (
+        await client
+          .from("conversations")
+          .update({ state: "closed", updated_at: nowIso() })
+          .eq("id", convo.id)
+      ).error,
+    );
+    return {
+      introductionId: intro.id,
+      conversationId: convo.id,
+      threadId: null,
+      state: "expired",
+      simulated: false,
+      emailedTo: null,
+      sendError,
+    };
+  }
+
+  // 5. Persist the outbound message + thread id, advance state.
+  warnOnError(
+    "messages insert (opt-in)",
+    (
+      await client.from("messages").insert({
+        conversation_id: convo.id,
+        agentmail_message_id: send.messageId,
+        direction: "outbound",
+        from_email: AGENTMAIL_INBOX_ID,
+        to_emails: helped.email ? [helped.email] : [],
+        subject: draft.subject,
+        body: outgoing,
+      })
+    ).error,
+  );
+  warnOnError(
+    "conversations update (thread id)",
+    (
+      await client
+        .from("conversations")
+        .update({ thread_id: send.threadId, subject: draft.subject, updated_at: nowIso() })
+        .eq("id", convo.id)
+    ).error,
+  );
+  warnOnError(
+    "introductions update (a_invited)",
+    (
+      await client
+        .from("introductions")
+        .update({ state: "a_invited", updated_at: nowIso() })
+        .eq("id", intro.id)
+    ).error,
+  );
+
+  // 6. Seed the relationship + first interaction.
+  const rel = await upsertRelationship(client, helped.id, suggested.id, {
+    status: "introduced",
+    source: "dawn_intro",
+    strengthBump: 0.05,
+  });
+  await logInteraction(client, {
+    relationship_id: rel?.id ?? null,
+    person_id: helped.id,
+    counterparty_id: suggested.id,
+    type: "intro_sent",
+    weight: 0.15,
+  });
+
+  return {
+    introductionId: intro.id,
+    conversationId: convo.id,
+    threadId: send.threadId,
+    state: "a_invited",
+    simulated: send.simulated,
+    emailedTo: helped.email,
+  };
+}
+
+// ---- Second-side invite (the other half of double opt-in) -------------------
+
+/**
+ * Ask person B whether they're open to the introduction A just accepted.
+ *
+ * B gets their OWN conversation row and therefore its own AgentMail thread. Two
+ * reasons: B's reply must not land in A's thread (each side's opt-in is private to
+ * them), and inbound triage binds replies by `thread_id` — a single shared thread id
+ * could not tell A's reply from B's. `conversations.introduction_id` is a plain FK,
+ * so several conversations per introduction is already supported.
+ *
+ * Returns whether an email actually went out.
+ */
+async function inviteSecondSide(
+  client: SupabaseClient,
+  p: { introductionId: string; helped: Party; suggested: Party; rationale: string },
+): Promise<boolean> {
+  const { data: convo, error: cErr } = await client
+    .from("conversations")
+    .insert({
+      introduction_id: p.introductionId,
+      inbox_id: AGENTMAIL_INBOX_ID,
+      purpose: "opt_in",
+      participants: [
+        { person_id: p.suggested.id, email: p.suggested.email, role: "suggested" },
+        { person_id: p.helped.id, email: p.helped.email, role: "helped" },
+      ],
+    })
+    .select()
+    .single();
+  if (cErr) {
+    warnOnError("conversations insert (second side)", cErr);
+    return false;
+  }
+
+  const draft = await draftSecondSideOptInEmail(p.helped, p.suggested, p.rationale);
+  const outgoing = withUnsubscribe(draft.body);
+  const send = await sendThreadedOrFresh({
+    replyToMessageId: null, // B has no prior message to thread onto.
+    to: [p.suggested.email],
+    subject: draft.subject,
+    text: outgoing,
+  });
+
+  warnOnError(
+    "messages insert (second-side opt-in)",
+    (
+      await client.from("messages").insert({
+        conversation_id: convo.id,
+        agentmail_message_id: send.messageId,
+        direction: "outbound",
+        from_email: AGENTMAIL_INBOX_ID,
+        to_emails: p.suggested.email ? [p.suggested.email] : [],
+        subject: draft.subject,
+        body: outgoing,
+      })
+    ).error,
+  );
+  warnOnError(
+    "conversations update (second-side thread id)",
+    (
+      await client
+        .from("conversations")
+        .update({ thread_id: send.threadId, subject: draft.subject, updated_at: nowIso() })
+        .eq("id", convo.id)
+    ).error,
+  );
+
+  return send.delivered;
+}
+
+// ---- Advance an introduction when a reply arrives (called by /api/agent/inbound)
+
+export interface AdvanceResult {
+  state: string;
+  action:
+    | "opted_in_waiting"
+    | "invited_second_side"
+    | "proposed_times"
+    | "scheduled"
+    | "declined"
+    | "noop";
+  note: string;
+}
+
+/**
+ * Apply an inbound reply to its introduction and move the state machine forward.
+ * `replierId` is which participant replied; `replyToMessageId` is the AgentMail
+ * message id to reply on (kept threaded). Returns what action was taken.
+ */
+export async function advanceOnReply(
+  client: SupabaseClient,
+  args: {
+    introductionId: string;
+    conversationId: string;
+    replierId: string;
+    intent: ReplyIntent;
+    replyToMessageId: string | null;
+    /** Row id of the stored inbound `messages` record, for preference provenance. */
+    replyMessageRowId?: string | null;
+  },
+): Promise<AdvanceResult> {
+  const { data: intro } = await client
+    .from("introductions")
+    .select("*")
+    .eq("id", args.introductionId)
+    .single();
+  if (!intro) return { state: "unknown", action: "noop", note: "introduction not found" };
+
+  const isA = args.replierId === intro.person_a_id;
+  const respField = isA ? "a_response" : "b_response";
+
+  // Whatever the outcome, anything durable the member said is worth keeping.
+  // People often reveal a preference while accepting, not only while declining.
+  await recordPreferences(client, {
+    personId: args.replierId,
+    signals: args.intent.preference_signals,
+    evidenceMessageId: args.replyMessageRowId ?? null,
+  });
+
+  if (args.intent.opted_in === "no") {
+    warnOnError(
+      "introductions update (declined)",
+      (
+        await client
+          .from("introductions")
+          .update({ [respField]: "no", state: "declined", updated_at: nowIso() })
+          .eq("id", intro.id)
+      ).error,
+    );
+    // Close the loop: mark the underlying suggestion rejected so the reranker's
+    // exclusion list and calibration examples pick this up on the next run.
+    await recordMatchOutcome(client, {
+      matchId: intro.match_id ?? null,
+      aId: intro.person_a_id,
+      bId: intro.person_b_id,
+      status: "rejected",
+    });
+    await closeIntroductionConversations(client, intro.id);
+    return {
+      state: "declined",
+      action: "declined",
+      note: args.intent.decline_reason
+        ? `Participant declined: ${args.intent.decline_reason}`
+        : "Participant declined.",
+    };
+  }
+
+  // A reply that picks a time while we are already scheduling is a BOOKING, not a
+  // fresh opt-in, and must be checked before the generic "yes" branch. "Wednesday
+  // 2pm works great" classifies as opted_in: "yes", which used to re-enter the
+  // both-opted-in branch and propose times all over again — so `scheduled` was
+  // unreachable from any natural reply and the flow could loop indefinitely.
+  const isBooking = intro.state === "scheduling" && Boolean(args.intent.chosen_time);
+
+  if (!isBooking && args.intent.opted_in === "yes") {
+    const aResp = isA ? "yes" : intro.a_response;
+    const bResp = isA ? intro.b_response : "yes";
+    const bothIn = aResp === "yes" && bResp === "yes";
+
+    // Load both parties for a scheduling draft.
+    const { data: people } = await client
+      .from("people")
+      .select("id, name, email, headline, timezone")
+      .in("id", [intro.person_a_id, intro.person_b_id]);
+    const byId = new Map((people ?? []).map((p) => [p.id, p as Party]));
+    const helped = byId.get(intro.person_a_id)!;
+    const suggested = byId.get(intro.person_b_id)!;
+
+    // Record opt-in on the relationship.
+    const rel = await upsertRelationship(client, intro.person_a_id, intro.person_b_id, {
+      status: bothIn ? "connected" : "introduced",
+      strengthBump: 0.2,
+    });
+    await logInteraction(client, {
+      relationship_id: rel?.id ?? null,
+      person_id: args.replierId,
+      counterparty_id: isA ? intro.person_b_id : intro.person_a_id,
+      type: "opted_in",
+      weight: 0.25,
+    });
+
+    if (!bothIn) {
+      // A said yes and B has never been contacted → this is the moment to ask B.
+      // Previously the flow just parked here waiting for a reply from someone who
+      // had never received an email, until expire-intros swept it.
+      if (isA && intro.b_response === "pending") {
+        const invited = await inviteSecondSide(client, {
+          introductionId: intro.id,
+          helped,
+          suggested,
+          rationale: intro.rationale ?? "You have overlapping interests.",
+        });
+        warnOnError(
+          "introductions update (b_invited)",
+          (
+            await client
+              .from("introductions")
+              .update({ a_response: "yes", state: "b_invited", updated_at: nowIso() })
+              .eq("id", intro.id)
+          ).error,
+        );
+        return {
+          state: "b_invited",
+          action: "invited_second_side",
+          note: invited
+            ? `${helped.name} is in; asked ${suggested.name} if they're open to it.`
+            : `${helped.name} is in, but ${suggested.name} has no reachable email address.`,
+        };
+      }
+
+      warnOnError(
+        "introductions update (one side opted in)",
+        (
+          await client
+            .from("introductions")
+            .update({ [respField]: "yes", state: isA ? "a_opted_in" : "b_opted_in", updated_at: nowIso() })
+            .eq("id", intro.id)
+        ).error,
+      );
+      return { state: isA ? "a_opted_in" : "b_opted_in", action: "opted_in_waiting", note: "One side in; awaiting the other." };
+    }
+
+    // Both in → propose times to BOTH parties and move to scheduling. This used to
+    // send only to person A while the drafted body addressed them both, so A would
+    // read "you're both up for connecting" and act on times B had never seen.
+    const draft = await draftSchedulingEmail(helped, suggested);
+    const schedulingBody = withUnsubscribe(draft.body);
+    const recipients = [helped.email, suggested.email].filter((e): e is string => Boolean(e));
+    const send = await sendThreadedOrFresh({
+      // Deliberately NOT threaded. AgentMail's reply() takes no recipient list — it
+      // answers whoever sent the parent — so threading here would deliver the
+      // proposed times to one side only, which is the exact bug being fixed. A fresh
+      // send is the only way to address both parties.
+      replyToMessageId: null,
+      to: recipients,
+      subject: draft.subject,
+      text: schedulingBody,
+    });
+    warnOnError(
+      "messages insert (scheduling)",
+      (
+        await client.from("messages").insert({
+          conversation_id: args.conversationId,
+          agentmail_message_id: send.messageId,
+          direction: "outbound",
+          from_email: AGENTMAIL_INBOX_ID,
+          to_emails: recipients,
+          subject: draft.subject,
+          body: schedulingBody,
+        })
+      ).error,
+    );
+    warnOnError(
+      "introductions update (scheduling)",
+      (
+        await client
+          .from("introductions")
+          .update({ a_response: aResp, b_response: bResp, state: "scheduling", updated_at: nowIso() })
+          .eq("id", intro.id)
+      ).error,
+    );
+    warnOnError(
+      "conversations update (scheduling)",
+      (
+        await client
+          .from("conversations")
+          .update({ purpose: "scheduling", updated_at: nowIso() })
+          .eq("id", args.conversationId)
+      ).error,
+    );
+
+    return { state: "scheduling", action: "proposed_times", note: "Both opted in; proposed meeting times." };
+  }
+
+  // Already scheduling and they picked a time → lock it in.
+  if (isBooking) {
+    const rel = await upsertRelationship(client, intro.person_a_id, intro.person_b_id, {
+      status: "met",
+      strengthBump: 0.3,
+    });
+    await logInteraction(client, {
+      relationship_id: rel?.id ?? null,
+      person_id: args.replierId,
+      counterparty_id: isA ? intro.person_b_id : intro.person_a_id,
+      type: "meeting_scheduled",
+      weight: 0.4,
+      metadata: { chosen_time: args.intent.chosen_time },
+    });
+    warnOnError(
+      "introductions update (scheduled)",
+      (
+        await client
+          .from("introductions")
+          .update({ state: "scheduled", updated_at: nowIso() })
+          .eq("id", intro.id)
+      ).error,
+    );
+    // A meeting actually booked is the strongest positive signal the product gets;
+    // feed it back so the reranker's calibration examples include real wins.
+    await recordMatchOutcome(client, {
+      matchId: intro.match_id ?? null,
+      aId: intro.person_a_id,
+      bId: intro.person_b_id,
+      status: "accepted",
+    });
+    await closeIntroductionConversations(client, intro.id);
+    return { state: "scheduled", action: "scheduled", note: `Locked in: ${args.intent.chosen_time}` };
+  }
+
+  return { state: intro.state, action: "noop", note: "No state change (unclear reply)." };
+}

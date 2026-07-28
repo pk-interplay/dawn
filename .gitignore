@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.next/
+.env
+.env.local
+
+# Supabase CLI scratch — pooler-url embeds the database password.
+supabase/.temp/
+
+# Per-machine tool state, not shared config.
+.claude/settings.local.json
