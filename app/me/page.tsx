@@ -7,8 +7,9 @@ import { Check, Handshake, Loader2, LogOut, Sparkles, Users } from "lucide-react
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { clearMember, loadMember, type GeneratedProfile } from "@/lib/member";
+import { clearMember, type GeneratedProfile } from "@/lib/member";
 import { signOut, useAuth } from "../lib/useAuth";
+import { useMember } from "../lib/useMember";
 
 interface Stats {
   intros: number;
@@ -27,28 +28,25 @@ interface Connection {
 
 export default function Me() {
   const router = useRouter();
-  const { user, loading: authLoading } = useAuth();
+  const { user } = useAuth();
+  const { member, loading, signedIn } = useMember();
   const [profile, setProfile] = useState<GeneratedProfile | null>(null);
   const [stats, setStats] = useState<Stats | null>(null);
   const [connections, setConnections] = useState<Connection[] | null>(null);
-  const [ready, setReady] = useState(false);
   const [showUpgrade, setShowUpgrade] = useState(true);
 
-  // Require a signed-in session to view the dashboard.
+  // The dashboard needs both a session and a member. Wait for the lookup to
+  // settle before redirecting — bouncing on the cache alone is what sent
+  // already-onboarded members on a new device back through /join.
   useEffect(() => {
-    if (!authLoading && !user) {
-      router.replace("/login");
-    }
-  }, [authLoading, user, router]);
+    if (loading) return;
+    if (!signedIn) router.replace("/login");
+    else if (!member) router.replace("/join");
+  }, [loading, signedIn, member, router]);
 
   useEffect(() => {
-    const member = loadMember();
-    if (!member) {
-      router.replace("/join");
-      return;
-    }
+    if (!member) return;
     setProfile(member.profile);
-    setReady(true);
 
     fetch(`/api/me/${member.id}/stats`)
       .then((res) => res.json())
@@ -69,9 +67,9 @@ export default function Me() {
       .catch(() => {
         /* connections are best-effort */
       });
-  }, [router]);
+  }, [member]);
 
-  if (authLoading || !user || !ready || !profile) {
+  if (loading || !user || !profile) {
     return (
       <main className="flex min-h-screen items-center justify-center">
         <Loader2 className="text-muted-foreground size-5 animate-spin" />
@@ -80,6 +78,7 @@ export default function Me() {
   }
 
   async function handleSignOut() {
+    clearMember();
     await signOut();
     router.replace("/login");
   }
@@ -158,8 +157,10 @@ export default function Me() {
       <div className="text-center">
         <button
           onClick={() => {
+            // ?redo keeps /join from bouncing straight back here off the server
+            // lookup — the member is asking to rebuild the profile on purpose.
             clearMember();
-            router.replace("/join");
+            router.replace("/join?redo=1");
           }}
           className="text-muted-foreground hover:text-foreground text-xs underline underline-offset-4"
         >

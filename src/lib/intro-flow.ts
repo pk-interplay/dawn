@@ -2,6 +2,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import Anthropic from "@anthropic-ai/sdk";
 import { anthropic, textOf } from "./anthropic";
 import type { MatchDirection, Person } from "./types";
+import { MEETING_FORMATS, type MeetingFormat } from "../../lib/onboarding";
 import {
   AGENTMAIL_INBOX_ID,
   sendEmail,
@@ -55,10 +56,19 @@ export interface Party {
   email: string | null;
   headline: string | null;
   timezone: string | null;
+  /** Only used to decide whether an in-person meeting is worth proposing. */
+  location: string | null;
 }
 
 export function toParty(p: Person): Party {
-  return { id: p.id, name: p.name, email: p.email, headline: p.headline, timezone: p.timezone };
+  return {
+    id: p.id,
+    name: p.name,
+    email: p.email,
+    headline: p.headline,
+    timezone: p.timezone,
+    location: p.location ?? null,
+  };
 }
 
 // ---- Email drafting (Claude, forced-tool; deterministic fallback) -----------
@@ -144,14 +154,137 @@ export async function draftSecondSideOptInEmail(helped: Party, suggested: Party,
   };
 }
 
-async function draftSchedulingEmail(helped: Party, suggested: Party) {
+/**
+ * The formats this person said they'd accept, as the fixed `MEETING_FORMATS`
+ * values. Empty for anyone who onboarded before the format question existed, or
+ * who skipped it — which the caller reads as "no opinion", not "refuses everything".
+ */
+async function fetchMeetingFormats(
+  client: SupabaseClient,
+  personId: string,
+): Promise<Set<string>> {
+  const { data, error } = await client
+    .from("person_preferences")
+    .select("value")
+    .eq("person_id", personId)
+    .eq("kind", "format")
+    .eq("active", true);
+  warnOnError("person_preferences format read", error);
+  return new Set((data ?? []).map((r) => r.value as string));
+}
+
+/**
+ * What Dawn should propose, given what both people said they'd accept.
+ *
+ * Only an overlap counts. One person wanting coffee is not a reason to propose it
+ * to someone who asked for async email — and where there's no overlap at all (or
+ * nobody has answered) the honest move is to fall back to times, which is what
+ * every intro did before this existed.
+ */
+function sharedFormats(a: Set<string>, b: Set<string>): MeetingFormat[] {
+  // MEETING_FORMATS is ordered by how much of a commitment each one is, so this
+  // comes back warmest-first: propose the biggest thing they've BOTH agreed to
+  // rather than defaulting to the most cautious.
+  return MEETING_FORMATS.filter((format) => a.has(format) && b.has(format));
+}
+
+/**
+ * `people.location` is free text, so this is a deliberately conservative check —
+ * it only says yes when both sides wrote the same thing.
+ *
+ * The exclusion list matters more than the comparison. "Remote" is the common
+ * value for someone with no fixed city, and two people who both wrote it are the
+ * *least* likely pair to share a neighbourhood — matching on it would invite two
+ * strangers on different continents out for coffee. A false negative here just
+ * means Dawn proposes a call, which is the behaviour we had anyway.
+ */
+const NOT_A_PLACE = new Set(["remote", "anywhere", "distributed", "global", "n/a", "unknown"]);
+
+function inSameCity(a: string | null, b: string | null): boolean {
+  const left = a?.trim().toLowerCase();
+  const right = b?.trim().toLowerCase();
+  if (!left || !right) return false;
+  if (NOT_A_PLACE.has(left) || NOT_A_PLACE.has(right)) return false;
+  return left === right;
+}
+
+async function draftSchedulingEmail(
+  client: SupabaseClient,
+  helped: Party,
+  suggested: Party,
+) {
   const tzNote = [helped.timezone, suggested.timezone].filter(Boolean).join(" and ") || "their timezones";
+
+  const [helpedFormats, suggestedFormats] = await Promise.all([
+    fetchMeetingFormats(client, helped.id),
+    fetchMeetingFormats(client, suggested.id),
+  ]);
+  const sameCity = inSameCity(helped.location, suggested.location);
+
+  // Coffee is the one format that needs a second fact to be sensible: two people
+  // who both like coffee but live apart still need a call. When that's the case the
+  // answer isn't the generic fallback — it's the next thing they both agreed to,
+  // which for most people is a video call they already ticked.
+  const shared = sharedFormats(helpedFormats, suggestedFormats);
+  const format =
+    shared[0] === "in_person_coffee" && !sameCity ? (shared[1] ?? null) : (shared[0] ?? null);
+
+  let formatInstruction: string;
+  if (format === "in_person_coffee") {
+    formatInstruction =
+      `They have both said they'd like to meet for coffee in person, and they are both in ${helped.location}. ` +
+      `Propose coffee: suggest three specific day-and-time options over the next two weeks, and ask them to settle on a spot ` +
+      `convenient for both of them — do not invent a venue yourself.`;
+  } else if (format === "phone_call") {
+    formatInstruction =
+      `They have both said they'd prefer a phone call over video. Propose exactly three specific time options over the next two ` +
+      `weeks (spread across days) and mention it's just a call, so no link is needed.`;
+  } else if (format === "async_email") {
+    formatInstruction =
+      `Neither of them wants to start with a meeting — they both said they'd rather begin over email. Do NOT propose times. ` +
+      `Instead, introduce them to each other properly in this thread and invite them to take it from here by replying, ` +
+      `noting they can ask me to find a time whenever they want one.`;
+  } else {
+    // Includes video_call, no overlap, and nobody having answered.
+    formatInstruction =
+      `Propose exactly three specific meeting time options over the next two weeks (spread across days) and ask them to reply ` +
+      `with the one that works.`;
+  }
+
   const drafted = await draftEmail(
     `You are Dawn, coordinating a first meeting between two people who both said yes to an intro. Warm, concise, plain text, ready to send.`,
     `Both ${helped.name} and ${suggested.name} are keen to meet, and BOTH are recipients of this email. Address them both by name. ` +
-      `Propose exactly three specific meeting time options over the next two weeks (spread across days), account for ${tzNote}, and ask them to reply with the one that works. Keep it short and sign off as Dawn.`,
+      `${formatInstruction} Account for ${tzNote}. Keep it short and sign off as Dawn.`,
   );
   if (drafted) return drafted;
+
+  // Fallbacks, for when the model call fails. Only the async case needs its own:
+  // proposing times to two people who both asked not to meet yet is worse than
+  // sending nothing useful.
+  if (format === "async_email") {
+    return {
+      subject: `${helped.name} & ${suggested.name} — introducing you two`,
+      body:
+        `Hi ${helped.name} and ${suggested.name},\n\n` +
+        `You're both up for connecting, and you both mentioned you'd rather start over email — so here you are.\n\n` +
+        `${helped.name}${helped.headline ? `: ${helped.headline}` : ""}\n` +
+        `${suggested.name}${suggested.headline ? `: ${suggested.headline}` : ""}\n\n` +
+        `Reply here and take it from there. If you'd like me to find a time later, just ask.\n\n— Dawn`,
+    };
+  }
+  // `format` can only be coffee at this point if they're co-located — the selection
+  // above already dropped it otherwise.
+  if (format === "in_person_coffee") {
+    return {
+      subject: `Coffee? — ${helped.name} & ${suggested.name}`,
+      body:
+        `Hi ${helped.name} and ${suggested.name},\n\n` +
+        `Great news — you're both up for connecting, and you're both in ${helped.location}, so coffee seems right.\n\n` +
+        `A few times that could work:\n` +
+        `• Tue 10:00am\n• Wed 2:00pm\n• Thu 4:30pm\n\n` +
+        `Reply with your pick and somewhere convenient for you both.\n\n— Dawn`,
+    };
+  }
   return {
     subject: `Let's find a time — ${helped.name} & ${suggested.name}`,
     body:
@@ -922,7 +1055,7 @@ export async function advanceOnReply(
     // Both in → propose times to BOTH parties and move to scheduling. This used to
     // send only to person A while the drafted body addressed them both, so A would
     // read "you're both up for connecting" and act on times B had never seen.
-    const draft = await draftSchedulingEmail(helped, suggested);
+    const draft = await draftSchedulingEmail(client, helped, suggested);
     const schedulingBody = withUnsubscribe(draft.body);
     const recipients = [helped.email, suggested.email].filter((e): e is string => Boolean(e));
     const send = await sendThreadedOrFresh({

@@ -1,6 +1,8 @@
-// Client-side "who am I" for the v0 prototype. There is no auth yet, so a
-// member's identity (their people.id) plus the profile Dawn generated is kept
-// in localStorage. This is what lets us skip re-onboarding on return visits.
+// Client-side cache of "who am I": a member's identity (their people.id) plus the
+// profile Dawn generated. The authoritative answer comes from GET /api/me, which
+// resolves the row from the signed-in account — this only saves that round trip on
+// return visits. `userId` is stored alongside so a cache written by one account is
+// never shown to another on a shared browser.
 
 export interface GeneratedProfile {
   name: string;
@@ -16,6 +18,8 @@ export interface GeneratedProfile {
 export interface StoredMember {
   id: string;
   profile: GeneratedProfile;
+  /** auth.users id this cache belongs to; absent in caches written before /api/me. */
+  userId?: string;
 }
 
 export const MEMBER_STORAGE_KEY = "dawn_member";

@@ -9,3 +9,5 @@ supabase/.temp/
 
 # Per-machine tool state, not shared config.
 .claude/settings.local.json
+.vercel
+.env*

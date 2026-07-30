@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import "dotenv/config";
+import "./env";
 
 export const anthropic = new Anthropic();
 

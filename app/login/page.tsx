@@ -5,25 +5,24 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Loader2, Sparkles } from "lucide-react";
 
-import { useAuth } from "../lib/useAuth";
 import { AuthForm } from "../components/AuthForm";
-import { loadMember } from "@/lib/member";
+import { useMember } from "../lib/useMember";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
 export default function Login() {
   const router = useRouter();
-  const { user, loading } = useAuth();
+  const { member, loading, signedIn } = useMember();
   const [awaitingEmail, setAwaitingEmail] = useState(false);
 
-  // Once signed in, go to the dashboard if this device is already onboarded,
+  // Once signed in, go to the dashboard if this account has already onboarded,
   // otherwise into onboarding to build a profile.
   useEffect(() => {
-    if (!loading && user) {
-      router.replace(loadMember() ? "/me" : "/join");
+    if (!loading && signedIn) {
+      router.replace(member ? "/me" : "/join");
     }
-  }, [loading, user, router]);
+  }, [loading, signedIn, member, router]);
 
-  if (loading || user) {
+  if (loading || signedIn) {
     return (
       <main className="flex min-h-screen items-center justify-center">
         <Loader2 className="text-muted-foreground size-6 animate-spin" />

@@ -1,7 +1,12 @@
 import { NextResponse } from "next/server";
 import { db } from "../../../../lib/db";
 import type { Person } from "../../../../../src/lib/types";
-import { fetchCandidates, fetchCalibration } from "../../../../../src/lib/candidates";
+import {
+  fetchCandidates,
+  fetchCalibration,
+  fetchPreferences,
+  fetchRecentHistory,
+} from "../../../../../src/lib/candidates";
 import { rerank, validateMatches } from "../../../../../src/lib/rerank";
 
 const SHORTLIST_MAX = 5;
@@ -90,13 +95,22 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
       return NextResponse.json({ mode: "ranked", matches: [], saved, trace });
     }
 
-    const calibration = await fetchCalibration(db, person.id);
+    // Same three sources of learned signal the cron path uses. Without the last
+    // two, this view ranked on the profile alone and silently disagreed with the
+    // intros Dawn actually sends.
+    const [calibration, preferences, history] = await Promise.all([
+      fetchCalibration(db, person.id),
+      fetchPreferences(db, person.id),
+      fetchRecentHistory(db, person.id),
+    ]);
     trace.push(
       `Sending ${candidates.length} candidates to Claude to rerank and write rationale` +
         (calibration.length ? ` (with ${calibration.length} past accepted/rejected example(s) for calibration)` : "") +
+        (preferences.length ? ` (with ${preferences.length} stated preference(s))` : "") +
+        (history.length ? ` (with ${history.length} recent repl(ies))` : "") +
         `…`,
     );
-    const ranked = await rerank(person, candidates, calibration);
+    const ranked = await rerank(person, candidates, calibration, preferences, history);
     const { valid, notes } = validateMatches(ranked, candidates);
     trace.push(...notes);
     trace.push(
@@ -145,8 +159,12 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
       return NextResponse.json({ inserted: 0, corrected: 0, dropped: 0 });
     }
 
-    const calibration = await fetchCalibration(db, person.id);
-    const ranked = await rerank(person, candidates, calibration);
+    const [calibration, preferences, history] = await Promise.all([
+      fetchCalibration(db, person.id),
+      fetchPreferences(db, person.id),
+      fetchRecentHistory(db, person.id),
+    ]);
+    const ranked = await rerank(person, candidates, calibration, preferences, history);
     const { valid, notes } = validateMatches(ranked, candidates);
     const corrected = notes.filter((n) => n.startsWith("Corrected")).length;
     const dropped = notes.filter((n) => n.startsWith("Dropped")).length;

@@ -9,7 +9,10 @@
     "start": "next start",
     "seed": "tsx src/scripts/seed.ts",
     "personas": "tsx src/scripts/demo-personas.ts",
+    "personas:ecosystem": "tsx src/scripts/ecosystem-personas.ts",
     "match": "tsx src/scripts/match.ts",
+    "cron:local": "tsx src/scripts/local-cron.ts",
+    "auth:config": "tsx src/scripts/configure-auth.ts",
     "mcp": "tsx src/mcp/server.ts"
   },
   "dependencies": {
@@ -25,6 +28,7 @@
     "clsx": "^2.1.1",
     "dotenv": "^17.2.3",
     "lucide-react": "^1.26.0",
+    "motion": "^12.42.2",
     "next": "^16.2.11",
     "openai": "^6.7.0",
     "p-limit": "^7.1.1",

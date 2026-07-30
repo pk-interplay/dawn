@@ -47,7 +47,12 @@ interface InboundBody {
   event_type?: string;
   type?: string;
   message?: InboundMessage;
+  /** Set by the Edge Function from the event type; see UNAUTH_EVENT. */
+  authenticated?: boolean;
 }
+
+/** AgentMail's event for mail whose sending domain published no passing SPF/DKIM. */
+const UNAUTH_EVENT = "message.received.unauthenticated";
 
 function firstDefined(...vals: (string | undefined)[]): string | null {
   for (const v of vals) if (v) return v;
@@ -202,10 +207,24 @@ export async function POST(req: Request) {
   try {
     const body = (await req.json()) as InboundBody;
     const eventType = body.event_type ?? body.type;
-    // The Edge Function already filters message.sent; guard here too.
-    if (eventType && eventType !== "message.received") {
+    // The Edge Function already filters message.sent; guard here too. Both received
+    // variants are accepted — AgentMail routes mail from domains without passing
+    // SPF/DKIM to `message.received.unauthenticated`, and refusing those here would
+    // drop real replies from any member whose domain isn't set up (see triage's
+    // `authenticated` handling for how that mail is then constrained).
+    if (eventType && eventType !== "message.received" && eventType !== UNAUTH_EVENT) {
       return NextResponse.json({ ok: true, ignored: eventType });
     }
+
+    // Trust the Edge Function's explicit flag when present; otherwise infer from the
+    // event name. Undefined stays undefined — triage treats "unknown" as
+    // authenticated, so the CLI scripts and older payloads keep working.
+    const authenticated =
+      typeof body.authenticated === "boolean"
+        ? body.authenticated
+        : eventType === UNAUTH_EVENT
+          ? false
+          : undefined;
 
     const msg = body.message;
     if (!msg) return NextResponse.json({ error: "No message in payload" }, { status: 400 });
@@ -222,6 +241,7 @@ export async function POST(req: Request) {
       fromRaw,
       subject,
       text,
+      authenticated,
     });
 
     // Log BEFORE dispatching. If dispatch throws, the audit row still exists and
@@ -240,6 +260,15 @@ export async function POST(req: Request) {
       case "rate_limited":
         // Nothing to do beyond leaving the audit row. Deliberately silent: replying
         // to a rate-limited or looping sender is how you build an email loop.
+        break;
+
+      case "unverified_sender":
+        // Silent on purpose. This is an unauthenticated message claiming to be a
+        // member, with no Dawn thread behind it — i.e. either a spoof attempt or a
+        // member writing in cold from a domain we can't verify. Replying would
+        // confirm to a spoofer that the address they guessed is a real member, and
+        // the audit row is enough to spot the honest case in /admin/monitor and
+        // reach out by hand.
         break;
 
       case "non_member": {

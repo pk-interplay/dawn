@@ -1,4 +1,4 @@
-import "dotenv/config";
+import "../lib/env";
 import Anthropic from "@anthropic-ai/sdk";
 import { findPeopleTool, runFindPeople, type FindInput } from "./findTool";
 

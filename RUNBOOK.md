@@ -42,6 +42,7 @@ Set these on the deployment (see `.env.example` for the full annotated list):
 | `INBOUND_AUTOREPLY` | `true` — otherwise an unsubscribe is honoured silently, with no acknowledgement to a real colleague |
 | `INBOUND_MAX_PER_HOUR` | `20`. Counted per person, not per address, so your persona replies don't share one budget — but you'll be answering several personas an hour |
 | `ADMIN_EMAILS` / `ADMIN_EMAIL_DOMAINS` | your address / your domain, for `/admin/monitor` |
+| `RESEND_API_KEY`, `AUTH_SENDER_EMAIL` | required for password reset — see step 2b |
 | `MAIL_REDIRECT_TO` | **blank.** Set, it swallows your teammates' introductions into your own inbox |
 | `INTRO_TEST_SINGLE_SIDED` | **blank.** Set, it records person B as having consented to an introduction they were never shown |
 
@@ -53,6 +54,34 @@ Does your mail provider support plus-addressing? Send yourself a test at
 (`people.email` is unique) that all land in one mailbox, and plus tags are how that
 works. Google Workspace and most providers do this; if yours doesn't, use per-persona
 aliases and set `DEMO_PERSONA_INBOX` accordingly.
+
+## 2b. Auth email (password reset)
+
+Intro email goes out through AgentMail. Auth email — the password-reset link behind
+`/forgot-password` — goes out through Supabase, which needs its own SMTP. Resend
+provides it:
+
+```sh
+vercel integration add resend/resend-email   # accept the marketplace terms in the browser once
+vercel env pull                              # brings RESEND_API_KEY into .env.local
+# In Resend: Domains → add your sending domain and set the DNS records.
+# Then set AUTH_SENDER_EMAIL to an address on it, and SUPABASE_ACCESS_TOKEN locally.
+npm run auth:config                          # prints the current Supabase auth config
+npm run auth:config -- --apply               # writes SMTP + the redirect allow list
+```
+
+Two things go wrong quietly here:
+
+- **An unverified sending domain.** Resend refuses the message and Supabase reports
+  only "error sending recovery email". Verify the domain before testing.
+- **A missing redirect URL.** `<APP_URL>/reset-password` must be in the allow list, or
+  Supabase drops the tokens and every reset reads as an invalid link. The script writes
+  both the deployed and localhost variants; add `AUTH_PREVIEW_URL_PATTERN` if you test
+  on preview deployments.
+
+Leaving `RESEND_API_KEY` unset is not neutral: Supabase falls back to its built-in
+mailer, which is capped around 2 emails/hour project-wide and can refuse anyone who
+isn't a project member — so the third teammate to forget their password gets nothing.
 
 ## 3. Migrations
 

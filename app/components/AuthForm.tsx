@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { Loader2, MailCheck } from "lucide-react";
 
 import { supabaseBrowser } from "../lib/supabase-browser";
@@ -30,6 +31,7 @@ export function AuthForm({
   const [mode, setMode] = useState<Mode>(initialMode);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -44,6 +46,8 @@ export function AuthForm({
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (loading) return;
+    // The inline message under the confirm field is already showing at this point.
+    if (mode === "signup" && password !== confirmPassword) return;
     setLoading(true);
     setError(null);
     setNotice(null);
@@ -57,6 +61,7 @@ export function AuthForm({
         if (!data.session) {
           showInbox(email);
           setPassword("");
+          setConfirmPassword("");
           setMode("signin");
           return;
         }
@@ -71,6 +76,7 @@ export function AuthForm({
       if (/not confirmed/i.test(message)) {
         showInbox(email);
         setPassword("");
+        setConfirmPassword("");
       } else {
         setError(message);
       }
@@ -100,6 +106,11 @@ export function AuthForm({
 
   const primaryLabel =
     mode === "signup" ? signupCta ?? "Create account" : "Sign in";
+
+  // Hold off on the warning until they've started the second field, so it doesn't
+  // flash the moment the first character of the password is typed.
+  const mismatch =
+    mode === "signup" && confirmPassword.length > 0 && password !== confirmPassword;
 
   // Confirmation pending: hide the inputs entirely so the next step is the only thing on screen.
   if (pendingEmail) {
@@ -163,7 +174,17 @@ export function AuthForm({
         />
       </div>
       <div className="space-y-2">
-        <Label htmlFor="password">Password</Label>
+        <div className="flex items-center justify-between">
+          <Label htmlFor="password">Password</Label>
+          {mode === "signin" && (
+            <Link
+              href="/forgot-password"
+              className="text-muted-foreground text-sm underline-offset-4 hover:underline"
+            >
+              Forgot password?
+            </Link>
+          )}
+        </div>
         <Input
           id="password"
           type="password"
@@ -175,6 +196,28 @@ export function AuthForm({
           placeholder="••••••••"
         />
       </div>
+
+      {mode === "signup" && (
+        <div className="space-y-2">
+          <Label htmlFor="confirm-password">Confirm password</Label>
+          <Input
+            id="confirm-password"
+            type="password"
+            autoComplete="new-password"
+            required
+            aria-invalid={mismatch}
+            aria-describedby={mismatch ? "confirm-password-error" : undefined}
+            value={confirmPassword}
+            onChange={(e) => setConfirmPassword(e.target.value)}
+            placeholder="••••••••"
+          />
+          {mismatch && (
+            <p id="confirm-password-error" className="text-destructive text-sm">
+              These don&apos;t match
+            </p>
+          )}
+        </div>
+      )}
 
       {error && <p className="text-destructive text-sm">{error}</p>}
 
@@ -190,6 +233,7 @@ export function AuthForm({
           className="text-primary underline-offset-4 hover:underline"
           onClick={() => {
             setMode(mode === "signup" ? "signin" : "signup");
+            setConfirmPassword("");
             setError(null);
             setNotice(null);
           }}

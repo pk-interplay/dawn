@@ -23,7 +23,8 @@ export type InboundDecision =
   | "non_member"
   | "rate_limited"
   | "duplicate"
-  | "self_send";
+  | "self_send"
+  | "unverified_sender";
 
 /** Introductions in these states can no longer be advanced by a reply. */
 const TERMINAL_INTRO_STATES = ["declined", "expired", "scheduled", "completed"];
@@ -74,6 +75,21 @@ export interface InboundMessageInput {
   fromRaw: string | null;
   subject: string | null;
   text: string;
+  /**
+   * Whether AgentMail could authenticate the sending domain (SPF/DKIM/DMARC).
+   *
+   * Absent means authenticated — the webhook only sets this false for
+   * `message.received.unauthenticated`, and callers that don't know (the replay and
+   * simulate scripts, older payloads) should not be silently downgraded to untrusted.
+   *
+   * Dawn cannot require authentication. Members are ordinary companies, plenty of
+   * them run domains with no SPF record and no DKIM signing, and their replies are
+   * indistinguishable from a forgery at the protocol level. Dropping that mail means
+   * a member replies "yes" and Dawn never answers — the worst failure this product
+   * has. So unauthenticated mail is accepted, and trust is re-established from
+   * something the protocol can't forge instead: see `viaThread`.
+   */
+  authenticated?: boolean;
 }
 
 export interface TriageResult {
@@ -174,7 +190,19 @@ async function resolveSender(
   client: SupabaseClient,
   fromEmail: string,
   threadId: string | null,
-): Promise<{ id: string; name: string | null; via: "address" | "thread_alias" } | null> {
+): Promise<{
+  id: string;
+  name: string | null;
+  via: "address" | "thread_alias";
+  /**
+   * True when the thread Dawn opened independently corroborated this sender.
+   *
+   * This is the difference between "someone claiming to be X wrote to us" and
+   * "someone replied inside a conversation we started by writing to X" — and it is
+   * the only evidence available when the message carries no SPF/DKIM to trust.
+   */
+  viaThread: boolean;
+} | null> {
   const senderBase = baseAddress(fromEmail);
 
   if (threadId) {
@@ -192,7 +220,12 @@ async function resolveSender(
             `[triage] ${fromEmail} resolved to ${data.name} (${recipient.email}) via thread ${threadId}.`,
           );
         }
-        return { id: data.id as string, name: (data.name as string) ?? null, via };
+        return {
+          id: data.id as string,
+          name: (data.name as string) ?? null,
+          via,
+          viaThread: true,
+        };
       }
     }
   }
@@ -211,7 +244,12 @@ async function resolveSender(
     return null;
   }
   if (!person) return null;
-  return { id: person.id as string, name: (person.name as string) ?? null, via: "address" };
+  return {
+    id: person.id as string,
+    name: (person.name as string) ?? null,
+    via: "address",
+    viaThread: false,
+  };
 }
 
 export async function triage(
@@ -251,6 +289,31 @@ export async function triage(
     return { ...result, decision: "non_member", note: "Sender is not a member." };
   }
   result.personId = person.id;
+
+  // 3b. Trust. An unauthenticated message proves nothing about who sent it: the From
+  //     header is free text, so `resolveSender`'s address lookup alone would let
+  //     anyone act as any member by typing their address. The thread is the check
+  //     that survives — a reply threaded onto a conversation Dawn opened by writing
+  //     to that person had to reach whoever actually received that email.
+  //
+  //     So the rule is not "reject unauthenticated mail", which would lock out every
+  //     member whose domain lacks SPF/DKIM. It is: unauthenticated mail may only act
+  //     inside a thread Dawn started with that same person. An unauthenticated
+  //     message arriving out of the blue is treated as an unknown sender.
+  if (msg.authenticated === false && !person.viaThread) {
+    console.warn(
+      `[triage] unauthenticated message from ${fromEmail} matched ${person.name} by address ` +
+        `alone, outside any Dawn thread — refusing to act on it.`,
+    );
+    return {
+      ...result,
+      personId: null,
+      decision: "unverified_sender",
+      note:
+        "Unauthenticated sender (no SPF/DKIM) resolved only by From address, with no " +
+        "Dawn-initiated thread to corroborate it.",
+    };
+  }
 
   // 4. Per-member ceiling. Bounds both accidental loops and deliberate abuse, and
   //    caps the token spend any one member can trigger.

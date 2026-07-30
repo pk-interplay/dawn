@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import "dotenv/config";
+import "./env";
 
 export const openai = new OpenAI();
 

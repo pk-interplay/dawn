@@ -2,6 +2,7 @@ import { supabase } from "../lib/supabase";
 import { embed } from "../lib/openai";
 import { anthropic, textOf } from "../lib/anthropic";
 import type { GeneratedProfile } from "../lib/types";
+import type { MeetingFormat } from "../../lib/onboarding";
 
 const SEED_COUNT = Number(process.env.SEED_COUNT ?? 150);
 const BATCH_SIZE = 20;
@@ -33,7 +34,43 @@ const INDUSTRIES = [
 
 const STAGES = ["early-career", "senior IC", "executive", "first-time founder", "repeat founder"];
 
-const MEETING_FORMATS = ["async", "call", "in_person"];
+// A real city, not a free-text guess. The model used to invent locations, which
+// meant co-located pairs essentially never occurred — and the in-person path in
+// `draftSchedulingEmail` compares these strings exactly, so seeded members have to
+// draw from a shared list for coffee to ever be proposed. Weighted so the first few
+// cities repeat and pairs actually collide.
+const CITIES = [
+  "New York",
+  "New York",
+  "New York",
+  "San Francisco",
+  "San Francisco",
+  "San Francisco",
+  "London",
+  "London",
+  "Berlin",
+  "Singapore",
+  "Remote",
+];
+
+// What each seeded member would accept for a first conversation, written as
+// `person_preferences` rows with the same fixed values the real onboarding form
+// produces. Real members answer this themselves; without it every synthetic pair
+// has no format overlap and `draftSchedulingEmail` always falls back to proposing
+// times, so none of the format-aware branches are reachable in testing.
+//
+// Cycled rather than random so a seeded run is reproducible, and heavy on coffee so
+// co-located pairs actually hit the in-person path.
+const FORMAT_SETS: MeetingFormat[][] = [
+  ["in_person_coffee", "video_call"],
+  ["in_person_coffee", "video_call", "phone_call"],
+  ["video_call"],
+  ["in_person_coffee", "phone_call"],
+  ["async_email", "video_call"],
+  ["phone_call", "video_call"],
+  ["async_email"],
+  ["in_person_coffee", "video_call"],
+];
 
 const TIMEZONES = [
   "America/New_York",
@@ -77,8 +114,6 @@ const PROFILE_SCHEMA = {
           tags: { type: "array", items: { type: "string" } },
           industry: { type: "string" },
           career_stage: { type: "string" },
-          location: { type: "string" },
-          meeting_format: { type: "string", enum: MEETING_FORMATS },
           ask_must_haves: { type: "array", items: { type: "string" } },
           ask_nice_to_haves: { type: "array", items: { type: "string" } },
         },
@@ -91,8 +126,6 @@ const PROFILE_SCHEMA = {
           "tags",
           "industry",
           "career_stage",
-          "location",
-          "meeting_format",
           "ask_must_haves",
           "ask_nice_to_haves",
         ],
@@ -131,12 +164,48 @@ async function generateBatch(brief: string, count: number): Promise<GeneratedPro
     messages: [
       {
         role: "user",
-        content: `Generate ${count} realistic, varied synthetic professional networking profiles for a startup-ecosystem intro platform. Diversity brief for this batch: ${brief}. Each profile needs a short "offering" (what they can give another person: expertise, intros, capital, time, mentorship) and a distinct "looking_for" (their current ask/intent) that is NOT just the inverse of offering. Also include: "industry" (a specific industry/vertical, not necessarily the batch's lean), "career_stage" (their actual career stage), "location" (a plausible city or "Remote"), "meeting_format" (one of ${MEETING_FORMATS.join(", ")}), "ask_must_haves" (1-3 short phrases naming the specific, non-negotiable parts of their ask — decomposed from "looking_for", not restating it wholesale), and "ask_nice_to_haves" (0-2 short phrases for bonus-but-not-required parts of their ask). Vary sentence structure and vocabulary across profiles — avoid template-y repetition.`,
+        content: `Generate ${count} realistic, varied synthetic professional networking profiles for a startup-ecosystem intro platform. Diversity brief for this batch: ${brief}. Each profile needs a short "offering" (what they can give another person: expertise, intros, capital, time, mentorship) and a distinct "looking_for" (their current ask/intent) that is NOT just the inverse of offering. Also include: "industry" (a specific industry/vertical, not necessarily the batch's lean), "career_stage" (their actual career stage), "ask_must_haves" (1-3 short phrases naming the specific, non-negotiable parts of their ask — decomposed from "looking_for", not restating it wholesale), and "ask_nice_to_haves" (0-2 short phrases for bonus-but-not-required parts of their ask). Vary sentence structure and vocabulary across profiles — avoid template-y repetition.`,
       },
     ],
   });
   const parsed = JSON.parse(textOf(resp));
   return parsed.profiles;
+}
+
+/**
+ * The rows a real member would create by answering the onboarding form.
+ *
+ * `format` is what makes the in-person / async branches in `draftSchedulingEmail`
+ * reachable; `wants` is what makes the preference block in `rerank` non-empty. Both
+ * are stored exactly as the form stores them, so seeded and real members are
+ * indistinguishable to everything downstream — except `source`, which stays
+ * "seed" so a synthetic answer is never mistaken for something a person said.
+ */
+async function seedPreferences(
+  personId: string,
+  formats: MeetingFormat[],
+  wants: string[],
+): Promise<void> {
+  const rows = [
+    ...formats.map((value) => ({ kind: "format", value })),
+    ...wants.slice(0, 3).map((value) => ({ kind: "wants", value: value.trim() })),
+  ]
+    .filter((r) => r.value)
+    .map((r) => ({
+      person_id: personId,
+      kind: r.kind,
+      value: r.value,
+      source: "seed",
+      confidence: 1,
+      active: true,
+    }));
+
+  if (rows.length === 0) return;
+  const { error } = await supabase
+    .from("person_preferences")
+    .upsert(rows, { onConflict: "person_id,kind,value" });
+  // Not fatal: a seeded person with no preferences still matches on embeddings.
+  if (error) console.warn(`[seed] preference write failed for ${personId}: ${error.message}`);
 }
 
 async function main() {
@@ -169,10 +238,15 @@ async function main() {
     const profiles = await generateBatch(brief.text, brief.count);
 
     for (const p of profiles) {
+      // Assigned here rather than generated: both are compared between two people
+      // at scheduling time, so they have to come from a shared vocabulary.
+      const city = CITIES[inserted % CITIES.length];
+      const formats = FORMAT_SETS[inserted % FORMAT_SETS.length];
+
       const [embeddingOffering, embeddingLookingFor, embeddingTags] = await Promise.all([
         embed(`${p.headline}. Offers: ${p.offering}. Relevant background: ${p.bio}`),
         embed(`Looking for: ${p.looking_for}. Context: ${p.bio}`),
-        embed(`${p.industry}. ${p.career_stage}. Tags: ${p.tags.join(", ")}. Location: ${p.location}.`),
+        embed(`${p.industry}. ${p.career_stage}. Tags: ${p.tags.join(", ")}. Location: ${city}.`),
       ]);
 
       const { data, error } = await supabase
@@ -186,8 +260,9 @@ async function main() {
           tags: p.tags,
           industry: p.industry,
           career_stage: p.career_stage,
-          location: p.location,
-          meeting_format: p.meeting_format,
+          location: city,
+          // Display only. The list in `formats` is the part that drives behaviour.
+          meeting_format: formats[0],
           ask_must_haves: p.ask_must_haves,
           ask_nice_to_haves: p.ask_nice_to_haves,
           // Contact + scheduling fields (migration 0007).
@@ -206,7 +281,10 @@ async function main() {
         .select("id")
         .single();
       if (error) throw new Error(error.message);
-      if (data?.id) peopleIds.push(data.id);
+      if (data?.id) {
+        peopleIds.push(data.id);
+        await seedPreferences(data.id, formats, p.ask_must_haves ?? []);
+      }
       inserted++;
     }
     console.log(`Inserted batch of ${profiles.length} (${inserted}/${SEED_COUNT}) — ${brief.text}`);

@@ -1,6 +1,11 @@
 import { supabase } from "../lib/supabase";
 import type { Person } from "../lib/types";
-import { fetchCandidates, fetchCalibration } from "../lib/candidates";
+import {
+  fetchCandidates,
+  fetchCalibration,
+  fetchPreferences,
+  fetchRecentHistory,
+} from "../lib/candidates";
 import { rerank, validateMatches } from "../lib/rerank";
 
 async function matchPerson(person: Person) {
@@ -10,8 +15,12 @@ async function matchPerson(person: Person) {
     return;
   }
 
-  const calibration = await fetchCalibration(supabase, person.id);
-  const ranked = await rerank(person, candidates, calibration);
+  const [calibration, preferences, history] = await Promise.all([
+    fetchCalibration(supabase, person.id),
+    fetchPreferences(supabase, person.id),
+    fetchRecentHistory(supabase, person.id),
+  ]);
+  const ranked = await rerank(person, candidates, calibration, preferences, history);
   const { valid, notes } = validateMatches(ranked, candidates);
   for (const note of notes) console.log(`  ${note}`);
 

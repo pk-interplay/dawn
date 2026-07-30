@@ -62,6 +62,9 @@ export default function Monitor() {
         <div className="text-muted-foreground flex items-center gap-3 text-xs">
           <span>{gate.email}</span>
           <Link href="/admin" className="underline underline-offset-4">
+            exchange
+          </Link>
+          <Link href="/admin/console" className="underline underline-offset-4">
             console
           </Link>
         </div>

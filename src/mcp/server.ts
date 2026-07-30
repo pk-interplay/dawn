@@ -28,14 +28,19 @@ import { z } from "zod";
 process.env.DOTENV_CONFIG_QUIET = "true";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-// src/mcp/server.ts -> dawn-v0/.env
-loadEnv({ path: resolve(HERE, "../../.env"), quiet: true });
+// src/mcp/server.ts -> dawn-v0/.env.local, then dawn-v0/.env. `.env.local` first:
+// it's where this project's config lives, and dotenv keeps the first value it sees.
+loadEnv({
+  path: [resolve(HERE, "../../.env.local"), resolve(HERE, "../../.env")],
+  quiet: true,
+});
 
 // Dynamic imports AFTER env is loaded (these modules build clients on load).
 const { supabase } = await import("../lib/supabase.js");
 const { embed } = await import("../lib/openai.js");
 const { anthropic, textOf } = await import("../lib/anthropic.js");
-const { fetchCandidates, fetchCalibration } = await import("../lib/candidates.js");
+const { fetchCandidates, fetchCalibration, fetchPreferences, fetchRecentHistory } =
+  await import("../lib/candidates.js");
 const { rerank, validateMatches } = await import("../lib/rerank.js");
 import type { Person } from "../lib/types.js";
 
@@ -282,8 +287,12 @@ server.tool(
         });
       }
 
-      const calibration = await fetchCalibration(supabase, typed.id);
-      const ranked = await rerank(typed, candidates, calibration);
+      const [calibration, preferences, history] = await Promise.all([
+        fetchCalibration(supabase, typed.id),
+        fetchPreferences(supabase, typed.id),
+        fetchRecentHistory(supabase, typed.id),
+      ]);
+      const ranked = await rerank(typed, candidates, calibration, preferences, history);
       const { valid } = validateMatches(ranked, candidates);
       const matches = valid.map((m) => ({
         candidate_id: m.candidate_id,

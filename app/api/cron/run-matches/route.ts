@@ -22,7 +22,13 @@ const SCAN_LIMIT = 200; // how many members to consider per run
 // of 0019 works out to at most four opt-in asks a day. It exists because 'daily' was
 // the ceiling, and a three-day pilot on 'daily' delivers three emails in total: not
 // enough to tell whether a stream of introductions feels valuable or feels like spam.
+// `hourly` is the operator-testing tier (see CADENCES in lib/onboarding): with a
+// runner firing every hour it allows ~24 opt-in asks a day, which is only tolerable
+// when the recipient is the person running the test. Subtract a minute of slack so a
+// runner that fires at 10:00:59 after a 09:00:12 intro isn't judged to be inside the
+// window by 47 seconds and silently skipped for the whole hour.
 const CADENCE_DAYS: Record<string, number> = {
+  hourly: 1 / 24 - 1 / 1440,
   burst: 0.25,
   daily: 1,
   weekly: 7,
