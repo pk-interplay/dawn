@@ -3,47 +3,64 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/**
+ * Dawn's palette is built on one navy hue (~258) carried through every
+ * surface, so the greys read as deep blue rather than neutral. Chroma stays
+ * low on backgrounds and jumps only on `primary` and `ring` — that keeps the
+ * blue friendly and warm-leaning instead of corporate, and leaves the accent
+ * as the one thing on the page that is genuinely saturated.
+ */
 :root {
   --radius: 0.65rem;
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.141 0.005 285.823);
+  --background: oklch(0.99 0.005 258);
+  --foreground: oklch(0.22 0.04 258);
   --card: oklch(1 0 0);
-  --card-foreground: oklch(0.141 0.005 285.823);
+  --card-foreground: oklch(0.22 0.04 258);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.141 0.005 285.823);
-  --primary: oklch(0.21 0.006 285.885);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.967 0.001 286.375);
-  --secondary-foreground: oklch(0.21 0.006 285.885);
-  --muted: oklch(0.967 0.001 286.375);
-  --muted-foreground: oklch(0.552 0.016 285.938);
-  --accent: oklch(0.967 0.001 286.375);
-  --accent-foreground: oklch(0.21 0.006 285.885);
+  --popover-foreground: oklch(0.22 0.04 258);
+  --primary: oklch(0.48 0.155 256);
+  --primary-foreground: oklch(0.99 0.005 258);
+  --secondary: oklch(0.96 0.013 256);
+  --secondary-foreground: oklch(0.3 0.055 258);
+  --muted: oklch(0.96 0.013 256);
+  --muted-foreground: oklch(0.52 0.032 256);
+  --accent: oklch(0.94 0.022 254);
+  --accent-foreground: oklch(0.3 0.055 258);
   --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.92 0.004 286.32);
-  --input: oklch(0.92 0.004 286.32);
-  --ring: oklch(0.705 0.015 286.067);
+  --border: oklch(0.9 0.016 256);
+  --input: oklch(0.9 0.016 256);
+  --ring: oklch(0.48 0.155 256);
 }
 
 .dark {
-  --background: oklch(0.141 0.005 285.823);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.21 0.006 285.885);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.21 0.006 285.885);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.985 0 0);
-  --primary-foreground: oklch(0.21 0.006 285.885);
-  --secondary: oklch(0.274 0.006 286.033);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.274 0.006 286.033);
-  --muted-foreground: oklch(0.705 0.015 286.067);
-  --accent: oklch(0.274 0.006 286.033);
-  --accent-foreground: oklch(0.985 0 0);
+  --background: oklch(0.185 0.032 258);
+  --foreground: oklch(0.97 0.008 252);
+  --card: oklch(0.235 0.036 258);
+  --card-foreground: oklch(0.97 0.008 252);
+  --popover: oklch(0.235 0.036 258);
+  --popover-foreground: oklch(0.97 0.008 252);
+  --primary: oklch(0.7 0.145 250);
+  --primary-foreground: oklch(0.16 0.038 258);
+  --secondary: oklch(0.29 0.04 258);
+  --secondary-foreground: oklch(0.97 0.008 252);
+  --muted: oklch(0.29 0.04 258);
+  --muted-foreground: oklch(0.73 0.032 254);
+  --accent: oklch(0.33 0.048 256);
+  --accent-foreground: oklch(0.97 0.008 252);
   --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.552 0.016 285.938);
+  --border: oklch(0.82 0.06 254 / 14%);
+  --input: oklch(0.82 0.06 254 / 18%);
+  --ring: oklch(0.7 0.145 250);
+}
+
+/**
+ * Sentient is the core face, so it backs `font-sans` and every default. This
+ * block is deliberately not `inline`: inline theme values are substituted at
+ * their use sites rather than emitted, and Tailwind's own preflight resolves
+ * `html { font-family: var(--font-sans, …) }` against the real property.
+ */
+@theme {
+  --font-sans: var(--font-sentient), ui-serif, Georgia, serif;
 }
 
 @theme inline {
@@ -76,6 +93,6 @@
     @apply border-border outline-ring/50;
   }
   body {
-    @apply bg-background text-foreground;
+    @apply bg-background text-foreground font-sans;
   }
 }
