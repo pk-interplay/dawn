@@ -13,6 +13,14 @@
     "match": "tsx src/scripts/match.ts",
     "cron:local": "tsx src/scripts/local-cron.ts",
     "auth:config": "tsx src/scripts/configure-auth.ts",
+    "probe:cache": "tsx src/scripts/probe-cache-minimum.ts",
+    "export:eval-fixtures": "tsx src/scripts/export-eval-fixtures.ts",
+    "backfill:entities": "tsx src/scripts/backfill-entities-from-people.ts",
+    "summarize:entities": "tsx src/scripts/summarize-entities.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:eval": "vitest run --mode eval --include 'src/**/*.eval.test.ts'",
+    "typecheck": "tsc --noEmit",
     "mcp": "tsx src/mcp/server.ts"
   },
   "dependencies": {
@@ -30,6 +38,7 @@
     "lucide-react": "^1.26.0",
     "motion": "^12.42.2",
     "next": "^16.2.11",
+    "next-auth": "^5.0.0-beta.32",
     "openai": "^6.7.0",
     "p-limit": "^7.1.1",
     "postcss": "^8.5.22",
@@ -46,6 +55,7 @@
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "tsx": "^4.20.6",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
   }
 }

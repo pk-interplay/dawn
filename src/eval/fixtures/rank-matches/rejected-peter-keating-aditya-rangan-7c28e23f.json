@@ -1,0 +1,67 @@
+{
+  "$schema": "dawn-v0 match outcome -> nexus rank_matches fixture, v1",
+  "id": "7c28e23f-f99a-4c81-a181-a6c42d593823",
+  "label": "rejected",
+  "source": "dawn_v0:matches",
+  "observed_at": "2026-07-29T01:00:18.375849+00:00",
+  "synthetic_counterpart": true,
+  "proposed": {
+    "score": 0.68,
+    "direction": "mutual",
+    "rationale": "Aditya is a live AI founder needing enterprise GTM sequencing help and warm intros to seed funds — matching Peter's product/GTM advice offering and accelerator connections. For Peter, he's a concrete early-stage AI deal to get close to plus real-time market intel on how funds are responding to a raise, valuable for a new associate sourcing deals."
+  },
+  "subject": {
+    "id": "df4b723d-cf48-437b-8592-4b1d6c00eb3e",
+    "name": "Peter Keating",
+    "headline": "Product/strategy builder turned early-stage AI investor at Interplay",
+    "bio": "Peter's spent his career on the builder side of startups — first product hire at a crypto/web3 venture, corporate dev at an edtech scaleup, then three years running his own product strategy studio for early-stage founders. Now an MBA at NYU Stern and freshly landed as an Associate on the AI team at Interplay (VC + accelerator + studio + family office), plus a Venture Fellow sourcing and vetting deals for Stern's accelerator. He's straddling builder and investor identities right now, and clearly angling toward a full-time investing seat.</summary>\n<parameter name=\"goals\">Break in fully as a venture investor focused on early-stage AI and deep tech, build a reputation as a go-to sourcing/GTM resource for founders, expand a network of co-investors and operators for deal flow and diligence, eventually lead or co-lead seed checks",
+    "offering": "Hands-on product and GTM strategy advice for early-stage founders, startup sourcing and diligence support, connections into NYU Stern's accelerator pipeline and portfolio companies, first-hand builder-to-investor perspective",
+    "looking_for": "Introductions to early-stage founders (especially AI/deep tech), fellow investors and operators to swap deal flow and diligence notes with, and more senior VCs who can mentor him on the transition from operator to full-time investor",
+    "goals": [],
+    "background": [],
+    "tags": [],
+    "industry": null,
+    "career_stage": null,
+    "location": "New York",
+    "ask_must_haves": [],
+    "ask_nice_to_haves": [],
+    "is_synthetic": false,
+    "is_demo_persona": false
+  },
+  "counterpart": {
+    "id": "e177463b-27d3-4b25-a8f3-c81a8661e0eb",
+    "name": "Aditya Rangan",
+    "headline": "Co-founder & CEO, Trellis Labs — agentic workflow automation for insurance claims",
+    "bio": "Aditya was an engineering manager on the fraud platform at Marqeta before leaving in early 2024 to start Trellis Labs with his former colleague. They've shipped an agent system that processes first-notice-of-loss claims for two regional insurers and are at roughly $340K ARR heading into a seed raise. He has no go-to-market background and has been running sales himself off a spreadsheet.",
+    "offering": "A live, in-progress AI deal Peter can actually get close to — and an honest founder's-eye view of what he's hearing from other funds during his raise, which is useful market intel for a new associate.",
+    "looking_for": "Concrete help sequencing an enterprise GTM motion for a two-engineer team, plus warm paths to seed funds that understand vertical AI in regulated industries.",
+    "goals": [
+      "Close a $3.5M seed round in the next four months",
+      "Hire a first commercial lead who can sell to insurance ops teams",
+      "Get from two design partners to eight paying accounts by year-end"
+    ],
+    "background": [
+      "Engineering manager, fraud platform, Marqeta, 2020–2024",
+      "Founded Trellis Labs January 2024, two-person technical team",
+      "~$340K ARR from two regional insurance carriers"
+    ],
+    "tags": [
+      "agentic ai",
+      "insurtech",
+      "seed raise",
+      "enterprise gtm"
+    ],
+    "industry": "AI / Insurtech",
+    "career_stage": "Founder / Early-stage",
+    "location": "Austin, TX",
+    "ask_must_haves": [
+      "enterprise GTM sequencing advice",
+      "intros to seed funds doing vertical AI"
+    ],
+    "ask_nice_to_haves": [
+      "candidate leads for a first sales hire"
+    ],
+    "is_synthetic": false,
+    "is_demo_persona": true
+  }
+}
