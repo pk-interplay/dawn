@@ -22,7 +22,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
 
-export async function POST() {
+export async function POST(req: Request) {
   const session = await auth();
   if (!session?.user?.id || !session.user.email) {
     return NextResponse.json({ error: "Not signed in" }, { status: 401 });
@@ -42,12 +42,25 @@ export async function POST() {
     );
   }
 
+  // Optional user steer from the "Add guidance" field on the review screen. Cap the
+  // length so a pasted essay can't blow out the prompt; the model only needs a nudge.
+  let guidance: string | null = null;
+  try {
+    const body = (await req.json()) as { guidance?: unknown };
+    if (typeof body.guidance === "string" && body.guidance.trim()) {
+      guidance = body.guidance.trim().slice(0, 500);
+    }
+  } catch {
+    // No body / not JSON — regenerate with no guidance, same as before.
+  }
+
   let synthesis;
   try {
     synthesis = await synthesizeProfile({
       accessToken: session.accessToken,
       email: viewer.email,
       name: session.user.name ?? null,
+      guidance,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Synthesis failed";

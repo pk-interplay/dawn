@@ -14,7 +14,7 @@
  * the product must refuse is worse than having one fewer.
  */
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
@@ -80,6 +80,20 @@ export function ChatSurface({
   const { messages, sendMessage, status, error } = useChat({ transport });
   const busy = status === "submitted" || status === "streaming";
 
+  // The home page's starter questions link here as `/chat?q=…`. Fire that once on
+  // mount and strip it from the URL, so a refresh doesn't resend and the address bar
+  // doesn't keep a stale prompt around. Reading location directly (not
+  // useSearchParams) keeps this out of a Suspense boundary.
+  const firedInitial = useRef(false);
+  useEffect(() => {
+    if (firedInitial.current) return;
+    const q = new URLSearchParams(window.location.search).get("q")?.trim();
+    if (!q) return;
+    firedInitial.current = true;
+    void sendMessage({ text: q });
+    window.history.replaceState(null, "", window.location.pathname);
+  }, [sendMessage]);
+
   function submit(text: string) {
     const trimmed = text.trim();
     if (!trimmed || busy) return;
@@ -88,7 +102,7 @@ export function ChatSurface({
   }
 
   return (
-    <main className="flex h-screen flex-col pr-[72px]">
+    <main className="flex h-screen flex-col pl-[72px]">
       <header className="border-dawn-btn flex shrink-0 flex-wrap items-center justify-between gap-3 border-b px-6 py-4">
         <Link href="/" className="flex items-center gap-2.5 text-dawn-bone">
           <DawnMark idSuffix="chat" className="h-6 shrink-0 select-none" />

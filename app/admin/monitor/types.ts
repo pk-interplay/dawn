@@ -1,3 +1,15 @@
+export interface NetworkSettings {
+  enabled: boolean;
+  intensity: number;
+  updatedAt: string | null;
+  updatedBy: string | null;
+}
+
+export interface NetworkSettingsResponse {
+  settings: NetworkSettings;
+  bounds: { min: number; max: number };
+}
+
 export interface Overview {
   generatedAt: string;
   windowDays: number;

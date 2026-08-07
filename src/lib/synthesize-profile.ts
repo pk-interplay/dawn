@@ -4,6 +4,7 @@ import { z } from "zod";
 
 import { fetchRecentGmailHeaders, fetchRecentCalendarEvents } from "./gmail-ingest";
 import { parseAddress, splitAddresses } from "./network-ingest";
+import { domainOf, GENERIC_DOMAINS } from "./domains";
 
 /**
  * Draft a public profile for a user from their own mailbox activity.
@@ -72,20 +73,6 @@ const MAX_SUBJECTS = 120;
 const MAX_DOMAINS = 25;
 const MAX_EVENTS = 40;
 
-/** Free-mail and infrastructure domains say nothing about who someone works with. */
-const GENERIC_DOMAINS = new Set([
-  "gmail.com",
-  "googlemail.com",
-  "yahoo.com",
-  "hotmail.com",
-  "outlook.com",
-  "icloud.com",
-  "me.com",
-  "aol.com",
-  "proton.me",
-  "protonmail.com",
-]);
-
 export interface SynthesisResult {
   draft: ProfileDraft | null;
   generated: boolean;
@@ -94,16 +81,16 @@ export interface SynthesisResult {
   evidence: { subjects: number; domains: number; events: number };
 }
 
-function domainOf(email: string): string | null {
-  const at = email.lastIndexOf("@");
-  if (at < 1 || at === email.length - 1) return null;
-  return email.slice(at + 1).toLowerCase();
-}
-
 export async function synthesizeProfile(opts: {
   accessToken: string;
   email: string;
   name: string | null;
+  /**
+   * Optional free-text steer from the user on a regenerate — "I'm a founder, not an
+   * investor", "focus on my climate work". It shapes emphasis and framing; it does not
+   * license inventing claims the evidence doesn't support (the prompt says so).
+   */
+  guidance?: string | null;
 }): Promise<SynthesisResult> {
   const you = opts.email.trim().toLowerCase();
 
@@ -161,6 +148,8 @@ export async function synthesizeProfile(opts: {
     MAX_EVENTS,
   );
 
+  const guidance = opts.guidance?.trim();
+
   const context = [
     `Name: ${opts.name ?? "(unknown)"}`,
     `Email: ${opts.email}`,
@@ -197,6 +186,12 @@ export async function synthesizeProfile(opts: {
       `Also suggest concrete types of intros they might be open to, based on the kinds ` +
       `of organisations already in their network. These are suggestions the person can ` +
       `accept or ignore, never a stated preference.\n\n` +
+      (guidance
+        ? `The person reviewed a previous draft and asked you to steer this one: ` +
+          `"${guidance}". Honour it as direction on emphasis and framing. It does not ` +
+          `override the evidence rules above — if they ask for something the activity ` +
+          `doesn't support, lean the framing their way but don't invent claims.\n\n`
+        : "") +
       context,
   });
 

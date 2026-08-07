@@ -24,7 +24,8 @@
  *    silently dropped off-canvas.
  */
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent, ReactNode } from "react";
 
 import { cn } from "@/lib/utils";
 import type { ConstellationResponse, GraphEdge, GraphNode } from "./types";
@@ -40,6 +41,31 @@ const EDGE_OPACITY_MAX = 0.32;
 const EDGE_ELEMENT_BUDGET = 200;
 const MAX_LABELS = 24;
 const LABEL_CHARS = 22;
+/** Tightest zoom: viewBox shrinks to 1/8th, i.e. 8× magnification. */
+const MIN_VIEW_W = VIEW_W / 8;
+
+const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+interface View {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+const FULL_VIEW: View = { x: 0, y: 0, w: VIEW_W, h: VIEW_H };
+
+/** Enforce the fixed aspect ratio, the zoom limit, and keep the box inside the frame. */
+function clampView(v: View): View {
+  const w = clamp(v.w, MIN_VIEW_W, VIEW_W);
+  const h = w * (VIEW_H / VIEW_W);
+  return {
+    w,
+    h,
+    x: clamp(v.x, 0, VIEW_W - w),
+    y: clamp(v.y, 0, VIEW_H - h),
+  };
+}
 
 interface Placed {
   node: GraphNode;
@@ -60,6 +86,47 @@ export function Constellation({
 }) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [hovered, setHovered] = useState<Placed | null>(null);
+  const [view, setView] = useState<View>(FULL_VIEW);
+  // Panning state lives in a ref so a drag doesn't re-render on every move; it also
+  // carries `moved` so pointer-up can tell a pan apart from a click-to-select.
+  const pan = useRef<{ px: number; py: number; from: View; moved: boolean } | null>(null);
+  const zoomed = view.w < VIEW_W - 0.5;
+
+  // A native, non-passive wheel listener: React's onWheel is passive, so it cannot
+  // preventDefault the page scroll that would otherwise fight the zoom.
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    function onWheel(e: WheelEvent) {
+      e.preventDefault();
+      const rect = svg!.getBoundingClientRect();
+      setView((prev) => {
+        // Point under the cursor, in viewBox units — the fixed point of the zoom.
+        const px = prev.x + ((e.clientX - rect.left) / rect.width) * prev.w;
+        const py = prev.y + ((e.clientY - rect.top) / rect.height) * prev.h;
+        const w = clamp(prev.w * Math.exp(e.deltaY * 0.0015), MIN_VIEW_W, VIEW_W);
+        const h = w * (VIEW_H / VIEW_W);
+        return clampView({
+          x: px - ((px - prev.x) / prev.w) * w,
+          y: py - ((py - prev.y) / prev.h) * h,
+          w,
+          h,
+        });
+      });
+    }
+    svg.addEventListener("wheel", onWheel, { passive: false });
+    return () => svg.removeEventListener("wheel", onWheel);
+  }, []);
+
+  function zoomBy(factor: number) {
+    setView((prev) => {
+      const w = clamp(prev.w * factor, MIN_VIEW_W, VIEW_W);
+      const h = w * (VIEW_H / VIEW_W);
+      const cx = prev.x + prev.w / 2;
+      const cy = prev.y + prev.h / 2;
+      return clampView({ x: cx - w / 2, y: cy - h / 2, w, h });
+    });
+  }
 
   const { placed, byId, edges, degMax } = useMemo(() => {
     const withCoords = data.nodes.filter(
@@ -118,10 +185,10 @@ export function Constellation({
     const svg = svgRef.current;
     if (!svg) return null;
     const rect = svg.getBoundingClientRect();
-    // Map client px into viewBox units; the SVG scales with its container.
-    const x = ((event.clientX - rect.left) / rect.width) * VIEW_W;
-    const y = ((event.clientY - rect.top) / rect.height) * VIEW_H;
-    const tolerance = (16 / rect.width) * VIEW_W;
+    // Map client px into viewBox units; the SVG scales AND zooms with the current view.
+    const x = view.x + ((event.clientX - rect.left) / rect.width) * view.w;
+    const y = view.y + ((event.clientY - rect.top) / rect.height) * view.h;
+    const tolerance = (16 / rect.width) * view.w;
     let best: Placed | null = null;
     let bestDist = Infinity;
     for (const p of placed) {
@@ -136,22 +203,60 @@ export function Constellation({
 
   const dim = (id: string) => (neighbours ? (neighbours.has(id) ? 1 : 0.18) : 1);
 
+  function onPointerDown(e: ReactPointerEvent<SVGSVGElement>) {
+    e.currentTarget.setPointerCapture(e.pointerId);
+    pan.current = { px: e.clientX, py: e.clientY, from: view, moved: false };
+    setHovered(null);
+  }
+
+  function onPointerMove(e: ReactPointerEvent<SVGSVGElement>) {
+    const p = pan.current;
+    if (p) {
+      const svg = svgRef.current;
+      if (!svg) return;
+      const rect = svg.getBoundingClientRect();
+      if (Math.abs(e.clientX - p.px) > 3 || Math.abs(e.clientY - p.py) > 3) p.moved = true;
+      // Drag the content with the pointer: viewBox moves opposite the cursor.
+      setView(
+        clampView({
+          x: p.from.x - ((e.clientX - p.px) / rect.width) * p.from.w,
+          y: p.from.y - ((e.clientY - p.py) / rect.height) * p.from.h,
+          w: p.from.w,
+          h: p.from.h,
+        }),
+      );
+      return;
+    }
+    setHovered(nearest(e));
+  }
+
+  function onPointerUp(e: ReactPointerEvent<SVGSVGElement>) {
+    const p = pan.current;
+    pan.current = null;
+    // A press that never moved is a click: select (or clear) the entity under it.
+    if (p && !p.moved) {
+      const hit = nearest(e);
+      onSelect(hit ? hit.node.id : null);
+    }
+  }
+
   return (
     <div className="relative">
       <svg
         ref={svgRef}
-        viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
+        viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
         preserveAspectRatio="xMidYMid meet"
         role="img"
-        aria-label={`Network space: ${placed.length} entities plotted by semantic similarity, with ${edges.length} relationships drawn between them.`}
-        className="border-dawn-btn bg-card w-full rounded-[--radius] border"
+        aria-label={`Network space: ${placed.length} entities plotted by semantic similarity, with ${edges.length} relationships drawn between them. Scroll to zoom, drag to pan.`}
+        className={cn(
+          "border-dawn-btn bg-card w-full touch-none rounded-[--radius] border",
+          zoomed ? "cursor-grab active:cursor-grabbing" : "cursor-default",
+        )}
         // One delegated listener beats 300, and gives forgiving hit targets for r=3 dots.
-        onPointerMove={(e) => setHovered(nearest(e))}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
         onPointerLeave={() => setHovered(null)}
-        onClick={(e) => {
-          const hit = nearest(e);
-          onSelect(hit ? hit.node.id : null);
-        }}
       >
         <Edges edges={edges} byId={byId} selectedId={selectedId} neighbours={neighbours} />
 
@@ -212,7 +317,19 @@ export function Constellation({
         ))}
       </svg>
 
-      {hovered && <Tooltip placed={hovered} />}
+      <div className="absolute right-2 top-2 flex flex-col gap-1">
+        <ZoomButton label="Zoom in" onClick={() => zoomBy(1 / 1.4)} disabled={view.w <= MIN_VIEW_W + 0.5}>
+          +
+        </ZoomButton>
+        <ZoomButton label="Zoom out" onClick={() => zoomBy(1.4)} disabled={!zoomed}>
+          −
+        </ZoomButton>
+        <ZoomButton label="Reset zoom" onClick={() => setView(FULL_VIEW)} disabled={!zoomed}>
+          ⤢
+        </ZoomButton>
+      </div>
+
+      {hovered && !pan.current && <Tooltip placed={hovered} view={view} />}
 
       {/* Operable and screen-readable without reimplementing SVG focus management — and
           it partly IS the plain list of everyone on the map. */}
@@ -327,14 +444,39 @@ function Edges({
   );
 }
 
-function Tooltip({ placed }: { placed: Placed }) {
+function ZoomButton({
+  label,
+  onClick,
+  disabled,
+  children,
+}: {
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+      title={label}
+      className="border-dawn-btn bg-card/80 text-dawn-bone hover:bg-dawn-btn/20 flex size-8 items-center justify-center rounded-[--radius] border text-base leading-none backdrop-blur transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+    >
+      {children}
+    </button>
+  );
+}
+
+function Tooltip({ placed, view }: { placed: Placed; view: View }) {
   const { node } = placed;
   return (
     <div
       className="border-dawn-btn bg-popover pointer-events-none absolute z-10 rounded-[--radius] border px-3 py-2 text-xs shadow-lg"
       style={{
-        left: `${(placed.cx / VIEW_W) * 100}%`,
-        top: `${(placed.cy / VIEW_H) * 100}%`,
+        left: `${((placed.cx - view.x) / view.w) * 100}%`,
+        top: `${((placed.cy - view.y) / view.h) * 100}%`,
         transform: "translate(12px, -50%)",
       }}
     >

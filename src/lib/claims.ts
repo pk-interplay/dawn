@@ -128,6 +128,55 @@ export async function findEntityIdByEmail(
 }
 
 /**
+ * Resolve a company domain to the organization entity that holds it as a live
+ * `domain` claim, or null. The org-side analogue of findEntityIdByEmail: a
+ * person is identified automatically by their email, a company by its domain
+ * (reconcile-companies.ts materialises `stripe.com` → one organization entity).
+ * Same CI-legal read path — every `from("claims")` read lives in this file.
+ */
+export async function findEntityIdByDomain(
+  client: SupabaseClient,
+  domain: string,
+): Promise<string | null> {
+  const normalised = domain.trim().toLowerCase();
+  if (!normalised) return null;
+
+  const { data, error } = await client
+    .from("claims")
+    .select("subject_id")
+    .eq("attribute", "domain")
+    .is("superseded_by", null)
+    .filter("value", "eq", JSON.stringify(normalised))
+    .limit(1);
+  if (error) throw new Error(`findEntityIdByDomain lookup failed: ${error.message}`);
+  return data && data.length > 0 ? (data[0].subject_id as string) : null;
+}
+
+/**
+ * Find the organization entity for a domain, or create one. Deliberately
+ * separate from findOrCreateEntity (which resolves people by email) so the
+ * person path stays untouched: a company is resolved on its `domain` claim and
+ * nothing else, and two orgs are never merged on name alone — same SPEC §2.4
+ * posture as the person side.
+ */
+export async function findOrCreateOrgByDomain(
+  client: SupabaseClient,
+  domain: string,
+): Promise<{ id: string; created: boolean }> {
+  const normalised = domain.trim().toLowerCase();
+  const existing = normalised ? await findEntityIdByDomain(client, normalised) : null;
+  if (existing) return { id: existing, created: false };
+
+  const { data: created, error: insertError } = await client
+    .from("entities")
+    .insert({ kind: "organization" })
+    .select("id")
+    .single();
+  if (insertError) throw new Error(`findOrCreateOrgByDomain insert failed: ${insertError.message}`);
+  return { id: created.id as string, created: true };
+}
+
+/**
  * Find an entity by email (the only basis used for automatic resolution —
  * SPEC §2.4: never hard-merge on name alone) or create one. Two investors
  * named Chen at different funds must not collapse into one entity just because

@@ -107,8 +107,8 @@ export function DawnRail({ signedIn = false }: { signedIn?: boolean }) {
         aria-label="Account"
         style={{ "--dawn-delay": "60ms" } as React.CSSProperties}
         className={cn(
-          "group/rail dawn-enter fixed inset-y-0 right-0 z-20 flex w-14 flex-col",
-          "items-center justify-between border-l border-border bg-background py-3.5",
+          "group/rail dawn-enter fixed inset-y-0 left-0 z-20 flex w-14 flex-col",
+          "items-center justify-between border-r border-border bg-background py-3.5",
           "transition-[width] duration-[260ms] ease-[cubic-bezier(.22,.61,.36,1)] hover:w-[200px]",
         )}
       >
