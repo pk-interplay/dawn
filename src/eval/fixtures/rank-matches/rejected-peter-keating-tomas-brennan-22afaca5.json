@@ -1,0 +1,68 @@
+{
+  "$schema": "dawn-v0 match outcome -> nexus rank_matches fixture, v1",
+  "id": "22afaca5-9f8d-4c74-9260-277d69802db2",
+  "label": "rejected",
+  "source": "dawn_v0:matches",
+  "observed_at": "2026-07-29T17:00:17.948666+00:00",
+  "synthetic_counterpart": true,
+  "proposed": {
+    "score": 0.55,
+    "direction": "mutual",
+    "rationale": "Tomas is a live deep tech founder offering a stage-appropriate deal plus referrals to pre-raise bio-AI spinouts in his cohort — real sourcing value for Peter. Peter's product/GTM narrative help and view on raise timing matches Tomas's ask. Note the caution: Peter recently declined a similar live-founder intro (Aditya), so this is lower-confidence, but the cohort-referral deal flow angle differentiates it."
+  },
+  "subject": {
+    "id": "df4b723d-cf48-437b-8592-4b1d6c00eb3e",
+    "name": "Peter Keating",
+    "headline": "Product/strategy builder turned early-stage AI investor at Interplay",
+    "bio": "Peter's spent his career on the builder side of startups — first product hire at a crypto/web3 venture, corporate dev at an edtech scaleup, then three years running his own product strategy studio for early-stage founders. Now an MBA at NYU Stern and freshly landed as an Associate on the AI team at Interplay (VC + accelerator + studio + family office), plus a Venture Fellow sourcing and vetting deals for Stern's accelerator. He's straddling builder and investor identities right now, and clearly angling toward a full-time investing seat.</summary>\n<parameter name=\"goals\">Break in fully as a venture investor focused on early-stage AI and deep tech, build a reputation as a go-to sourcing/GTM resource for founders, expand a network of co-investors and operators for deal flow and diligence, eventually lead or co-lead seed checks",
+    "offering": "Hands-on product and GTM strategy advice for early-stage founders, startup sourcing and diligence support, connections into NYU Stern's accelerator pipeline and portfolio companies, first-hand builder-to-investor perspective",
+    "looking_for": "Introductions to early-stage founders (especially AI/deep tech), fellow investors and operators to swap deal flow and diligence notes with, and more senior VCs who can mentor him on the transition from operator to full-time investor",
+    "goals": [],
+    "background": [],
+    "tags": [],
+    "industry": null,
+    "career_stage": null,
+    "location": "New York",
+    "ask_must_haves": [],
+    "ask_nice_to_haves": [],
+    "is_synthetic": false,
+    "is_demo_persona": false
+  },
+  "counterpart": {
+    "id": "3f363453-d15f-438d-9a1a-dadf4771f69d",
+    "name": "Tomas Brennan",
+    "headline": "Founder, Halyard Bio — protein design models for enzyme engineering",
+    "bio": "Tomas ran a computational biology group at a mid-size CRO for five years, then spun out Halyard Bio in 2023 with two former colleagues to commercialize a protein-design model trained on internal assay data. They raised a $2.1M pre-seed from two angels and a small bio fund and now have three paid pilots with specialty chemical companies. He's a first-time founder with no commercial hires and admits he doesn't know how to talk about the company to non-scientists.",
+    "offering": "Access to a deep tech deal at exactly the stage Peter's fund cares about, plus a founder who will refer him to the other bio-AI spinouts in his cohort — several of whom are pre-raise.",
+    "looking_for": "Help turning a technical story into a narrative that investors and chemical-industry buyers understand, and a view on whether to raise a seed now or push for revenue first.",
+    "goals": [
+      "Decide seed timing and build the narrative for it",
+      "Convert three pilots into multi-year commercial contracts",
+      "Recruit a commercially minded co-founder or first business hire"
+    ],
+    "background": [
+      "Led computational biology group at a contract research organization, 2018–2023",
+      "Spun out Halyard Bio in 2023, $2.1M pre-seed",
+      "Three paid pilots with specialty chemical manufacturers"
+    ],
+    "tags": [
+      "bio ai",
+      "deep tech",
+      "protein design",
+      "positioning",
+      "pre-seed"
+    ],
+    "industry": "Biotech / AI",
+    "career_stage": "Founder / Early-stage",
+    "location": "Philadelphia, PA",
+    "ask_must_haves": [
+      "help translating technical work into investor narrative",
+      "honest read on seed timing"
+    ],
+    "ask_nice_to_haves": [
+      "intros to bio-literate seed funds"
+    ],
+    "is_synthetic": false,
+    "is_demo_persona": true
+  }
+}

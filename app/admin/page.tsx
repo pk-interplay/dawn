@@ -1,158 +1,72 @@
-"use client";
+/**
+ * The /admin index.
+ *
+ * This route used to BE a tool — the "Dawn · exchange" email-thread viewer — which
+ * is why the operator console had to move to /admin/console (see the comment at the
+ * top of that file). That was a mistake worth not repeating: when the index is one
+ * specific tool, the next tool has to displace it or hide somewhere.
+ *
+ * So this is deliberately a signpost and nothing else. It holds no data, which is
+ * also why it needs no gate: every destination below gates itself, and a list of
+ * links leaks nothing. Adding a fourth surface means adding a card here.
+ */
 
-import { useEffect, useMemo, useState } from "react";
+import type { Metadata } from "next";
 import Link from "next/link";
-import { Loader2 } from "lucide-react";
 
-import { useAuth } from "../lib/useAuth";
-import { adminFetch } from "../lib/admin-fetch";
-import { Button } from "@/components/ui/button";
-import { EmptyNote, ErrorNote, Loading } from "./monitor/shared";
-import ExchangeList, { applyFilter, type Filter } from "./exchange/ExchangeList";
-import Playback from "./exchange/Playback";
-import type { ExchangeSummary } from "./exchange/types";
+import { DawnMark } from "../components/DawnMark";
 
-type Gate = { status: "checking" } | { status: "ok"; email: string } | { status: "denied"; reason: string };
+export const metadata: Metadata = {
+  title: "Dawn · admin",
+};
 
-// Richest first: the most emails, replies breaking a tie. Whatever is showing when
-// the page opens is what someone demos, so it should be the fullest exchange in
-// the data rather than the most recently touched one.
-function bestFirst(rows: ExchangeSummary[]): ExchangeSummary[] {
-  return [...rows].sort(
-    (a, b) => b.messageCount - a.messageCount || b.inboundCount - a.inboundCount,
-  );
-}
+const SURFACES = [
+  {
+    href: "/admin/graph",
+    title: "Network space",
+    detail:
+      "Every entity plotted in its own embedding space, with relationship strength drawn between them. Click through to an entity's attributes and where each one came from.",
+  },
+  {
+    href: "/admin/monitor",
+    title: "Monitor",
+    detail:
+      "Read-only rollup of the legacy people/matches schema — members, matches, and the intro funnel.",
+  },
+  {
+    href: "/admin/console",
+    title: "Console",
+    detail: "Operator tools over the same legacy schema: search, profiles, network, submit an ask.",
+  },
+];
 
-export default function AdminExchange() {
-  const { user, loading } = useAuth();
-  const [gate, setGate] = useState<Gate>({ status: "checking" });
-  const [rows, setRows] = useState<ExchangeSummary[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState<Filter>("replied");
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (loading) return;
-    if (!user) {
-      setGate({ status: "denied", reason: "You need to sign in." });
-      return;
-    }
-    adminFetch<{ email: string }>("/api/admin/monitor/me")
-      .then((body) => setGate({ status: "ok", email: body.email }))
-      .catch((err) => setGate({ status: "denied", reason: err.message }));
-  }, [loading, user]);
-
-  useEffect(() => {
-    if (gate.status !== "ok") return;
-    let cancelled = false;
-    adminFetch<{ exchanges: ExchangeSummary[] }>("/api/admin/exchange")
-      .then((body) => {
-        if (cancelled) return;
-        setRows(body.exchanges);
-        // Loosen the default filter rather than opening on an empty pane: a pilot
-        // that hasn't had a reply yet still has opt-in emails worth showing.
-        const ranked = bestFirst(body.exchanges);
-        const opening =
-          (["replied", "sent", "all"] as Filter[]).find((f) => applyFilter(ranked, f).length) ??
-          "all";
-        setFilter(opening);
-        setSelectedId(applyFilter(ranked, opening)[0]?.id ?? null);
-      })
-      .catch((err) => !cancelled && setError(err.message));
-    return () => {
-      cancelled = true;
-    };
-  }, [gate.status]);
-
-  const visible = useMemo(() => applyFilter(bestFirst(rows ?? []), filter), [rows, filter]);
-
-  if (loading || gate.status === "checking") {
-    return (
-      <main className="flex min-h-screen items-center justify-center">
-        <Loader2 className="text-muted-foreground size-6 animate-spin" />
-      </main>
-    );
-  }
-
-  if (gate.status === "denied") {
-    return (
-      <main className="mx-auto flex min-h-screen w-full max-w-sm flex-col justify-center gap-4 px-4 text-center">
-        <h1 className="text-lg font-semibold tracking-tight">Dawn · exchange</h1>
-        <p className="text-muted-foreground text-sm">{gate.reason}</p>
-        {!user && (
-          <Button asChild>
-            <Link href="/login">Sign in</Link>
-          </Button>
-        )}
-      </main>
-    );
-  }
-
+export default function AdminIndex() {
   return (
-    <main className="mx-auto w-full max-w-6xl px-4 py-8">
-      <div className="mb-6 flex flex-wrap items-start justify-between gap-2">
-        <div>
-          <h1 className="text-xl font-semibold tracking-tight">
-            Dawn <span className="text-muted-foreground font-normal">· exchange</span>
-          </h1>
-          <p className="text-muted-foreground mt-1 max-w-xl text-sm">
-            A real introduction, replayed one email at a time — and what Dawn understood
-            from each reply.
-          </p>
-        </div>
-        <div className="text-muted-foreground flex items-center gap-3 text-xs">
-          <span>{gate.email}</span>
-          <Link href="/admin/monitor" className="underline underline-offset-4">
-            monitor
-          </Link>
-          <Link href="/admin/console" className="underline underline-offset-4">
-            console
-          </Link>
-        </div>
+    <main className="mx-auto w-full max-w-3xl px-6 py-16">
+      <div className="mb-12 flex items-center gap-3 text-dawn-bone">
+        <DawnMark idSuffix="admin" className="h-7 shrink-0 select-none" />
+        <h1 className="font-serif text-[32px] leading-none tracking-[0.3px]">
+          Dawn <span className="text-muted-foreground">· admin</span>
+        </h1>
       </div>
 
-      {error && <ErrorNote message={error} />}
-      {!rows && !error && <Loading what="introductions" />}
+      <p className="text-dawn-head mb-4 text-[11px] font-medium tracking-[2.4px] uppercase">
+        Surfaces
+      </p>
 
-      {rows && !rows.length && (
-        <EmptyNote>
-          No introductions exist yet, so there is nothing to replay. Generate counterparts with{" "}
-          <code className="text-xs">npm run personas</code>, then propose the first batch with{" "}
-          <code className="text-xs">/api/cron/run-matches</code> — see the runbook.
-        </EmptyNote>
-      )}
-
-      {rows && rows.length > 0 && (
-        <div className="grid gap-6 lg:grid-cols-[minmax(0,17rem)_minmax(0,1fr)]">
-          <aside className="lg:sticky lg:top-8 lg:self-start">
-            <ExchangeList
-              rows={visible}
-              selectedId={selectedId}
-              onSelect={setSelectedId}
-              filter={filter}
-              onFilterChange={(next) => {
-                setFilter(next);
-                const first = applyFilter(bestFirst(rows), next)[0]?.id ?? null;
-                // Keep the current selection if the new filter still contains it.
-                setSelectedId((current) =>
-                  current && applyFilter(bestFirst(rows), next).some((r) => r.id === current)
-                    ? current
-                    : first,
-                );
-              }}
-              totalCount={rows.length}
-            />
-          </aside>
-
-          <section>
-            {selectedId ? (
-              <Playback key={selectedId} introductionId={selectedId} />
-            ) : (
-              <EmptyNote>No introduction matches this filter.</EmptyNote>
-            )}
-          </section>
-        </div>
-      )}
+      <div className="space-y-3">
+        {SURFACES.map((surface, i) => (
+          <Link
+            key={surface.href}
+            href={surface.href}
+            style={{ "--dawn-delay": `${120 + i * 80}ms` } as React.CSSProperties}
+            className="dawn-enter border-dawn-btn bg-card hover:border-muted-foreground/40 block rounded-[--radius] border p-5 transition-colors"
+          >
+            <p className="font-serif text-xl tracking-[0.2px] text-dawn-bone">{surface.title}</p>
+            <p className="text-muted-foreground mt-1.5 text-sm">{surface.detail}</p>
+          </Link>
+        ))}
+      </div>
     </main>
   );
 }

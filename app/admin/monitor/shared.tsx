@@ -1,8 +1,5 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { adminFetch } from "../../lib/admin-fetch";
-import type { ThreadResponse } from "./types";
 import { Card, CardContent } from "@/components/ui/card";
 import type { ChartConfig } from "@/components/ui/chart";
 
@@ -143,45 +140,6 @@ export function EmptyNote({ children }: { children: React.ReactNode }) {
   );
 }
 
-// Expandable email thread, loaded on demand so the list views stay light.
-export function ThreadPanel({ conversationId }: { conversationId: string }) {
-  const [data, setData] = useState<ThreadResponse | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    adminFetch<ThreadResponse>(`/api/admin/monitor/thread?conversation_id=${conversationId}`)
-      .then((body) => !cancelled && setData(body))
-      .catch((err) => !cancelled && setError(err.message));
-    return () => {
-      cancelled = true;
-    };
-  }, [conversationId]);
-
-  if (error) return <ErrorNote message={error} />;
-  if (!data) return <Loading what="thread" />;
-  if (!data.messages.length) return <EmptyNote>No messages recorded on this thread yet.</EmptyNote>;
-
-  return (
-    <div className="space-y-2">
-      {data.messages.map((m) => (
-        <div
-          key={m.id}
-          className={`rounded-md border p-3 text-sm ${
-            m.direction === "inbound" ? "bg-muted/40" : "bg-card"
-          }`}
-        >
-          <div className="text-muted-foreground mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
-            <span className="text-foreground font-medium">
-              {m.direction === "inbound" ? "↓" : "↑"} {m.from_email ?? "unknown"}
-            </span>
-            <span>→ {m.to_emails?.join(", ") || "—"}</span>
-            <span>· {timeAgo(m.created_at)}</span>
-          </div>
-          {m.subject && <p className="mb-1 font-medium">{m.subject}</p>}
-          <p className="text-muted-foreground whitespace-pre-wrap">{m.body?.trim() || "(empty body)"}</p>
-        </div>
-      ))}
-    </div>
-  );
-}
+// ThreadPanel (the expandable email thread reader) lived here and was removed with
+// the email layer. `Dot`/`Pill` below are the pattern to reuse for any new status
+// marker — note they always pair the colour with a word, never colour alone.

@@ -12,10 +12,20 @@
     "personas:ecosystem": "tsx src/scripts/ecosystem-personas.ts",
     "match": "tsx src/scripts/match.ts",
     "cron:local": "tsx src/scripts/local-cron.ts",
-    "auth:config": "tsx src/scripts/configure-auth.ts",
-    "mcp": "tsx src/mcp/server.ts"
+    "probe:cache": "tsx src/scripts/probe-cache-minimum.ts",
+    "export:eval-fixtures": "tsx src/scripts/export-eval-fixtures.ts",
+    "backfill:entities": "tsx src/scripts/backfill-entities-from-people.ts",
+    "summarize:entities": "tsx src/scripts/summarize-entities.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:eval": "vitest run --mode eval --include 'src/**/*.eval.test.ts'",
+    "typecheck": "tsc --noEmit",
+    "mcp": "tsx src/mcp/server.ts",
+    "auth:config": "tsx src/scripts/configure-auth.ts"
   },
   "dependencies": {
+    "@ai-sdk/anthropic": "^4.0.33",
+    "@ai-sdk/react": "^4.0.58",
     "@anthropic-ai/sdk": "^0.112.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@radix-ui/react-label": "^2.1.13",
@@ -23,18 +33,20 @@
     "@radix-ui/react-tabs": "^1.1.19",
     "@supabase/supabase-js": "^2.58.0",
     "@tailwindcss/postcss": "^4.3.3",
-    "agentmail": "^0.5.17",
+    "ai": "7.0.52",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "dotenv": "^17.2.3",
     "lucide-react": "^1.26.0",
     "motion": "^12.42.2",
     "next": "^16.2.11",
+    "next-auth": "^5.0.0-beta.32",
     "openai": "^6.7.0",
     "p-limit": "^7.1.1",
     "postcss": "^8.5.22",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
     "recharts": "^3.8.0",
     "tailwind-merge": "^3.6.0",
     "tailwindcss": "^4.3.3",
@@ -46,6 +58,7 @@
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "tsx": "^4.20.6",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
   }
 }

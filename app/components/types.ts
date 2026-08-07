@@ -56,22 +56,6 @@ export interface MatchesResponse {
 }
 
 // Result of triggering an intro from the admin Network tab.
-export interface IntroTriggerResult {
-  ok?: boolean;
-  introductionId?: string;
-  state?: string;
-  emailedTo?: string | null;
-  simulated?: boolean;
-  threadId?: string | null;
-  alreadyActive?: boolean;
-  note?: string;
-  error?: string;
-}
-
-// A person's existing introduction, for the Introductions list.
-export interface IntroSummary {
-  id: string;
-  other: { id: string; name: string; headline: string | null } | null;
-  state: string;
-  created_at: string;
-}
+// IntroTriggerResult and IntroSummary lived here, describing the /api/admin/intro
+// send-an-intro response and the per-person introductions list. Both went with the
+// email layer along with their only consumer, NetworkTab's send buttons.

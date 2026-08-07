@@ -29,8 +29,8 @@ export default function Console() {
           Dawn <span className="text-muted-foreground font-normal">· console</span>
         </h1>
         <div className="text-muted-foreground flex items-center gap-3 text-xs">
-          <Link href="/admin" className="underline underline-offset-4">
-            exchange
+          <Link href="/admin/graph" className="underline underline-offset-4">
+            graph
           </Link>
           <Link href="/admin/monitor" className="underline underline-offset-4">
             monitor

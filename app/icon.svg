@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80" role="img" aria-label="Dawn">
+  <defs>
+    <mask id="c" maskUnits="userSpaceOnUse">
+      <rect width="80" height="80" fill="black"/>
+      <circle cx="40" cy="48" r="24" fill="white"/>
+      <ellipse cx="40" cy="48" rx="24" ry="15" fill="black"/>
+    </mask>
+  </defs>
+  <rect x="0" y="0" width="80" height="48" fill="#e8e6e1" mask="url(#c)"/>
+  <line x1="14" y1="48" x2="66" y2="48"
+        stroke="#e8e6e1" stroke-width="4" stroke-linecap="round"/>
+</svg>

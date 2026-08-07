@@ -3,18 +3,9 @@
 import { useEffect, useState } from "react";
 import { adminFetch } from "../../lib/admin-fetch";
 import type { IntroRow } from "./types";
-import {
-  EmptyNote,
-  ErrorNote,
-  Loading,
-  ResponseBadge,
-  StateBadge,
-  ThreadPanel,
-  timeAgo,
-} from "./shared";
+import { EmptyNote, ErrorNote, Loading, ResponseBadge, StateBadge, timeAgo } from "./shared";
 import { Card, CardContent } from "@/components/ui/card";
 import { SelectNative } from "@/components/ui/select-native";
-import { Button } from "@/components/ui/button";
 
 const STATES = [
   "proposed",
@@ -40,7 +31,6 @@ export default function IntrosTab() {
   const [rows, setRows] = useState<IntroRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [state, setState] = useState("");
-  const [openThread, setOpenThread] = useState<string | null>(null);
 
   useEffect(() => {
     setRows(null);
@@ -113,28 +103,14 @@ export default function IntrosTab() {
               </p>
             )}
 
+            {/* Message counts and the per-conversation thread reader were removed
+                with the email layer — this intro machinery is dark, so there are no
+                threads to read. State, responses, and rationale still tell the story. */}
             <div className="text-muted-foreground flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
               <span>created {timeAgo(intro.created_at)}</span>
               <span>· updated {timeAgo(intro.updated_at)}</span>
               <span>· via {intro.channel}</span>
-              <span>
-                · {intro.messageCount} message{intro.messageCount === 1 ? "" : "s"}
-              </span>
             </div>
-
-            {intro.conversations.map((c) => (
-              <div key={c.id} className="space-y-2">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => setOpenThread(openThread === c.id ? null : c.id)}
-                >
-                  {openThread === c.id ? "Hide" : "View"} {c.purpose.replace(/_/g, " ")} thread (
-                  {c.messageCount})
-                </Button>
-                {openThread === c.id && <ThreadPanel conversationId={c.id} />}
-              </div>
-            ))}
           </CardContent>
         </Card>
       ))}

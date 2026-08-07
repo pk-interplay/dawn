@@ -1,0 +1,69 @@
+{
+  "$schema": "dawn-v0 match outcome -> nexus rank_matches fixture, v1",
+  "id": "53f8a280-bee8-4f4d-8232-ab0b5f16bcc8",
+  "label": "rejected",
+  "source": "dawn_v0:matches",
+  "observed_at": "2026-07-24T16:28:20.752774+00:00",
+  "synthetic_counterpart": true,
+  "proposed": {
+    "score": 0.72,
+    "direction": "mutual",
+    "rationale": "Kwame is a repeat founder explicitly looking for a finance/ML lead to build unit-economics models for a new venture — Ryan is a staff ML engineer itching to build who wants a commercially-minded co-founder, which Kwame's founder credentials satisfy. Kwame's commercial and partnership experience directly fills Ryan's must-have for a commercial co-founder, while Ryan brings the technical modeling firepower Kwame needs. The strongest bidirectional fit for Ryan's co-founder ask."
+  },
+  "subject": {
+    "id": "69d14f22-8c98-41ea-96e5-498c2db80ff1",
+    "name": "Ryan Doyle",
+    "headline": "Staff ML engineer, tinkering with agentic finance tools",
+    "bio": "I ship recommendation and forecasting models at a large fintech by day. Nights and weekends I build LLM agents for personal finance. Torn between the stability I have and the itch to build.",
+    "offering": "Hands-on help wiring LLMs into real financial workflows without hallucinating your net worth away.",
+    "looking_for": "A commercially-minded co-founder to turn my side project into something real.",
+    "goals": [],
+    "background": [],
+    "tags": [
+      "ml",
+      "llm",
+      "personal-finance",
+      "agents"
+    ],
+    "industry": "Personal finance",
+    "career_stage": "Senior IC",
+    "location": "Berlin",
+    "ask_must_haves": [
+      "commercial co-founder",
+      "personal finance interest"
+    ],
+    "ask_nice_to_haves": [
+      "prior founding experience"
+    ],
+    "is_synthetic": true,
+    "is_demo_persona": false
+  },
+  "counterpart": {
+    "id": "dec6295a-d360-4793-9d33-660f52c49c4b",
+    "name": "Kwame Osei",
+    "headline": "Repeat founder, mobile money veteran",
+    "bio": "I've launched mobile money products across three telcos and one startup that got acquired. Now advising and quietly incubating my next idea in agent networks. Distribution is everything in this space.",
+    "offering": "Deep expertise in agent network economics and telco partnership negotiations.",
+    "looking_for": "A finance lead to build unit-economics models for my new agent-network concept.",
+    "goals": [],
+    "background": [],
+    "tags": [
+      "mobile-money",
+      "agent-networks",
+      "emerging-markets",
+      "telco"
+    ],
+    "industry": "Mobile financial services",
+    "career_stage": "Repeat founder",
+    "location": "New York",
+    "ask_must_haves": [
+      "unit economics modeling",
+      "finance leadership"
+    ],
+    "ask_nice_to_haves": [
+      "emerging-market experience"
+    ],
+    "is_synthetic": true,
+    "is_demo_persona": false
+  }
+}

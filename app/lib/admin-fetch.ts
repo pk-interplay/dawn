@@ -1,19 +1,20 @@
 "use client";
 
-import { supabaseBrowser } from "./supabase-browser";
-
-// Fetch wrapper for the admin API. Attaches the current Supabase session token
-// so requireAdmin() on the server can identify the caller.
+// Fetch wrapper for the admin API.
 //
-// `json` switches the call to POST and sends the value as the request body —
-// needed by /api/admin/intro, which triggers a real introduction and so must
-// carry the same credential as the read-only monitor routes.
+// This used to read the Supabase session and attach `Authorization: Bearer <token>`
+// so requireAdmin() could identify the caller. Google-only auth makes that
+// unnecessary: NextAuth's session cookie is sent automatically on same-origin
+// requests, and requireAdmin() reads it via auth(). Nothing to attach.
+//
+// Kept as a wrapper rather than inlining `fetch` at each call site because the
+// error unwrapping below is the actual value — the admin routes answer with
+// `{ error }` and a status, and every tab wants that surfaced as a thrown Error
+// with the server's own message rather than "Request failed (403)".
+//
+// `json` switches the call to POST and sends the value as the request body.
 export async function adminFetch<T>(path: string, json?: unknown): Promise<T> {
-  const { data } = await supabaseBrowser().auth.getSession();
-  const token = data.session?.access_token;
-
   const headers: Record<string, string> = {};
-  if (token) headers.Authorization = `Bearer ${token}`;
   if (json !== undefined) headers["Content-Type"] = "application/json";
 
   const res = await fetch(path, {

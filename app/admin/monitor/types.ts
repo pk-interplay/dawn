@@ -25,9 +25,6 @@ export interface Overview {
     byDirection: Record<string, number>;
     byStatus: Record<string, number>;
   };
-  inbound: { total: number; byDecision: Record<string, number>; replied: number };
-  messages: { total: number; inbound: number; outbound: number };
-  conversations: { total: number; byPurpose: Record<string, number>; byState: Record<string, number> };
   relationships: { total: number; byStatus: Record<string, number>; avgStrength: number | null };
   activity: Array<{ date: string; counts: Record<string, number>; total: number }>;
 }
@@ -38,15 +35,6 @@ export interface PersonRef {
   headline?: string | null;
   email?: string | null;
   paused?: boolean;
-}
-
-export interface ConversationRef {
-  id: string;
-  purpose: string;
-  state: string;
-  subject: string | null;
-  thread_id: string | null;
-  messageCount: number;
 }
 
 export interface IntroRow {
@@ -61,23 +49,6 @@ export interface IntroRow {
   person_a: PersonRef;
   person_b: PersonRef;
   match: { id: string; score: number | null; direction: string; status: string } | null;
-  conversations: ConversationRef[];
-  messageCount: number;
-}
-
-export interface InboxRow {
-  id: string;
-  from_email: string;
-  subject: string | null;
-  preview: string;
-  truncated: boolean;
-  decision: string;
-  classification: Record<string, unknown>;
-  replied: boolean;
-  created_at: string;
-  thread_id: string | null;
-  person: PersonRef | null;
-  conversation: { id: string; subject: string | null; purpose: string; state: string } | null;
 }
 
 export interface MemberRow extends PersonRef {
@@ -97,35 +68,4 @@ export interface MemberRow extends PersonRef {
   interactions: number;
   lastTouch: string | null;
   preferences: Array<{ kind: string; value: string; source: string; confidence: number }>;
-}
-
-export interface ThreadResponse {
-  conversation: {
-    id: string;
-    subject: string | null;
-    purpose: string;
-    state: string;
-    thread_id: string | null;
-    inbox_id: string | null;
-    participants: unknown;
-    created_at: string;
-    updated_at: string;
-  };
-  introduction: {
-    id: string;
-    state: string;
-    rationale: string | null;
-    person_a: PersonRef | null;
-    person_b: PersonRef | null;
-  } | null;
-  messages: Array<{
-    id: string;
-    direction: "inbound" | "outbound";
-    from_email: string | null;
-    to_emails: string[];
-    subject: string | null;
-    body: string | null;
-    parsed: Record<string, unknown>;
-    created_at: string;
-  }>;
 }

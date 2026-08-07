@@ -1,11 +1,12 @@
-import { createClient } from "@supabase/supabase-js";
+import { auth } from "../../src/auth";
 
-const url = process.env.SUPABASE_URL;
-const key = process.env.SUPABASE_PUBLISHABLE_KEY;
-
-// Allowlist gate for the read-only monitoring routes (/api/admin/monitor/*).
-// The browser sends its Supabase session token as a Bearer header; we verify it
-// server-side and check the resulting email against two allowlists:
+// Allowlist gate for the admin routes (/api/admin/*).
+//
+// The email comes from the NextAuth session — i.e. from Google's verified `email`
+// claim — rather than from a Supabase token in an `Authorization` header, which is
+// what this read before Google became the only way in. The allowlist logic itself
+// is unchanged, and remains the ONLY thing separating an operator from an ordinary
+// member now that the door is open to any Google account (see src/auth.ts):
 //
 //   ADMIN_EMAIL_DOMAINS — whole domains, e.g. "interplay.vc" (the common case:
 //                         anyone on the team gets in without a per-person edit)
@@ -45,32 +46,26 @@ function emailDomain(email: string): string | null {
 
 export type AdminCheck = { ok: true; email: string } | { ok: false; status: number; error: string };
 
-export async function requireAdmin(req: Request): Promise<AdminCheck> {
+// `req` is unused — the session comes from the request cookie via auth(). Kept in
+// the signature so every /api/admin/* route did not have to change in the same
+// commit as the auth swap.
+export async function requireAdmin(_req?: Request): Promise<AdminCheck> {
   const allowedEmails = adminEmails();
   const allowedDomains = adminDomains();
   if (!allowedEmails.length && !allowedDomains.length) {
     return {
       ok: false,
       status: 503,
-      error: "Set ADMIN_EMAIL_DOMAINS or ADMIN_EMAILS to open the monitor",
+      error: "Set ADMIN_EMAIL_DOMAINS or ADMIN_EMAILS to open the admin surfaces",
     };
   }
-  if (!url || !key) {
-    return { ok: false, status: 503, error: "Supabase env vars are not configured" };
+
+  const session = await auth();
+  if (!session?.user?.email) {
+    return { ok: false, status: 401, error: "Not signed in" };
   }
 
-  const header = req.headers.get("authorization") ?? "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-  if (!token) return { ok: false, status: 401, error: "Missing bearer token" };
-
-  // getUser(token) validates the JWT against the auth server rather than trusting
-  // the claims, so an expired or forged token fails here.
-  const { data, error } = await createClient(url, key).auth.getUser(token);
-  if (error || !data.user?.email) {
-    return { ok: false, status: 401, error: "Invalid session" };
-  }
-
-  const email = data.user.email.toLowerCase();
+  const email = session.user.email.toLowerCase();
   const domain = emailDomain(email);
   const permitted =
     allowedEmails.includes(email) || (domain !== null && allowedDomains.includes(domain));

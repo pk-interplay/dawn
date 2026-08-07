@@ -75,16 +75,10 @@ async function call(path: string): Promise<void> {
 async function tick(): Promise<void> {
   await call(`/api/cron/run-matches?synthetic=${SYNTHETIC}&limit=${BATCH}`);
 
-  // Fold the two daily jobs in, so the local run isn't missing the proximity decay
-  // and expiry that a scheduled deployment would be doing. Once per calendar day,
-  // at roughly the hours 0019 uses.
-  const now = new Date();
-  const today = now.toISOString().slice(0, 10);
-  if (today !== lastDailyRunDate && now.getUTCHours() >= DECAY_AT_UTC_HOUR) {
-    lastDailyRunDate = today;
-    await call("/api/cron/decay-proximity");
-    if (now.getUTCHours() >= EXPIRE_AT_UTC_HOUR) await call("/api/cron/expire-intros");
-  }
+  // decay-proximity and expire-intros used to be folded in here so a local run
+  // matched a scheduled deployment. Migration 0031 unschedules both — with the email
+  // layer gone, `relationships` has no writer and `introductions` no longer grows, so
+  // each was decaying or sweeping a frozen table. Nothing to mirror any more.
 }
 
 console.log(

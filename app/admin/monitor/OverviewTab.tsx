@@ -28,7 +28,6 @@ export default function OverviewTab() {
   if (error) return <ErrorNote message={error} />;
   if (!data) return <Loading what="overview" />;
 
-  const decisions = toRows(data.inbound.byDecision);
   const activity = data.activity.map((d) => ({ ...d, count: d.total }));
   const hasActivity = activity.some((d) => d.count > 0);
 
@@ -59,16 +58,6 @@ export default function OverviewTab() {
           hint={`${data.people.total - data.people.withEmail} unreachable`}
         />
         <StatTile
-          label="Inbound emails"
-          value={data.inbound.total}
-          hint={`${data.inbound.replied} replied to`}
-        />
-        <StatTile
-          label="Messages"
-          value={data.messages.total}
-          hint={`${data.messages.inbound} in · ${data.messages.outbound} out`}
-        />
-        <StatTile
           label="Matches"
           value={data.matches.total}
           hint={
@@ -85,11 +74,6 @@ export default function OverviewTab() {
               ? "no strength"
               : `avg strength ${data.relationships.avgStrength.toFixed(2)}`
           }
-        />
-        <StatTile
-          label="Conversations"
-          value={data.conversations.total}
-          hint={`${data.conversations.byState.open ?? 0} open`}
         />
         <StatTile
           label="Accepted matches"
@@ -172,54 +156,6 @@ export default function OverviewTab() {
                 <YAxis tickLine={false} axisLine={false} width={28} allowDecimals={false} />
                 <ChartTooltip content={<ChartTooltipContent />} />
                 <Bar dataKey="count" fill="var(--color-count)" radius={[4, 4, 0, 0]} maxBarSize={24} />
-              </BarChart>
-            </ChartContainer>
-          )}
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Inbound triage</CardTitle>
-          <CardDescription>
-            How the agent classified every email that reached the webhook.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          {!decisions.length ? (
-            <EmptyNote>No inbound email yet.</EmptyNote>
-          ) : (
-            <ChartContainer
-              config={chartConfig}
-              className="aspect-auto w-full"
-              style={{ height: Math.max(140, decisions.length * 34) }}
-            >
-              <BarChart
-                accessibilityLayer
-                data={decisions}
-                layout="vertical"
-                margin={{ left: 4, right: 32 }}
-                barCategoryGap={2}
-              >
-                <CartesianGrid horizontal={false} />
-                <XAxis type="number" dataKey="count" hide />
-                <YAxis
-                  type="category"
-                  dataKey="label"
-                  tickLine={false}
-                  axisLine={false}
-                  width={124}
-                />
-                <ChartTooltip cursor={false} content={<ChartTooltipContent hideLabel />} />
-                <Bar dataKey="count" fill="var(--color-count)" radius={[0, 4, 4, 0]} maxBarSize={24}>
-                  <LabelList
-                    dataKey="count"
-                    position="right"
-                    offset={8}
-                    className="fill-muted-foreground"
-                    fontSize={12}
-                  />
-                </Bar>
               </BarChart>
             </ChartContainer>
           )}

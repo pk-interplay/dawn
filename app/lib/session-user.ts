@@ -1,34 +1,33 @@
-import { createClient } from "@supabase/supabase-js";
+import { auth } from "../../src/auth";
 
-const url = process.env.SUPABASE_URL;
-const key = process.env.SUPABASE_PUBLISHABLE_KEY;
+/**
+ * Identify the signed-in user behind a request.
+ *
+ * Was: read a Supabase session token from an `Authorization: Bearer` header and
+ * validate it with `auth.getUser(token)`. Now: read the NextAuth session, since
+ * Google is the only way in.
+ *
+ * The `UserCheck` shape is kept identical so call sites need no change, but
+ * `user.id` now means something different — it is the Google `sub`
+ * (`entities.auth_user_id`), not a Supabase `auth.users` uuid. Anything that
+ * joined on the old value against `people.user_id` is reading a dead link.
+ *
+ * No bearer header is involved any more: NextAuth's session cookie is sent
+ * automatically on same-origin requests, which is why `adminFetch` stopped
+ * attaching one. `req` is retained in the signature — unused — so the ~dozen
+ * `requireUser(req)` call sites did not all have to change in the same commit as
+ * the auth swap. Drop the parameter when touching those routes for other reasons.
+ */
 
 export type SessionUser = { id: string; email: string | null };
 export type UserCheck =
   | { ok: true; user: SessionUser }
   | { ok: false; status: number; error: string };
 
-/**
- * Identify the member behind a request from their Supabase session token.
- *
- * Same posture as requireAdmin() in ./admin-auth.ts — getUser(token) validates the
- * JWT against the auth server rather than trusting its claims — but with no
- * allowlist: any confirmed account is a member. This is what lets the server, not
- * localStorage, answer "which people row is this?", so the logged-in state survives
- * a new browser or a cleared cache.
- */
-export async function requireUser(req: Request): Promise<UserCheck> {
-  if (!url || !key) {
-    return { ok: false, status: 503, error: "Supabase env vars are not configured" };
+export async function requireUser(_req?: Request): Promise<UserCheck> {
+  const session = await auth();
+  if (!session?.user?.id) {
+    return { ok: false, status: 401, error: "Not signed in" };
   }
-
-  const header = req.headers.get("authorization") ?? "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-  if (!token) return { ok: false, status: 401, error: "Missing bearer token" };
-
-  const { data, error } = await createClient(url, key).auth.getUser(token);
-  if (error || !data.user) {
-    return { ok: false, status: 401, error: "Invalid session" };
-  }
-  return { ok: true, user: { id: data.user.id, email: data.user.email ?? null } };
+  return { ok: true, user: { id: session.user.id, email: session.user.email ?? null } };
 }

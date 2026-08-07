@@ -1,5 +1,26 @@
 # Pilot runbook — 5 teammates, 3 days of introductions
 
+> ## ⚠️ This pilot is no longer runnable as written.
+>
+> The email layer it depends on has been removed: no AgentMail inbox, no send gateway,
+> no inbound webhook, no inbox/exchange UI. `src/lib/agentmail.ts` is a typed no-op and
+> a CI guard fails the build if any send path returns. So **steps 4 and 6–8 below cannot
+> be executed** — nothing will be delivered and no reply can arrive.
+>
+> What still works: onboarding, embedding-based matching, `rerank`, and the
+> `/admin/monitor` views. `run-matches` still computes and persists matches; it simply
+> stops there instead of opening an introduction.
+>
+> The double opt-in machinery (`intro-flow.ts`, `introductions`, the opt-in states) is
+> deliberately kept in the repo, dark, to be rewired to a channel later — see SPEC §3.2's
+> send gateway, build step 5. Migration 0031 unschedules `dawn-decay-proximity` and
+> `dawn-expire-intros`, both of which became no-ops.
+>
+> **This file needs a rewrite** once the Gmail onboarding flow and `/chat` land, at which
+> point the operator story is: sign in with Google → ingest → confirm profile → query the
+> graph. Kept in the meantime because the environment, cron, and troubleshooting sections
+> are still accurate, and because the pilot's hard-won failure modes are worth preserving.
+
 The test: a handful of real colleagues onboard at `/join`, and over the following days
 Dawn emails each of them a few warm introductions. Every counterpart is fictional and
 delivers to one inbox you control, so you play the other side of the network over real
@@ -18,9 +39,8 @@ has to stay unscheduled until then. The rest is ordinary setup.
 
 ## 1. Deploy first
 
-Nothing works locally. `pg_cron` calls the app over HTTPS to propose introductions,
-and AgentMail's webhook calls it to deliver replies — both need a public URL. While
-`APP_URL` points at localhost, no teammate's reply can ever reach the state machine.
+`pg_cron` calls the app over HTTPS to run matching, so that part needs a public URL.
+(The other half of this — AgentMail's webhook delivering replies — no longer exists.)
 
 ```sh
 vercel deploy --prod        # or your host of choice
@@ -36,30 +56,35 @@ Set these on the deployment (see `.env.example` for the full annotated list):
 | `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `NEXT_PUBLIC_*` | as usual |
 | `OPENAI_API_KEY` | **required** — no embeddings means no member is ever matched |
 | `ANTHROPIC_API_KEY` | required by `run-matches` |
-| `AGENTMAIL_API_KEY`, `AGENTMAIL_INBOX_ID` | required, or mail is only simulated |
-| `CRON_SECRET` | long random string; gates `/api/cron/*` and `/api/agent/inbound` |
-| `DEMO_PERSONA_INBOX` | the inbox you will read as every persona, e.g. `pk@interplay.vc` |
-| `INBOUND_AUTOREPLY` | `true` — otherwise an unsubscribe is honoured silently, with no acknowledgement to a real colleague |
-| `INBOUND_MAX_PER_HOUR` | `20`. Counted per person, not per address, so your persona replies don't share one budget — but you'll be answering several personas an hour |
+| `CRON_SECRET` | long random string; gates `/api/cron/*` |
 | `ADMIN_EMAILS` / `ADMIN_EMAIL_DOMAINS` | your address / your domain, for `/admin/monitor` |
 | `RESEND_API_KEY`, `AUTH_SENDER_EMAIL` | required for password reset — see step 2b |
-| `MAIL_REDIRECT_TO` | **blank.** Set, it swallows your teammates' introductions into your own inbox |
-| `INTRO_TEST_SINGLE_SIDED` | **blank.** Set, it records person B as having consented to an introduction they were never shown |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `AUTH_SECRET` | Gmail ingest sign-in (`src/auth.ts`) |
 
-The scripts (`npm run personas`) additionally need `SUPABASE_SERVICE_ROLE_KEY` and
-`DEMO_PERSONA_INBOX` in your local `.env`.
+The AgentMail, inbound-gating, and mail-redirect variables are gone with the email
+layer. `DEMO_PERSONA_INBOX` and `INTRO_TEST_SINGLE_SIDED` went with them — both existed
+only so one inbox could play both sides of an email round trip.
 
-Does your mail provider support plus-addressing? Send yourself a test at
-`you+test@yourdomain` before relying on it. Personas need one address each
-(`people.email` is unique) that all land in one mailbox, and plus tags are how that
-works. Google Workspace and most providers do this; if yours doesn't, use per-persona
-aliases and set `DEMO_PERSONA_INBOX` accordingly.
+The scripts (`npm run personas`) additionally need `SUPABASE_SERVICE_ROLE_KEY` in your
+local `.env`.
+
+The plus-addressing setup that used to be required here is not any more: personas needed
+one deliverable address each only so an operator could reply as them over real email.
+They are still generated as matching fixtures, and `people.email` is still unique, but
+nothing sends to those addresses.
 
 ## 2b. Auth email (password reset)
 
-Intro email goes out through AgentMail. Auth email — the password-reset link behind
-`/forgot-password` — goes out through Supabase, which needs its own SMTP. Resend
-provides it:
+> **Being removed.** Email+password auth is replaced by Google sign-in, which takes
+> `/forgot-password` and this whole SMTP setup with it. Two things must happen in the
+> Supabase dashboard to make "no email can be sent" actually true — clear the project's
+> custom SMTP settings and disable the email auth provider — because that mailer runs on
+> the platform, not in this repo, and no code change can switch it off. Do that BEFORE
+> deleting `src/scripts/configure-auth.ts`; it is the tool you would use to inspect or
+> revert the setting.
+
+Auth email — the password-reset link behind `/forgot-password` — goes out through
+Supabase, which needs its own SMTP. Resend provides it:
 
 ```sh
 vercel integration add resend/resend-email   # accept the marketplace terms in the browser once
@@ -95,24 +120,12 @@ supabase db push        # or apply 0018_demo_cohort.sql and 0019_pilot_schedule.
 three-hourly cadence and adds `unschedule_dawn_jobs()` — **neither is called at
 migration time**, deliberately. You call them in step 7.
 
-## 4. Inbound email
+## 4. Inbound email — removed
 
-Deploy the webhook and register it once:
-
-```sh
-supabase functions deploy agentmail-webhook
-supabase secrets set APP_URL=https://your-app CRON_SECRET=<same value as the app>
-```
-
-Then, against your AgentMail account:
-
-```js
-client.webhooks.create({ url: "<edge function url>", events: ["message.received"] })
-```
-
-Verify before inviting anyone: email Dawn's inbox from an address that isn't a member
-and confirm an `inbound_events` row appears with `decision = 'non_member'`. If nothing
-lands, replies will vanish silently for the whole pilot — fix it now.
+The `agentmail-webhook` Edge Function, `/api/agent/inbound`, and `src/lib/triage.ts` are
+deleted. Nothing can arrive, so there is nothing to register. SPEC §3.4 keeps the triage
+design (replay guard → self-send guard → sender resolution → trust → rate ceiling) for
+whenever inbound returns; recover the implementation from git history at `3171c91`.
 
 ## 5. Onboard the team (day 0)
 
@@ -153,7 +166,8 @@ select vault.create_secret('<CRON_SECRET>',    'dawn_cron_secret');
 select schedule_dawn_jobs();
 ```
 
-Expect: `Scheduled dawn-run-matches (every 3h), dawn-decay-proximity, dawn-expire-intros.`
+Expect: `Scheduled dawn-run-matches (hourly). decay-proximity and expire-intros are
+intentionally unscheduled — see 0031.`
 
 Volume is governed in two independent places and both have to allow it: the schedule
 (every 3h) and each member's `intro_cadence` (`burst` = one intro per 6h). The ceiling
@@ -166,26 +180,19 @@ curl -H "Authorization: Bearer $CRON_SECRET" \
   "https://your-app/api/cron/run-matches?synthetic=false&limit=10"
 ```
 
-## 8. Play the other side (daily)
+## 8. Play the other side (daily) — not possible
 
-Persona mail arrives in `DEMO_PERSONA_INBOX`, tagged so you can filter it. **Reply
-normally, from your ordinary address.** Inbound triage matches your address to the
-persona Dawn wrote to in that thread and attributes the reply to the persona, so a
-plain "yes, happy to chat" from `pk@` is recorded as Ava Chen opting in.
+This step was the heart of the pilot: persona mail landed in one inbox, you replied as
+each persona, and inbound triage attributed the reply so the double opt-in advanced. All
+three of those pieces are gone — no send, no inbox, no triage — so there is nothing to
+reply to and no way for a reply to be recorded.
 
-Two rules:
+Until a channel is rewired (SPEC §3.2, build step 5), the closest thing to exercising the
+other side is `/admin/console` → Network, which runs matching for a person and records a
+Pass — the same rejection signal the calibration loop reads.
 
-- **Reply in the thread.** The thread is what identifies which persona is speaking —
-  a fresh email resolves to you, not to them.
-- **Answer as that person would**, including saying no. An honest mix of yes and no is
-  what makes your teammates' side of the data worth reading.
-
-Check the run in `/admin/monitor`: introductions by state, the inbox tab for what
-arrived, and members with nothing in flight.
-
-If a reply doesn't resolve — it shows up as `decision = 'non_member'` — the fallback
-is the admin intro controls; don't hand-edit `introductions` rows, or the state
-machine and the email trail stop agreeing.
+Check the run in `/admin/monitor`: introductions by state and members with nothing in
+flight. The inbox tab and the per-intro thread reader are gone with the email layer.
 
 ## 9. Stop, and clean up
 
@@ -215,8 +222,4 @@ but nobody should be left wondering whether an intro is still coming.
 | No intros at all | Cron never scheduled (`select * from cron.job`), or the Vault secrets are missing |
 | One member never gets an intro | No embeddings on their row, or `paused = true` |
 | `run-matches` returns `skipped: "no candidates"` | Not enough personas answering that member's ask — generate more |
-| Your persona replies come back as the waitlist template | You replied outside the thread, or plus-addressing isn't delivering |
-| Teammates' intros land in your inbox | `MAIL_REDIRECT_TO` is set |
-| Everything is recorded but nothing is delivered | `AGENTMAIL_API_KEY` unset — the flow runs in simulated mode |
-| Replies do nothing | Webhook not registered, or `APP_URL`/`CRON_SECRET` mismatched between app and Edge Function |
-| Persona replies stop being processed mid-day | `INBOUND_MAX_PER_HOUR` reached for that persona |
+| Nothing is ever delivered | Expected — the email layer is removed. `run-matches` stops at the match. |

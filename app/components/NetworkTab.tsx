@@ -1,8 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { IntroSummary, IntroTriggerResult, MatchesResponse, PersonSummary } from "./types";
-import { adminFetch } from "../lib/admin-fetch";
+import type { MatchesResponse, PersonSummary } from "./types";
 import { SelectNative } from "@/components/ui/select-native";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -22,9 +21,6 @@ export default function NetworkTab({ initialPersonId }: { initialPersonId?: stri
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [respondingId, setRespondingId] = useState<string | null>(null);
-  const [sendingId, setSendingId] = useState<string | null>(null);
-  const [introResults, setIntroResults] = useState<Record<string, string>>({});
-  const [introductions, setIntroductions] = useState<IntroSummary[] | null>(null);
   const autoRanFor = useRef<string | null>(null);
 
   useEffect(() => {
@@ -48,13 +44,11 @@ export default function NetworkTab({ initialPersonId }: { initialPersonId?: stri
     setError(null);
     setSaveMessage(null);
     setData(null);
-    setIntroResults({});
     try {
       const res = await fetch(`/api/people/${id}/matches`);
       const body = await res.json();
       if (!res.ok) throw new Error(body.error ?? "Failed to run matchmaking");
       setData(body);
-      loadIntroductions(id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
@@ -62,51 +56,10 @@ export default function NetworkTab({ initialPersonId }: { initialPersonId?: stri
     }
   }
 
-  async function loadIntroductions(id: string) {
-    try {
-      const body = await adminFetch<{ introductions?: IntroSummary[] }>(
-        `/api/admin/intro?person_id=${id}`,
-      );
-      if (Array.isArray(body.introductions)) setIntroductions(body.introductions);
-    } catch {
-      /* best-effort */
-    }
-  }
-
-  // Fire the real intro flow (opt-in email + state machine) for a specific pair.
-  async function sendIntro(
-    candidateId: string,
-    rationale: string,
-    direction: string,
-    score: number | null,
-  ) {
-    if (!selectedId) return;
-    setSendingId(candidateId);
-    try {
-      const body = await adminFetch<IntroTriggerResult>(`/api/admin/intro`, {
-        person_id: selectedId,
-        candidate_id: candidateId,
-        rationale,
-        direction,
-        score,
-      });
-
-      const msg = body.alreadyActive
-        ? (body.note ?? "An introduction is already in progress.")
-        : body.simulated
-          ? `Simulated (set AGENTMAIL_API_KEY to send for real) — introduction is now ${body.state}.`
-          : `Opt-in email sent to ${body.emailedTo ?? "recipient"} — introduction is now ${body.state}.`;
-      setIntroResults((prev) => ({ ...prev, [candidateId]: msg }));
-      loadIntroductions(selectedId);
-    } catch (err) {
-      setIntroResults((prev) => ({
-        ...prev,
-        [candidateId]: err instanceof Error ? err.message : "Something went wrong",
-      }));
-    } finally {
-      setSendingId(null);
-    }
-  }
+  // The "Send intro email" buttons, the /api/admin/intro trigger, and the
+  // introductions list they fed were removed with the email layer. Matching itself
+  // is untouched: this tab still runs candidates → rerank → save, and Pass still
+  // records a rejection, which is the signal the calibration loop reads.
 
   async function respond(matchId: string, status: "accepted" | "rejected") {
     setRespondingId(matchId);
@@ -235,18 +188,6 @@ export default function NetworkTab({ initialPersonId }: { initialPersonId?: stri
                 <p className="text-sm">
                   <span className="font-medium">Why:</span> {m.rationale}
                 </p>
-                <div className="space-y-1">
-                  <Button
-                    size="sm"
-                    disabled={sendingId === m.candidate_id}
-                    onClick={() => sendIntro(m.candidate_id, m.rationale, m.direction, m.score)}
-                  >
-                    {sendingId === m.candidate_id ? "Sending…" : "Send intro email"}
-                  </Button>
-                  {introResults[m.candidate_id] && (
-                    <p className="text-muted-foreground text-xs">{introResults[m.candidate_id]}</p>
-                  )}
-                </div>
               </CardContent>
             </Card>
           ))}
@@ -270,58 +211,16 @@ export default function NetworkTab({ initialPersonId }: { initialPersonId?: stri
                 <p className="text-sm">
                   <span className="font-medium">Why:</span> {m.rationale}
                 </p>
-                {m.other?.id && (
-                  <div className="space-y-1">
-                    <div className="flex gap-2">
-                      <Button
-                        size="sm"
-                        disabled={sendingId === m.other.id}
-                        onClick={() =>
-                          sendIntro(m.other!.id, m.rationale, m.direction, m.score)
-                        }
-                      >
-                        {sendingId === m.other.id ? "Sending…" : "Send intro email"}
-                      </Button>
-                      {m.status === "suggested" && (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={respondingId === m.id}
-                          onClick={() => respond(m.id, "rejected")}
-                        >
-                          Pass
-                        </Button>
-                      )}
-                    </div>
-                    {introResults[m.other.id] && (
-                      <p className="text-muted-foreground text-xs">{introResults[m.other.id]}</p>
-                    )}
-                  </div>
+                {m.other?.id && m.status === "suggested" && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={respondingId === m.id}
+                    onClick={() => respond(m.id, "rejected")}
+                  >
+                    Pass
+                  </Button>
                 )}
-              </CardContent>
-            </Card>
-          ))}
-        </div>
-      )}
-
-      {introductions && introductions.length > 0 && (
-        <div className="space-y-3">
-          <h2 className="text-lg font-semibold">Introductions</h2>
-          <p className="text-muted-foreground text-sm">
-            Intros Dawn has started for this person and where each one stands.
-          </p>
-          {introductions.map((it) => (
-            <Card key={it.id}>
-              <CardContent className="flex items-center justify-between gap-3 py-3">
-                <div className="min-w-0">
-                  <h3 className="truncate text-sm font-medium">{it.other?.name ?? "Someone"}</h3>
-                  {it.other?.headline && (
-                    <p className="text-muted-foreground truncate text-xs">{it.other.headline}</p>
-                  )}
-                </div>
-                <span className="bg-secondary text-secondary-foreground shrink-0 rounded-full px-2 py-0.5 text-xs">
-                  {it.state}
-                </span>
               </CardContent>
             </Card>
           ))}

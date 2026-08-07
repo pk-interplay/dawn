@@ -2,7 +2,6 @@ import type { Candidate, Person } from "./types";
 
 const SHORTLIST_MIN = 3;
 const SHORTLIST_MAX = 5;
-const REQUEST_TIMEOUT_MS = 30_000;
 
 export const MATCH_SCHEMA = {
   type: "object",
@@ -83,11 +82,28 @@ export async function rerank(
     ? `\n\nRecent things this person actually wrote back to Dawn, newest first — use them to read intent the profile misses:\n${JSON.stringify(history)}\n`
     : "";
 
-  const resp = await anthropic.messages.create(
+  // Streamed rather than a plain create(), for the same reason /api/join/profile
+  // is: adaptive thinking spends from the same max_tokens as the response, and a
+  // budget this size risks an SDK HTTP timeout before the request finishes.
+  // Streaming also retires the manual 30s timeout — the SDK scales its own
+  // default for streamed requests.
+  const stream = anthropic.messages.stream(
     {
-      model: "claude-opus-4-8",
-      max_tokens: 4000,
-      output_config: { format: { type: "json_schema", schema: MATCH_SCHEMA } },
+      model: "claude-opus-5",
+      // Raised from 4000 alongside the model bump, and the order matters: Opus 5
+      // thinks by default when `thinking` is omitted, and max_tokens caps
+      // thinking AND the response together. Bumping the model without the budget
+      // truncates a shortlist mid-rationale, which reads as a quality regression
+      // rather than a configuration error.
+      max_tokens: 16000,
+      // Ranking is the product's quality ceiling (spec §7), so thinking stays on.
+      // `high` is Opus 5's default, set explicitly because that default has moved
+      // between generations. Sweep medium/high/xhigh against the eval fixtures
+      // before settling.
+      output_config: {
+        effort: "high",
+        format: { type: "json_schema", schema: MATCH_SCHEMA },
+      },
       messages: [
         {
           role: "user",
@@ -113,8 +129,8 @@ export async function rerank(
         },
       ],
     },
-    { timeout: REQUEST_TIMEOUT_MS },
   );
+  const resp = await stream.finalMessage();
 
   const parsed = JSON.parse(textOf(resp));
   if (!Array.isArray(parsed?.matches)) {
