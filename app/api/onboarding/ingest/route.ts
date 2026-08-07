@@ -30,6 +30,14 @@ export const dynamic = "force-dynamic";
 // nexus used 60s for the same shape of work and occasionally grazed it.
 export const maxDuration = 300;
 
+/**
+ * Streams newline-delimited JSON so the onboarding screen can show contacts flowing
+ * in live rather than a spinner. Event shapes on the wire:
+ *   {"type":"contact","name":"…","email":"…"}   — one per unique correspondent, as found
+ *   {"type":"error","error":"…"}                — ingest failed; nothing usable
+ *   {"type":"result","ingest":…,"draft":…,…}    — terminal success (draft may be null)
+ * The auth gate runs before the stream opens so a 401 is still a plain JSON status.
+ */
 export async function POST() {
   const session = await auth();
   if (!session?.user?.id || !session.user.email) {
@@ -43,66 +51,91 @@ export async function POST() {
       { status: 401 },
     );
   }
+  const accessToken = session.accessToken;
+  const name = session.user.name ?? null;
 
   const viewer = await ensureViewerEntity(supabase, session);
 
-  // Ingest first and separately. It is the part that must succeed — it is the graph —
-  // and it is the part with no model call in it.
-  let ingest;
-  try {
-    ingest = await ingestGmailNetwork(supabase, session.accessToken, viewer.email);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "Gmail ingest failed";
-    console.error("[onboarding] ingest failed:", message);
-    return NextResponse.json({ error: message }, { status: 502 });
-  }
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (event: Record<string, unknown>) =>
+        controller.enqueue(encoder.encode(JSON.stringify(event) + "\n"));
 
-  // Synthesis gets its own try/catch, and this is deliberate. nexus's equivalent
-  // route did not have one, so a synthesis failure returned 500 and the user saw
-  // "Something went wrong" even though their entire network had just been ingested
-  // successfully. The graph is the valuable part; a missing draft is recoverable by
-  // pressing Regenerate.
-  let synthesis;
-  try {
-    synthesis = await synthesizeProfile({
-      accessToken: session.accessToken,
-      email: viewer.email,
-      name: session.user.name ?? null,
-    });
-  } catch (err) {
-    console.error("[onboarding] synthesis failed:", err);
-    return NextResponse.json({
-      entityId: viewer.entityId,
-      ingest,
-      draft: null,
-      generated: false,
-      reason: "error" as const,
-    });
-  }
+      // Ingest first and separately. It is the part that must succeed — it is the graph
+      // — and the part with no model call in it. Each unique correspondent is streamed
+      // out as it is discovered; the client renders them as they arrive.
+      let ingest;
+      try {
+        const seen = new Set<string>();
+        ingest = await ingestGmailNetwork(supabase, accessToken, viewer.email, (contact) => {
+          if (seen.has(contact.email)) return;
+          seen.add(contact.email);
+          send({ type: "contact", name: contact.name, email: contact.email });
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Gmail ingest failed";
+        console.error("[onboarding] ingest failed:", message);
+        send({ type: "error", error: message });
+        controller.close();
+        return;
+      }
 
-  if (synthesis.draft) {
-    const { error } = await supabase.from("profile_drafts").upsert(
-      {
-        entity_id: viewer.entityId,
+      // Synthesis gets its own try/catch, and this is deliberate. nexus's equivalent
+      // route did not have one, so a synthesis failure looked like total failure even
+      // though the entire network had just been ingested. The graph is the valuable
+      // part; a missing draft is recoverable by pressing Regenerate.
+      let synthesis;
+      try {
+        synthesis = await synthesizeProfile({ accessToken, email: viewer.email, name });
+      } catch (err) {
+        console.error("[onboarding] synthesis failed:", err);
+        send({
+          type: "result",
+          entityId: viewer.entityId,
+          ingest,
+          draft: null,
+          generated: false,
+          reason: "error",
+        });
+        controller.close();
+        return;
+      }
+
+      if (synthesis.draft) {
+        const { error } = await supabase.from("profile_drafts").upsert(
+          {
+            entity_id: viewer.entityId,
+            draft: synthesis.draft,
+            model: SYNTHESIS_MODEL,
+            created_at: new Date().toISOString(),
+          },
+          { onConflict: "entity_id" },
+        );
+        if (error) {
+          // The draft exists but could not be staged. Send it anyway rather than
+          // throwing away a model call — Confirm re-synthesises if it finds no row.
+          console.error("[onboarding] failed to stage draft:", error.message);
+        }
+      }
+
+      send({
+        type: "result",
+        entityId: viewer.entityId,
+        ingest,
         draft: synthesis.draft,
-        model: SYNTHESIS_MODEL,
-        created_at: new Date().toISOString(),
-      },
-      { onConflict: "entity_id" },
-    );
-    if (error) {
-      // The draft exists but could not be staged. Return it anyway rather than
-      // throwing away a model call — Confirm will re-synthesise if it finds no row.
-      console.error("[onboarding] failed to stage draft:", error.message);
-    }
-  }
+        generated: synthesis.generated,
+        reason: synthesis.reason,
+        evidenceNote: describeEvidence(synthesis.evidence),
+      });
+      controller.close();
+    },
+  });
 
-  return NextResponse.json({
-    entityId: viewer.entityId,
-    ingest,
-    draft: synthesis.draft,
-    generated: synthesis.generated,
-    reason: synthesis.reason,
-    evidenceNote: describeEvidence(synthesis.evidence),
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-store, no-transform",
+    },
   });
 }

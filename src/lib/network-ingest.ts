@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { fetchRecentCalendarEvents, fetchRecentGmailHeaders } from "./gmail-ingest";
+import { fetchRecentCalendarEvents, fetchRecentGmailHeaders, type GmailHeaderSet } from "./gmail-ingest";
 import { findOrCreateEntity, projectDisplayName, writeClaim } from "./claims";
 
 /**
@@ -80,13 +80,33 @@ export async function ingestGmailNetwork(
   client: SupabaseClient,
   accessToken: string,
   youEmail: string,
+  onContact?: (contact: { name: string; email: string }) => void,
 ): Promise<IngestSummary> {
+  const you = youEmail.toLowerCase();
+
+  // Surface each real correspondent the moment its header batch arrives, so the
+  // onboarding screen can stream names in during the fetch rather than staring at a
+  // spinner. Never leaks message content — only the From/To/Cc display names, which
+  // is exactly what the ingest already keys on.
+  const onBatch = onContact
+    ? (batch: GmailHeaderSet[]) => {
+        for (const h of batch) {
+          for (const addr of [
+            ...splitAddresses(h.from),
+            ...splitAddresses(h.to),
+            ...splitAddresses(h.cc),
+          ]) {
+            if (addr.email !== you) onContact({ name: addr.name, email: addr.email });
+          }
+        }
+      }
+    : undefined;
+
   const [headers, events] = await Promise.all([
-    fetchRecentGmailHeaders(accessToken),
+    fetchRecentGmailHeaders(accessToken, onBatch),
     fetchRecentCalendarEvents(accessToken),
   ]);
 
-  const you = youEmail.toLowerCase();
   const contacts = new Map<string, ContactAccum>();
 
   const touch = (email: string, name: string, kind: "email" | "meeting", whenMs: number) => {

@@ -11,8 +11,17 @@
 
 /** How far back to look for emails/meetings. Keeps latency and API usage bounded. */
 const LOOKBACK_MONTHS = 6;
-/** How many message-metadata fetches to run concurrently. */
-const BATCH_SIZE = 20;
+/**
+ * How many message-metadata fetches to run concurrently. Gmail enforces a
+ * per-user *concurrency* limit (distinct from the per-second quota) and rejects
+ * excess simultaneous requests with 429 "Too many concurrent requests for user"
+ * (reason: rateLimitExceeded). 20 tripped it reliably; a handful in flight at
+ * once stays comfortably under. Transient bursts are absorbed by the backoff in
+ * googleFetch rather than by cranking this back up.
+ */
+const BATCH_SIZE = 5;
+/** Max attempts per request before giving up (1 initial + retries). */
+const MAX_ATTEMPTS = 5;
 
 export interface GmailHeaderSet {
   from?: string;
@@ -37,18 +46,42 @@ function lookbackDate(): Date {
   return d;
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 async function googleFetch(token: string, url: string) {
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Google API request failed (${res.status}): ${url}\n${body}`);
+  for (let attempt = 1; ; attempt++) {
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (res.ok) return res.json();
+
+    // 429 (rate/concurrency) and 5xx are transient — back off and retry. Everything
+    // else (401 expired token, 403 scope, 404) is terminal and re-raised immediately.
+    const retriable = res.status === 429 || res.status >= 500;
+    if (!retriable || attempt >= MAX_ATTEMPTS) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`Google API request failed (${res.status}): ${url}\n${body}`);
+    }
+
+    // Honor Retry-After when Google sends it; otherwise exponential backoff with
+    // jitter (0.5s, 1s, 2s, 4s …) so a batch's retries don't resynchronize into
+    // another concurrency spike.
+    const retryAfter = Number(res.headers.get("retry-after"));
+    const backoff = Number.isFinite(retryAfter) && retryAfter > 0
+      ? retryAfter * 1000
+      : 500 * 2 ** (attempt - 1) + Math.floor(Math.random() * 250);
+    await sleep(backoff);
   }
-  return res.json();
 }
 
 /** Lists recent Gmail messages and returns just the headers we need (From/To/Cc/Date/Subject).
- * Metadata-only: no message body is fetched or stored. */
-export async function fetchRecentGmailHeaders(token: string): Promise<GmailHeaderSet[]> {
+ * Metadata-only: no message body is fetched or stored.
+ *
+ * `onBatch` (optional) is called with each batch of headers as it comes back from
+ * Gmail, so a caller can surface ingest progress live (e.g. the onboarding ticker)
+ * instead of waiting for the whole lookback window to page in. */
+export async function fetchRecentGmailHeaders(
+  token: string,
+  onBatch?: (batch: GmailHeaderSet[]) => void,
+): Promise<GmailHeaderSet[]> {
   const after = Math.floor(lookbackDate().getTime() / 1000);
 
   const listUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
@@ -96,6 +129,7 @@ export async function fetchRecentGmailHeaders(token: string): Promise<GmailHeade
       }),
     );
     headers.push(...results);
+    onBatch?.(results);
   }
   return headers;
 }

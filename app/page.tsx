@@ -18,7 +18,7 @@
 import Link from "next/link";
 import { MessageCircle } from "lucide-react";
 
-import { auth } from "../src/auth";
+import { auth, signIn } from "../src/auth";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { DawnMark } from "./components/DawnMark";
@@ -31,19 +31,34 @@ export default async function Home() {
   // Google gives a full name; there is no separate first-name field to read.
   const firstName = session?.user?.name?.trim().split(/\s+/)[0];
 
-  const href = signedIn ? "/chat" : "/api/auth/signin?callbackUrl=%2Fonboarding";
-  const label = firstName
-    ? `Chat With Your Personal Super-Connector, ${firstName}`
-    : "Chat with Dawn";
+  // Starting Google sign-in needs a POST with CSRF through `signIn`, not a GET to
+  // /api/auth/signin — which, because pages.signIn is "/", just redirects back to
+  // this page and loops. So the signed-out button submits a server action instead
+  // of being a link.
+  async function startSignIn() {
+    "use server";
+    await signIn("google", { redirectTo: "/onboarding" });
+  }
+
+  // The home screen no longer opens an empty chat — it opens a chat that is already
+  // asking something. Four starter questions the graph can actually answer, so the
+  // first thing Dawn does is answer rather than sit at a blank prompt.
+  const questions = [
+    "Who are my most active relationships?",
+    "Who do I know at Anthropic?",
+    "Who haven't I talked to in a while?",
+    "Who could introduce me to someone at Stripe?",
+  ];
 
   return (
     <div className="flex h-screen overflow-hidden">
-      {/* The greeting takes the top-left corner when it's there, so About drops below it. */}
+      {/* The greeting takes the top-right corner when it's there, so About drops below it.
+          Both sit on the right now that the rail owns the left edge. */}
       <Link
         href="/about"
         style={{ "--dawn-delay": "380ms" } as React.CSSProperties}
         className={cn(
-          "dawn-enter fixed left-[26px] z-12 font-serif text-xl tracking-[0.3px]",
+          "dawn-enter fixed right-[26px] z-12 font-serif text-xl tracking-[0.3px]",
           "text-dawn-bone opacity-85 transition-opacity duration-150 hover:opacity-100",
           firstName ? "top-[60px]" : "top-[26px]",
         )}
@@ -54,7 +69,7 @@ export default async function Home() {
       {firstName && (
         <div
           style={{ "--dawn-delay": "180ms" } as React.CSSProperties}
-          className="dawn-enter fixed top-[22px] left-[26px] z-10 font-serif text-[22px] tracking-[0.3px] text-dawn-bone"
+          className="dawn-enter fixed top-[22px] right-[26px] z-10 font-serif text-[22px] tracking-[0.3px] text-dawn-bone"
         >
           Hello {firstName}!
         </div>
@@ -71,26 +86,64 @@ export default async function Home() {
           </span>
         </h1>
 
-        <Button
-          asChild
-          variant="pill"
-          size="pill"
+        <div
           style={{ "--dawn-delay": "380ms" } as React.CSSProperties}
-          className="dawn-enter dawn-shimmer max-w-[90vw]"
+          className="dawn-enter grid w-full max-w-[560px] grid-cols-2 gap-3 px-6"
         >
-          <Link href={href}>
-            <MessageCircle className="size-[17px] text-muted-foreground" strokeWidth={2} />
-            <span className="truncate">{label}</span>
-          </Link>
-        </Button>
+          {questions.map((question, i) =>
+            signedIn ? (
+              // Signed in, the question opens the chat already asking it.
+              <Link
+                key={question}
+                href={`/chat?q=${encodeURIComponent(question)}`}
+                style={{ "--dawn-delay": `${420 + i * 60}ms` } as React.CSSProperties}
+                className={cn(
+                  "dawn-enter border-dawn-btn bg-dawn-input group flex items-start gap-3 rounded-2xl border",
+                  "px-4 py-3.5 text-left transition-colors hover:border-muted-foreground/40",
+                )}
+              >
+                <MessageCircle
+                  className="text-muted-foreground group-hover:text-dawn-bone mt-0.5 size-[17px] shrink-0 transition-colors"
+                  strokeWidth={2}
+                />
+                <span className="text-muted-foreground group-hover:text-dawn-bone text-sm leading-snug transition-colors">
+                  {question}
+                </span>
+              </Link>
+            ) : (
+              // Signed out, any of them starts sign-in first; onboarding comes next.
+              <form
+                key={question}
+                action={startSignIn}
+                style={{ "--dawn-delay": `${420 + i * 60}ms` } as React.CSSProperties}
+                className="dawn-enter"
+              >
+                <button
+                  type="submit"
+                  className={cn(
+                    "border-dawn-btn bg-dawn-input group flex h-full w-full items-start gap-3 rounded-2xl border",
+                    "px-4 py-3.5 text-left transition-colors hover:border-muted-foreground/40",
+                  )}
+                >
+                  <MessageCircle
+                    className="text-muted-foreground group-hover:text-dawn-bone mt-0.5 size-[17px] shrink-0 transition-colors"
+                    strokeWidth={2}
+                  />
+                  <span className="text-muted-foreground group-hover:text-dawn-bone text-sm leading-snug transition-colors">
+                    {question}
+                  </span>
+                </button>
+              </form>
+            ),
+          )}
+        </div>
 
         {!signedIn && (
           <p
             style={{ "--dawn-delay": "480ms" } as React.CSSProperties}
             className="dawn-enter text-muted-foreground max-w-[80vw] text-center text-[13px]"
           >
-            Sign in with Google. Dawn reads your Gmail and Calendar metadata — who and
-            when, never message content — to build your side of the network.
+            Maps your network from who you email and meet — metadata only, never message content.
           </p>
         )}
       </main>
