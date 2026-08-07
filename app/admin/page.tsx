@@ -1,14 +1,13 @@
 /**
  * The /admin index.
  *
- * This route used to BE a tool — the "Dawn · exchange" email-thread viewer — which
- * is why the operator console had to move to /admin/console (see the comment at the
- * top of that file). That was a mistake worth not repeating: when the index is one
- * specific tool, the next tool has to displace it or hide somewhere.
+ * This route used to BE a tool — the "Dawn · exchange" email-thread viewer. That was
+ * a mistake worth not repeating: when the index is one specific tool, the next tool
+ * has to displace it or hide somewhere.
  *
  * So this is deliberately a signpost and nothing else. It holds no data, which is
  * also why it needs no gate: every destination below gates itself, and a list of
- * links leaks nothing. Adding a fourth surface means adding a card here.
+ * links leaks nothing. Adding a surface means adding a card here.
  */
 
 import type { Metadata } from "next";
@@ -32,11 +31,6 @@ const SURFACES = [
     title: "Monitor",
     detail:
       "Read-only rollup of the legacy people/matches schema — members, matches, and the intro funnel.",
-  },
-  {
-    href: "/admin/console",
-    title: "Console",
-    detail: "Operator tools over the same legacy schema: search, profiles, network, submit an ask.",
   },
 ];
 

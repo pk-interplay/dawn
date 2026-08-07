@@ -62,9 +62,6 @@ export default function Monitor() {
           <Link href="/admin/graph" className="underline underline-offset-4">
             graph
           </Link>
-          <Link href="/admin/console" className="underline underline-offset-4">
-            console
-          </Link>
         </div>
       </div>
 
