@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { signIn } from "next-auth/react";
 import { Loader2 } from "lucide-react";
 
 import { adminFetch } from "../../lib/admin-fetch";
@@ -44,8 +45,10 @@ export default function Monitor() {
         {/* Offered unconditionally: the server distinguishes not-signed-in from
             not-an-admin, but signing in as someone else is the only useful action
             either way, and there is no client session to branch on. */}
-        <Button asChild>
-          <Link href="/api/auth/signin?callbackUrl=%2Fadmin%2Fmonitor">Sign in</Link>
+        {/* signIn (POST + CSRF), not a link to /api/auth/signin — pages.signIn is
+            "/", so a GET there just loops back to home. */}
+        <Button onClick={() => void signIn("google", { callbackUrl: "/admin/monitor" })}>
+          Sign in
         </Button>
       </main>
     );

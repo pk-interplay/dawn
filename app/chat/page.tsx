@@ -4,6 +4,7 @@ import { redirect } from "next/navigation";
 import { auth } from "../../src/auth";
 import { supabase } from "../../src/lib/supabase";
 import { resolveViewerEntity } from "../../src/lib/entity-identity";
+import { isAdmin } from "../lib/admin-auth";
 import { DawnRail } from "../components/DawnRail";
 import { ChatSurface } from "./ChatSurface";
 
@@ -21,7 +22,9 @@ export const metadata: Metadata = {
  */
 export default async function Chat() {
   const session = await auth();
-  if (!session?.user?.id) redirect("/api/auth/signin?callbackUrl=%2Fchat");
+  // pages.signIn is "/", so a GET to /api/auth/signin just bounces back to the
+  // landing page anyway — redirect straight there, where the real sign-in lives.
+  if (!session?.user?.id) redirect("/");
 
   // Service-role client, matching /onboarding. Resolving identity through the
   // publishable-key `db` gated the answer behind RLS on `entities`, so onboarding
@@ -44,7 +47,7 @@ export default async function Chat() {
         firstName={session.user.name?.trim().split(/\s+/)[0] ?? null}
         networkSize={count ?? 0}
       />
-      <DawnRail signedIn />
+      <DawnRail signedIn isAdmin={await isAdmin()} />
     </>
   );
 }

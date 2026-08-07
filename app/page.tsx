@@ -21,12 +21,15 @@ import { MessageCircle } from "lucide-react";
 import { auth, signIn } from "../src/auth";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { isAdmin } from "./lib/admin-auth";
 import { DawnMark } from "./components/DawnMark";
 import { DawnRail } from "./components/DawnRail";
 
 export default async function Home() {
   const session = await auth();
   const signedIn = Boolean(session?.user?.id);
+  // Gates the Admin rail tab (see DawnRail). Only meaningful when signed in.
+  const admin = signedIn && (await isAdmin());
 
   // Google gives a full name; there is no separate first-name field to read.
   const firstName = session?.user?.name?.trim().split(/\s+/)[0];
@@ -43,6 +46,11 @@ export default async function Home() {
   // The home screen no longer opens an empty chat — it opens a chat that is already
   // asking something. Four starter questions the graph can actually answer, so the
   // first thing Dawn does is answer rather than sit at a blank prompt.
+  //
+  // These only render once signed in: each one is about *your* network ("my most
+  // active relationships", "who I know at Anthropic"), so showing them signed out
+  // advertises answers to a visitor who has no graph yet. Signed out, the main area
+  // is a single sign-in button instead — the recruiting slot the cards used to fill.
   const questions = [
     "Who are my most active relationships?",
     "Who do I know at Anthropic?",
@@ -86,13 +94,13 @@ export default async function Home() {
           </span>
         </h1>
 
-        <div
-          style={{ "--dawn-delay": "380ms" } as React.CSSProperties}
-          className="dawn-enter grid w-full max-w-[560px] grid-cols-2 gap-3 px-6"
-        >
-          {questions.map((question, i) =>
-            signedIn ? (
-              // Signed in, the question opens the chat already asking it.
+        {signedIn ? (
+          <div
+            style={{ "--dawn-delay": "380ms" } as React.CSSProperties}
+            className="dawn-enter grid w-full max-w-[560px] grid-cols-2 gap-3 px-6"
+          >
+            {questions.map((question, i) => (
+              // Each question opens the chat already asking it.
               <Link
                 key={question}
                 href={`/chat?q=${encodeURIComponent(question)}`}
@@ -110,33 +118,21 @@ export default async function Home() {
                   {question}
                 </span>
               </Link>
-            ) : (
-              // Signed out, any of them starts sign-in first; onboarding comes next.
-              <form
-                key={question}
-                action={startSignIn}
-                style={{ "--dawn-delay": `${420 + i * 60}ms` } as React.CSSProperties}
-                className="dawn-enter"
-              >
-                <button
-                  type="submit"
-                  className={cn(
-                    "border-dawn-btn bg-dawn-input group flex h-full w-full items-start gap-3 rounded-2xl border",
-                    "px-4 py-3.5 text-left transition-colors hover:border-muted-foreground/40",
-                  )}
-                >
-                  <MessageCircle
-                    className="text-muted-foreground group-hover:text-dawn-bone mt-0.5 size-[17px] shrink-0 transition-colors"
-                    strokeWidth={2}
-                  />
-                  <span className="text-muted-foreground group-hover:text-dawn-bone text-sm leading-snug transition-colors">
-                    {question}
-                  </span>
-                </button>
-              </form>
-            ),
-          )}
-        </div>
+            ))}
+          </div>
+        ) : (
+          // Signed out, the starter questions are hidden — they are about the visitor's
+          // own network, which does not exist until they sign in and ingest. The main
+          // area is the single sign-in call to action instead.
+          <form action={startSignIn} style={{ "--dawn-delay": "420ms" } as React.CSSProperties} className="dawn-enter">
+            <Button
+              type="submit"
+              className="bg-dawn-bone text-background hover:bg-dawn-bone/90 h-11 rounded-full px-6 text-[15px] font-medium"
+            >
+              Continue with Gmail
+            </Button>
+          </form>
+        )}
 
         {!signedIn && (
           <p
@@ -148,7 +144,7 @@ export default async function Home() {
         )}
       </main>
 
-      <DawnRail signedIn={signedIn} />
+      <DawnRail signedIn={signedIn} isAdmin={admin} />
     </div>
   );
 }

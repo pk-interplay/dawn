@@ -26,10 +26,12 @@ export default async function Onboarding() {
   const session = await auth();
   if (!session?.user?.id) redirect("/");
 
-  // No access token means the Google grant could not be refreshed. Sending them back
-  // to sign in is the only thing that fixes it, and Gmail ingest is the entire point
-  // of this screen — there is nothing to show without it.
-  if (!session.accessToken) redirect("/api/auth/signin?callbackUrl=%2Fonboarding");
+  // No access token means the Google grant could not be refreshed. Send them home
+  // rather than to /api/auth/signin, which — because pages.signIn is "/" — only
+  // redirects to home anyway (a GET there cannot start the POST+CSRF Google flow).
+  // Full recovery from a tokenless session still needs a fresh Google grant; that
+  // gap is unchanged, this just drops a pointless hop through a looping endpoint.
+  if (!session.accessToken) redirect("/");
 
   const viewer = await resolveViewerEntity(supabase, session);
   if (viewer?.onboardedAt) redirect("/chat");

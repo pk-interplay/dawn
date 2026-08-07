@@ -20,10 +20,9 @@
  * flash the signed-out rail on every load.
  */
 
-import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
-import { signOut } from "next-auth/react";
+import { signIn, signOut } from "next-auth/react";
 import {
   HelpCircle,
   LogIn,
@@ -47,8 +46,14 @@ interface RailItem {
   onSelect?: () => void;
 }
 
-export function DawnRail({ signedIn = false }: { signedIn?: boolean }) {
-  const router = useRouter();
+export function DawnRail({
+  signedIn = false,
+  isAdmin = false,
+}: {
+  signedIn?: boolean;
+  /** Gates the Admin tab: only the allowlisted operators (admin-auth.ts) see it. */
+  isAdmin?: boolean;
+}) {
   const [toast, setToast] = useState<string | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -73,7 +78,12 @@ export function DawnRail({ signedIn = false }: { signedIn?: boolean }) {
         { label: "Chat", icon: MessageCircle, href: "/chat" },
       ]
     : [
-        { label: "Sign In", icon: LogIn, onSelect: () => router.push("/api/auth/signin?callbackUrl=%2Fonboarding") },
+        // Google sign-in needs a POST with CSRF, which next-auth/react's signIn
+        // does. A GET to /api/auth/signin does NOT work here: pages.signIn is "/",
+        // so that route just redirects back to the landing page in a loop (see the
+        // same note in app/page.tsx). This is the client-side twin of the home
+        // screen's server action.
+        { label: "Sign In", icon: LogIn, onSelect: () => void signIn("google", { callbackUrl: "/onboarding" }) },
         { label: "About", icon: HelpCircle, href: "/about" },
       ];
 
@@ -81,9 +91,9 @@ export function DawnRail({ signedIn = false }: { signedIn?: boolean }) {
     // There is no settings route in this app yet, so the slot is kept for shape
     // and says so rather than linking nowhere.
     { label: "Settings", icon: Settings, onSelect: () => flash(SOON_MESSAGE) },
-    signedIn
-      ? { label: "Admin", icon: Shield, href: "/admin" }
-      : { label: "Admin", icon: Shield, onSelect: () => flash(GATE_MESSAGE) },
+    // The Admin tab is only shown to allowlisted operators — everyone else never
+    // sees a control that would just 403 (or gate-toast) when clicked.
+    ...(isAdmin ? [{ label: "Admin", icon: Shield, href: "/admin" } as RailItem] : []),
     { label: "Help", icon: HelpCircle, onSelect: () => flash(SOON_MESSAGE) },
   ];
 
