@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { Bar, BarChart, CartesianGrid, LabelList, XAxis, YAxis } from "recharts";
 import { adminFetch } from "../../lib/admin-fetch";
+import NetworkControls from "./NetworkControls";
 import type { Overview } from "./types";
 import { chartConfig, EmptyNote, ErrorNote, Loading, StatTile, pct, timeAgo } from "./shared";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -25,14 +26,30 @@ export default function OverviewTab() {
       .catch((err) => setError(err.message));
   }, []);
 
-  if (error) return <ErrorNote message={error} />;
-  if (!data) return <Loading what="overview" />;
+  // The network controls own their own fetch, so they render (and stay usable) even
+  // while the overview stats are still loading or have failed to load.
+  if (error)
+    return (
+      <div className="space-y-6">
+        <NetworkControls />
+        <ErrorNote message={error} />
+      </div>
+    );
+  if (!data)
+    return (
+      <div className="space-y-6">
+        <NetworkControls />
+        <Loading what="overview" />
+      </div>
+    );
 
   const activity = data.activity.map((d) => ({ ...d, count: d.total }));
   const hasActivity = activity.some((d) => d.count > 0);
 
   return (
     <div className="space-y-6">
+      <NetworkControls />
+
       {/* Hero: the one number the view leads with. */}
       <Card>
         <CardContent className="px-6">

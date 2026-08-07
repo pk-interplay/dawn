@@ -9,6 +9,7 @@ import {
   fetchRecentHistory,
 } from "../../../../src/lib/candidates";
 import { rerank, validateMatches } from "../../../../src/lib/rerank";
+import { readNetworkSettings } from "../../../../src/lib/network-settings";
 
 export const runtime = "nodejs";
 // Matching + reranking is slow; give the batch room. Vercel/host caps still apply.
@@ -54,6 +55,23 @@ async function run(req: Request) {
   // intros for people who don't exist. Pass ?synthetic=true to exercise the sandbox.
   const synthetic = url.searchParams.get("synthetic") === "true";
 
+  // Network-wide experiment controls (migration 0032). The master switch stops the
+  // scheduled batch entirely; a targeted ?person_id= test run is the one deliberate
+  // override, matching the cadence bypass below. `intensity` scales every member's
+  // cadence window: dividing by it makes intros more frequent as it rises.
+  const settings = await readNetworkSettings(db);
+  if (!settings.enabled && !onlyPersonId) {
+    return NextResponse.json({
+      ok: true,
+      processed: 0,
+      considered: 0,
+      results: [],
+      networkEnabled: false,
+      intensity: settings.intensity,
+      note: "Network is switched off; no introductions opened.",
+    });
+  }
+
   const results: RunResult[] = [];
   let processed = 0;
 
@@ -91,7 +109,11 @@ async function run(req: Request) {
       // (The match-frequency Edge Function exposes the same idea via the
       // person_intro_stats SQL function; here we count directly for a cast-safe
       // query.) Skipped when targeting a specific person for testing.
-      const days = CADENCE_DAYS[person.intro_cadence] ?? 7;
+      // The member's base window, scaled by the network intensity dial: a higher
+      // intensity shortens the window (more frequent intros), a lower one lengthens
+      // it. At intensity 1.0 this is exactly the member's own cadence.
+      const baseDays = CADENCE_DAYS[person.intro_cadence] ?? 7;
+      const days = baseDays / settings.intensity;
       const since = new Date(Date.now() - days * 86_400_000).toISOString();
       const { count: introsRecent } = await db
         .from("intros")
@@ -99,7 +121,10 @@ async function run(req: Request) {
         .eq("requester_ref", person.id)
         .gte("created_at", since);
       if (!onlyPersonId && (introsRecent ?? 0) > 0) {
-        results.push({ person: person.name, skipped: `over cadence (${introsRecent} in ${days}d)` });
+        results.push({
+          person: person.name,
+          skipped: `over cadence (${introsRecent} in ${days.toFixed(2)}d @ ${settings.intensity}×)`,
+        });
         continue;
       }
 
@@ -186,7 +211,14 @@ async function run(req: Request) {
       processed++;
     }
 
-    return NextResponse.json({ ok: true, processed, considered: people.length, results });
+    return NextResponse.json({
+      ok: true,
+      processed,
+      considered: people.length,
+      networkEnabled: settings.enabled,
+      intensity: settings.intensity,
+      results,
+    });
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "run-matches failed", processed, results },
