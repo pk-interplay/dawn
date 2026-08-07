@@ -152,6 +152,21 @@ Two investors named Chen at different funds, and one person changing firms, are 
 
 ## 3. Email layer
 
+> **Status: not built, and the `dawn-v0` implementation it draws on has been removed.**
+>
+> The AgentMail two-way inbox, the inbound webhook, `triage.ts`, and the inbox/exchange
+> UI are all deleted; `src/lib/agentmail.ts` remains only as a typed no-op so the intro
+> state machine still compiles, and a CI guard fails the build if any email send path
+> reappears. `dawn-v0`'s double opt-in machinery (`intro-flow.ts`, `introductions`, the
+> opt-in states) is kept in the repo, dark, to be rewired to a channel later.
+>
+> This section is therefore the **design for build step 5**, not a description of
+> running code. It is kept in full because the five behaviours in §3.2 each cost a real
+> incident to learn, and that is the most expensive knowledge in this document — but the
+> file:line references below point at code that no longer exists in that form. Read them
+> as "this is the behaviour and this is why", not as a map of the tree. Recover the exact
+> shapes from git history at commit `3171c91` if step 5 needs them.
+
 Two jobs. Conflating them is the failure that takes the product down.
 
 ### 3.1 Routing rule
@@ -317,9 +332,12 @@ Be precise about what that seed data is: one pair a human accepted or declined. 
 
 - **Review queue** — contested attributes, low-confidence claims, candidate entity links, drafts awaiting approval. Each row shows `evidence` (§2.1), or approving is rubber-stamping.
 - **Entity view** — every attribute with source, method, confidence, `observed_at`, and whether it is contested or stale.
-- **MCP tools over the graph**, consumed by Hermes. No chat UI in Next.js; the conversational surface already exists.
+- **MCP tools over the graph**, consumed by Hermes. This is the *operator* conversational surface, and it needs no Next.js UI of its own.
+- **Dawn chat** (`/chat`) — the *member-facing* conversational surface, added after this spec was written. Amends the original line here, which read "No chat UI in Next.js; the conversational surface already exists."
 
-Reuse `/admin/monitor`'s tab shell, `requireAdmin`, and `adminFetch`.
+  That line was right about Hermes and wrong as a general rule, and the landing page proved it: its only CTA said "Chat With Your Personal Super-Connector" and had nowhere to go. The two surfaces are not the same product. Hermes/MCP is an operator tool over the whole graph with no scope boundary and no session. Dawn chat is a signed-in member asking about *their* network, with a scope toggle between their own synced contacts and every teammate's — which is the warm-path question, and the reason the shared graph is worth building. It runs on its own tool set (`src/lib/network-tools.ts`) reading `entities`/`edges`/`resolved_attributes`, and it deliberately exposes `contested` and `stale` in conversation, which is the review queue's value delivered without a second UI.
+
+Reuse `/admin/monitor`'s tab shell, `requireAdmin`, and `adminFetch` for the operator surfaces above. The constellation view (`/admin/graph`) is a deliberate exception: it reads the claims model where monitor's tabs read legacy `people`/`matches`, and one tab strip over two live data models would assert they are the same dataset.
 
 ---
 

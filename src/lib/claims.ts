@@ -100,6 +100,34 @@ export interface EntityMatchHint {
 }
 
 /**
+ * Resolve an email to the entity that holds it as a live claim, or null.
+ *
+ * Lifted out of findOrCreateEntity (which still calls it) so callers that must
+ * NOT create an entity as a side effect can resolve one — "which entity is the
+ * signed-in user" is a lookup, and answering it by creating a duplicate is the
+ * bug. It also gives those callers a CI-legal path: the grep guard in
+ * .github/workflows/ci.yml fails the build on `from("claims")` anywhere but this
+ * file, so every claims read has to be exported from here.
+ */
+export async function findEntityIdByEmail(
+  client: SupabaseClient,
+  email: string,
+): Promise<string | null> {
+  const normalised = email.trim().toLowerCase();
+  if (!normalised) return null;
+
+  const { data, error } = await client
+    .from("claims")
+    .select("subject_id")
+    .eq("attribute", "email")
+    .is("superseded_by", null)
+    .filter("value", "eq", JSON.stringify(normalised))
+    .limit(1);
+  if (error) throw new Error(`findEntityIdByEmail lookup failed: ${error.message}`);
+  return data && data.length > 0 ? (data[0].subject_id as string) : null;
+}
+
+/**
  * Find an entity by email (the only basis used for automatic resolution —
  * SPEC §2.4: never hard-merge on name alone) or create one. Two investors
  * named Chen at different funds must not collapse into one entity just because
@@ -114,15 +142,8 @@ export async function findOrCreateEntity(
 ): Promise<string> {
   const email = opts.matchHint?.email?.trim().toLowerCase();
   if (email) {
-    const { data: existing, error } = await client
-      .from("claims")
-      .select("subject_id")
-      .eq("attribute", "email")
-      .is("superseded_by", null)
-      .filter("value", "eq", JSON.stringify(email))
-      .limit(1);
-    if (error) throw new Error(`findOrCreateEntity lookup failed: ${error.message}`);
-    if (existing && existing.length > 0) return existing[0].subject_id as string;
+    const existing = await findEntityIdByEmail(client, email);
+    if (existing) return existing;
   }
 
   const { data: created, error: insertError } = await client

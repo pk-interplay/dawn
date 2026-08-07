@@ -1,27 +1,41 @@
 import NextAuth from "next-auth";
 import Google from "next-auth/providers/google";
 import { GOOGLE_SCOPES } from "./lib/google-scopes";
+import { supabase } from "./lib/supabase";
+import { findOrCreateEntity } from "./lib/claims";
 
 /**
- * Gmail-ingest auth (Nexus v0.2 build step 2, SPEC.md §3.3). Ported from
- * nexus's src/auth.ts. This is a SECOND, deliberately separate auth system
- * from the member-facing Supabase Auth (app/lib/supabase-browser.ts) and the
- * admin allowlist (app/lib/admin-auth.ts) — it exists only to get a Google
- * access token for whichever mailbox(es) are the ingest source, not as a
- * general sign-in mechanism.
+ * THE auth system. Google only.
  *
- * SPEC §3.3: ship internal-only to Interplay's Workspace — the only shape
- * that keeps CASA (third-party security assessment) off the critical path.
- * Enforced below via the `hd` (hosted domain) claim Google puts on the ID
- * token for Workspace accounts: a personal @gmail.com account has no `hd`
- * claim at all and is rejected, not merely unprivileged.
+ * This used to be one of two: a Supabase email+password system served members
+ * (/login, /join, /me, password reset) while this file existed solely to get a
+ * Google access token for Gmail ingest. That split meant two notions of "who am
+ * I" — a Supabase user id and a Google `sub` — with no link between them, so the
+ * ingested graph belonged to an identity the app's own session could not name.
+ * Supabase Auth is gone; a Google account is now the only way in, and the Google
+ * `sub` is the single identity everything keys on.
+ *
+ * ## Any Gmail account, deliberately
+ *
+ * There used to be a `signIn` callback here rejecting any account whose ID token
+ * carried no `hd` (Workspace hosted-domain) claim — which is every personal
+ * @gmail.com account. It cited SPEC §3.3: internal-use apps are exempt from
+ * Google verification and CASA, and CASA triggers on storing restricted-scope
+ * data, which Gmail ingest does.
+ *
+ * That reasoning still holds and the constraint has NOT gone away — it has moved.
+ * Access is now gated per surface rather than at the door:
+ *
+ *   - `requireAdmin` (app/lib/admin-auth.ts) still allowlists on ADMIN_EMAILS /
+ *     ADMIN_EMAIL_DOMAINS, deny-by-default, so the operator surfaces are unchanged.
+ *   - Anyone signing in gets an entity in the single Interplay workspace and can
+ *     ingest their own mailbox and query the graph.
+ *
+ * **Before this app is offered to anyone outside Interplay's Workspace, re-read
+ * SPEC §3.3.** Restricted-scope data leaving an internal-use app is what puts a
+ * third-party security assessment on the critical path, and that is a launch
+ * dependency, not a compliance footnote. Nothing in the code will stop you.
  */
-function allowedDomains(): string[] {
-  return (process.env.ADMIN_EMAIL_DOMAINS ?? "")
-    .split(",")
-    .map((d) => d.trim().toLowerCase().replace(/^@/, ""))
-    .filter(Boolean);
-}
 
 /** Refreshes an expired Google access token using the stored refresh token. */
 async function refreshGoogleAccessToken(refreshToken: string) {
@@ -65,18 +79,47 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
   ],
   secret: process.env.AUTH_SECRET,
   callbacks: {
-    async signIn({ profile }) {
-      const domains = allowedDomains();
-      if (!domains.length) return false; // deny by default — same posture as admin-auth.ts
-      const hd = (profile as { hd?: string } | undefined)?.hd?.toLowerCase();
-      return !!hd && domains.includes(hd);
-    },
-    async jwt({ token, account }) {
+    async jwt({ token, account, profile }) {
       if (account) {
+        // Auth.js deliberately assigns `user.id` a random UUID on every sign-in
+        // when there is no database adapter (see @auth/core's getUserAndAccount:
+        // "the user's id is intentionally not set based on the profile id").
+        // Without pinning it, every login gets a fresh unrelated id and all
+        // previously-ingested data becomes invisible. account.providerAccountId
+        // is the stable Google account id (profile.sub) — pin to that.
         if (account.providerAccountId) token.sub = account.providerAccountId;
         token.accessToken = account.access_token;
         token.refreshToken = account.refresh_token;
         token.expiresAt = account.expires_at;
+
+        // Claim the caller's entity and stamp it with this Google id, so
+        // "which entity is the signed-in user" is answerable from the session
+        // alone rather than re-derived from an email claim on every request.
+        //
+        // findOrCreateEntity resolves by the live `email` claim, so a user who
+        // already appears in the graph as somebody else's contact is ADOPTED
+        // rather than duplicated — which is the whole point of doing it here
+        // instead of at first ingest.
+        //
+        // Best-effort: never block sign-in on it. If Supabase is down the user
+        // still gets a session, and the onboarding route resolves the entity
+        // again on its own.
+        if (token.sub && profile?.email) {
+          try {
+            const entityId = await findOrCreateEntity(supabase, {
+              kind: "person",
+              matchHint: { email: profile.email },
+            });
+            const { error } = await supabase
+              .from("entities")
+              .update({ auth_user_id: token.sub })
+              .eq("id", entityId)
+              .is("auth_user_id", null); // never steal an entity already claimed
+            if (error) throw new Error(error.message);
+          } catch (err) {
+            console.error("[auth] Failed to link entity to Google account:", err);
+          }
+        }
         return token;
       }
       if (token.expiresAt && Date.now() / 1000 > (token.expiresAt as number) - 60) {
@@ -102,5 +145,11 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       session.accessToken = token.accessToken as string | undefined;
       return session;
     },
+  },
+  pages: {
+    // The landing page IS the sign-in page (one pill, "Continue with Gmail"), so
+    // an unauthenticated redirect should land there rather than on Auth.js's
+    // built-in provider-picker — there is only one provider to pick.
+    signIn: "/",
   },
 });

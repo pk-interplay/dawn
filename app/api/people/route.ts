@@ -19,14 +19,26 @@ export async function POST(request: Request) {
   const body = await request.json();
 
   // Onboarding is signed-in only, and the identity comes from the verified session
-  // rather than the body: a client-supplied user_id could claim someone else's row,
+  // rather than the body: a client-supplied identity could claim someone else's row,
   // and a missing one produced an orphan the account could never find again. Seeding
   // scripts write through the service-role client, not this route.
   const auth = await requireUser(request);
   if (!auth.ok) {
     return NextResponse.json({ error: auth.error }, { status: auth.status });
   }
-  const { id: authUserId, email: authEmail } = auth.user;
+  const { email: authEmail } = auth.user;
+
+  // `people.user_id` is deliberately NOT written any more. It is a `uuid` column
+  // referencing Supabase's auth.users (migration 0007), and Supabase Auth is gone —
+  // the session id is now a Google `sub`, a numeric string that is not a valid uuid.
+  // Writing it would fail with a Postgres 22P02 cast error, which is a confusing way
+  // to discover a dead foreign key. Email is now the only link from a session to a
+  // `people` row.
+  //
+  // This route is legacy and effectively dark: its only caller was the /join
+  // onboarding flow, replaced by the Gmail flow which writes claims instead. GET is
+  // still read by /admin/console. It retires with `people` at SPEC build step 5. The
+  // signed-in identity↔entity link lives on `entities.auth_user_id` (migration 0029).
 
   const {
     name,
@@ -80,7 +92,6 @@ export async function POST(request: Request) {
     ask_must_haves: Array.isArray(ask_must_haves) ? ask_must_haves : [],
     ask_nice_to_haves: Array.isArray(ask_nice_to_haves) ? ask_nice_to_haves : [],
     email: authEmail,
-    user_id: authUserId,
     timezone: timezone || null,
     intro_cadence: cadence,
   };
@@ -110,7 +121,7 @@ export async function POST(request: Request) {
   // with the same identity — and a duplicate row makes the member invisible to
   // inbound triage (its .maybeSingle() lookup errors on two matches) and gets them
   // treated as a non-member. Resolve by auth user first, then by email.
-  const existing = await findExistingPerson(authUserId, authEmail);
+  const existing = await findExistingPerson(authEmail);
 
   const { data, error } = existing
     ? await db.from("people").update(record).eq("id", existing).select().single()
@@ -201,15 +212,14 @@ async function savePreferences(personId: string, raw: unknown): Promise<number> 
   return rows.length;
 }
 
-/** Existing people.id for this auth user or email address, if any. */
-async function findExistingPerson(
-  userId: unknown,
-  email: unknown,
-): Promise<string | null> {
-  if (typeof userId === "string" && userId) {
-    const { data } = await db.from("people").select("id").eq("user_id", userId).maybeSingle();
-    if (data?.id) return data.id as string;
-  }
+/**
+ * Existing people.id for this email address, if any.
+ *
+ * Used to resolve by `user_id` first. That column is a uuid referencing Supabase's
+ * auth.users, and the session id is now a Google `sub` — comparing the two errors
+ * rather than missing, so the lookup is email-only.
+ */
+async function findExistingPerson(email: unknown): Promise<string | null> {
   if (typeof email === "string" && email) {
     const { data } = await db.from("people").select("id").ilike("email", email).maybeSingle();
     if (data?.id) return data.id as string;

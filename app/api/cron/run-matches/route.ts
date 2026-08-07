@@ -9,7 +9,6 @@ import {
   fetchRecentHistory,
 } from "../../../../src/lib/candidates";
 import { rerank, validateMatches } from "../../../../src/lib/rerank";
-import { startIntroduction } from "../../../../src/lib/intro-flow";
 
 export const runtime = "nodejs";
 // Matching + reranking is slow; give the batch room. Vercel/host caps still apply.
@@ -166,19 +165,23 @@ async function run(req: Request) {
         .eq("id", chosen.candidate_id)
         .single();
 
-      const intro = await startIntroduction(db, {
-        helped: person,
-        suggested: suggested as Person,
-        matchId: matchRow?.id ?? null,
-        direction: chosen.direction,
-        rationale: chosen.rationale,
-      });
-
+      // This is where the run used to call startIntroduction(), which wrote the
+      // introductions/conversations/intros rows and then sent the opt-in email.
+      // The email layer is gone, so the run now stops at the match: candidates are
+      // fetched, reranked, validated, and the winner is persisted to `matches`.
+      //
+      // Deliberately NOT calling startIntroduction() with sending neutered. It also
+      // writes the `intros` ledger row that the cadence gate above counts, so
+      // leaving it in would silently rate-limit members out of being matched for an
+      // intro that never reaches them. Rewiring the intro machinery to a new channel
+      // is what re-opens this call site — see SPEC §3.2's send gateway (step 5).
       results.push({
         person: person.name,
         suggested: (suggested as Person | null)?.name ?? null,
         score: chosen.score,
-        ...intro,
+        matchId: matchRow?.id ?? null,
+        direction: chosen.direction,
+        introduced: false as const,
       });
       processed++;
     }

@@ -38,6 +38,28 @@ jobs:
             exit 1
           fi
 
+      # The email layer was removed deliberately, not incidentally: no inbox, no
+      # send gateway, no inbound webhook. Its replacement is SPEC §3.2's gateway,
+      # where every send passes suppression → consent → rate limit → idempotency →
+      # approval first. A stray `resend`/`nodemailer` import, or a Gmail send scope,
+      # would route around all five of those gates — so this is checked, not trusted.
+      #
+      # NOTE: this cannot cover Supabase Auth's own mailer, which sends from the
+      # platform rather than from this repo. That is disabled in the project's
+      # dashboard settings (custom SMTP cleared, email provider off); see RUNBOOK.
+      # Matches the granted-scope URL form (`auth/gmail.send`) rather than a bare
+      # `gmail.send`, so prose explaining WHY those scopes are dropped — as
+      # src/lib/google-scopes.ts does — doesn't fail the build. A guard that trips on
+      # its own documentation gets deleted by the next person, which is worse than
+      # not having one.
+      - name: No email send path
+        run: |
+          if grep -rnE 'from "agentmail"|require\("agentmail"\)|from "resend"|nodemailer|@sendgrid|postmark|mailgun|auth/gmail\.send|auth/gmail\.compose|messages/send' \
+               src app lib components supabase --include='*.ts' --include='*.tsx'; then
+            echo "An email send path was reintroduced. Route sends through SPEC §3.2's gateway instead." >&2
+            exit 1
+          fi
+
   eval:
     runs-on: ubuntu-latest
     needs: checks

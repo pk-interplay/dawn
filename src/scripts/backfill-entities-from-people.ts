@@ -1,5 +1,5 @@
 import { supabase } from "../lib/supabase";
-import { writeClaims, type ClaimInput } from "../lib/claims";
+import { findOrCreateEntity, writeClaims, type ClaimInput } from "../lib/claims";
 import type { Person } from "../lib/types";
 
 /**
@@ -41,13 +41,28 @@ const ARRAY_COLUMNS: (keyof Person)[] = ["goals", "background", "tags", "ask_mus
 const FLAG_COLUMNS: (keyof Person)[] = ["is_synthetic", "is_demo_persona", "paused"];
 
 async function backfillPerson(person: Person): Promise<{ entityId: string; claimCount: number }> {
-  const { data: entity, error: entityError } = await supabase
+  // Must go through findOrCreateEntity, NOT a bare insert. Gmail ingest
+  // (network-ingest.ts) resolves contacts by their live `email` claim, so it
+  // will reuse an entity this script created — but a bare insert here does not
+  // reciprocate. Run this script AFTER an ingest and the same human ends up with
+  // two entities: one holding every `edges` row, the other holding
+  // headline/bio/offering/looking_for. Nothing errors; the graph just quietly
+  // splits, and a chat resolving to the wrong half sees either no network or no
+  // profile. Resolving by email in both directions is what keeps them one.
+  const entityId = await findOrCreateEntity(supabase, {
+    kind: "person",
+    matchHint: { email: person.email ?? undefined },
+  });
+
+  // findOrCreateEntity does not set display_name (projectDisplayName owns that
+  // column, projected from claims). Set it here only when creating fresh, so a
+  // re-run cannot clobber a name an ingest already projected.
+  const { error: nameError } = await supabase
     .from("entities")
-    .insert({ kind: "person", display_name: person.name })
-    .select("id")
-    .single();
-  if (entityError) throw new Error(`entity insert failed for ${person.name}: ${entityError.message}`);
-  const entityId = entity.id as string;
+    .update({ display_name: person.name })
+    .eq("id", entityId)
+    .is("display_name", null);
+  if (nameError) throw new Error(`entity display_name failed for ${person.name}: ${nameError.message}`);
 
   const observedAt = new Date().toISOString();
   const source = `migration:people.${person.id}`;

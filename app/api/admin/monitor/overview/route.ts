@@ -55,37 +55,24 @@ export async function GET(req: Request) {
 
     // Row counts here are in the tens, so pulling the columns and aggregating in
     // JS avoids adding RPCs for group-bys. Revisit if any table passes ~5k rows.
-    const [people, introductions, matches, inbound, messages, conversations, relationships, interactions] =
-      await Promise.all([
-        db.from("people").select("id, paused, intro_cadence, email, industry, created_at"),
-        db.from("introductions").select("id, state, a_response, b_response, created_at, updated_at"),
-        db.from("matches").select("id, score, direction, status, created_at"),
-        db.from("inbound_events").select("id, decision, replied, created_at"),
-        db.from("messages").select("id, direction, created_at"),
-        db.from("conversations").select("id, purpose, state, created_at"),
-        db.from("relationships").select("id, status, strength, last_interaction_at"),
-        db.from("interactions").select("id, type, occurred_at").gte("occurred_at", since),
-      ]);
+    // `inbound_events`, `messages`, and `conversations` used to be read here. The
+    // email layer that wrote them is gone, so they would report frozen totals
+    // forever — worse than absent, because a stale number reads as a live one.
+    const [people, introductions, matches, relationships, interactions] = await Promise.all([
+      db.from("people").select("id, paused, intro_cadence, email, industry, created_at"),
+      db.from("introductions").select("id, state, a_response, b_response, created_at, updated_at"),
+      db.from("matches").select("id, score, direction, status, created_at"),
+      db.from("relationships").select("id, status, strength, last_interaction_at"),
+      db.from("interactions").select("id, type, occurred_at").gte("occurred_at", since),
+    ]);
 
-    for (const result of [
-      people,
-      introductions,
-      matches,
-      inbound,
-      messages,
-      conversations,
-      relationships,
-      interactions,
-    ]) {
+    for (const result of [people, introductions, matches, relationships, interactions]) {
       if (result.error) throw new Error(result.error.message);
     }
 
     const peopleRows = people.data ?? [];
     const introRows = introductions.data ?? [];
     const matchRows = matches.data ?? [];
-    const inboundRows = inbound.data ?? [];
-    const messageRows = messages.data ?? [];
-    const conversationRows = conversations.data ?? [];
     const relationshipRows = relationships.data ?? [];
     const interactionRows = interactions.data ?? [];
 
@@ -157,21 +144,6 @@ export async function GET(req: Request) {
         avgScore: avg(scores),
         byDirection: tally(matchRows, "direction"),
         byStatus: tally(matchRows, "status"),
-      },
-      inbound: {
-        total: inboundRows.length,
-        byDecision: tally(inboundRows, "decision"),
-        replied: inboundRows.filter((r) => r.replied).length,
-      },
-      messages: {
-        total: messageRows.length,
-        inbound: messageRows.filter((m) => m.direction === "inbound").length,
-        outbound: messageRows.filter((m) => m.direction === "outbound").length,
-      },
-      conversations: {
-        total: conversationRows.length,
-        byPurpose: tally(conversationRows, "purpose"),
-        byState: tally(conversationRows, "state"),
       },
       relationships: {
         total: relationshipRows.length,

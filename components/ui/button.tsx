@@ -19,6 +19,12 @@ const buttonVariants = cva(
         secondary: "bg-secondary text-secondary-foreground shadow-xs hover:bg-secondary/80",
         ghost: "hover:bg-accent hover:text-accent-foreground",
         link: "text-primary underline-offset-4 hover:underline",
+        /**
+         * Dawn's only call to action: a dark indigo pill with a bone label, per
+         * the reference build. There is no saturated CTA colour in this design —
+         * `bg-primary` sitting just above the canvas is the intent.
+         */
+        pill: "rounded-full border border-dawn-btn bg-primary text-dawn-bone hover:bg-accent hover:border-[#3a3080] hover:-translate-y-px hover:shadow-[0_10px_24px_rgba(0,0,0,0.35)]",
       },
       size: {
         default: "h-9 px-4 py-2 has-[>svg]:px-3",
@@ -26,6 +32,14 @@ const buttonVariants = cva(
         lg: "h-10 rounded-md px-6 has-[>svg]:px-4",
         xl: "h-12 rounded-lg px-8 text-base has-[>svg]:px-5",
         icon: "size-9",
+        /**
+         * The pill sizes are padding-driven rather than fixed-height, matching
+         * the reference. They repeat `rounded-full` because cva emits size after
+         * variant, so a `rounded-*` set only on the variant would lose the merge.
+         */
+        "pill-sm": "h-auto gap-2 rounded-full px-4 py-2 text-[13.5px]",
+        pill: "h-auto gap-2.5 rounded-full px-[26px] py-3.5 text-[14.5px]",
+        "pill-lg": "h-auto gap-2.5 rounded-full px-[30px] py-[15px] text-[15px]",
       },
     },
     defaultVariants: {

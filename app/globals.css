@@ -4,63 +4,89 @@
 @custom-variant dark (&:is(.dark *));
 
 /**
- * Dawn's palette is built on one navy hue (~258) carried through every
- * surface, so the greys read as deep blue rather than neutral. Chroma stays
- * low on backgrounds and jumps only on `primary` and `ring` — that keeps the
- * blue friendly and warm-leaning instead of corporate, and leaves the accent
- * as the one thing on the page that is genuinely saturated.
+ * Dawn's palette, transcribed from the reference build at interplay.bot/Dawn.
+ *
+ * The canvas is one flat deep indigo (#150f38) carried edge to edge — no
+ * elevation, no gradient — and every other surface is a slightly lighter tint
+ * of the same hue. Notably there is *no* saturated accent anywhere: the primary
+ * CTA is a dark indigo pill (#1c1548) with a bone-white label, so `--primary`
+ * sitting a hair above `--background` is the design, not an oversight. The only
+ * things that read as bright are text and the logo mark.
+ *
+ * Values stay as hex so this file reads as a literal transcription of the
+ * reference's CSS custom properties. Tailwind resolves opacity modifiers
+ * (`border-border/60`, `bg-primary/90`) against hex via color-mix just fine.
+ *
+ * The app is dark-only — app/layout.tsx hard-codes `class="dark"` on <html> —
+ * so `:root` and `.dark` carry identical values. That costs a little repetition
+ * and buys immunity to a light-mode flash, or to a stray component that reads
+ * the root scope rather than the dark one.
  */
 :root {
-  --radius: 0.65rem;
-  --background: oklch(0.99 0.005 258);
-  --foreground: oklch(0.22 0.04 258);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.22 0.04 258);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.22 0.04 258);
-  --primary: oklch(0.48 0.155 256);
-  --primary-foreground: oklch(0.99 0.005 258);
-  --secondary: oklch(0.96 0.013 256);
-  --secondary-foreground: oklch(0.3 0.055 258);
-  --muted: oklch(0.96 0.013 256);
-  --muted-foreground: oklch(0.52 0.032 256);
-  --accent: oklch(0.94 0.022 254);
-  --accent-foreground: oklch(0.3 0.055 258);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.9 0.016 256);
-  --input: oklch(0.9 0.016 256);
-  --ring: oklch(0.48 0.155 256);
+  --radius: 0.625rem;
+  --background: #150f38;
+  --foreground: #d4d4d8;
+  --card: #1a1348;
+  --card-foreground: #e8e6e1;
+  --popover: #1c1548;
+  --popover-foreground: #e5e7eb;
+  --primary: #1c1548;
+  --primary-foreground: #e8e6e1;
+  --secondary: #1c1548;
+  --secondary-foreground: #d4d4d8;
+  --muted: #221a54;
+  --muted-foreground: #7a7796;
+  --accent: #251c5f;
+  --accent-foreground: #e8e6e1;
+  --destructive: #f87171;
+  --border: #251c5f;
+  --input: #1f2530;
+  --ring: #2e3645;
+
+  /* Reference values shadcn has no token slot for. */
+  --dawn-bone: #e8e6e1; /* wordmark and bright display text */
+  --dawn-head: #5c6470; /* field labels, kickers, the scroll cue */
+  --dawn-input: #11161f; /* input fill — deliberately darker than the canvas */
+  --dawn-btn: #2a2260; /* pill and tooltip border */
 }
 
 .dark {
-  --background: oklch(0.185 0.032 258);
-  --foreground: oklch(0.97 0.008 252);
-  --card: oklch(0.235 0.036 258);
-  --card-foreground: oklch(0.97 0.008 252);
-  --popover: oklch(0.235 0.036 258);
-  --popover-foreground: oklch(0.97 0.008 252);
-  --primary: oklch(0.7 0.145 250);
-  --primary-foreground: oklch(0.16 0.038 258);
-  --secondary: oklch(0.29 0.04 258);
-  --secondary-foreground: oklch(0.97 0.008 252);
-  --muted: oklch(0.29 0.04 258);
-  --muted-foreground: oklch(0.73 0.032 254);
-  --accent: oklch(0.33 0.048 256);
-  --accent-foreground: oklch(0.97 0.008 252);
-  --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(0.82 0.06 254 / 14%);
-  --input: oklch(0.82 0.06 254 / 18%);
-  --ring: oklch(0.7 0.145 250);
+  --background: #150f38;
+  --foreground: #d4d4d8;
+  --card: #1a1348;
+  --card-foreground: #e8e6e1;
+  --popover: #1c1548;
+  --popover-foreground: #e5e7eb;
+  --primary: #1c1548;
+  --primary-foreground: #e8e6e1;
+  --secondary: #1c1548;
+  --secondary-foreground: #d4d4d8;
+  --muted: #221a54;
+  --muted-foreground: #7a7796;
+  --accent: #251c5f;
+  --accent-foreground: #e8e6e1;
+  --destructive: #f87171;
+  --border: #251c5f;
+  --input: #1f2530;
+  --ring: #2e3645;
 }
 
 /**
- * Sentient is the core face, so it backs `font-sans` and every default. This
- * block is deliberately not `inline`: inline theme values are substituted at
- * their use sites rather than emitted, and Tailwind's own preflight resolves
+ * Two faces, matching the reference: sans for every piece of UI and body copy,
+ * serif reserved for the wordmark and section headings.
+ *
+ * The reference names "Cormorant Garamond" but never ships a @font-face for it,
+ * so on the live site every wordmark actually renders as its Georgia fallback.
+ * Sentient — already self-hosted here, and a high-contrast serif in the same
+ * spirit — stands in for the intended face, with Georgia kept behind it.
+ *
+ * This block is deliberately not `inline`: inline theme values are substituted
+ * at their use sites rather than emitted, and Tailwind's own preflight resolves
  * `html { font-family: var(--font-sans, …) }` against the real property.
  */
 @theme {
-  --font-sans: var(--font-sentient), ui-serif, Georgia, serif;
+  --font-sans: var(--font-inter), -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-serif: var(--font-sentient), Georgia, "Times New Roman", serif;
 }
 
 @theme inline {
@@ -86,13 +112,87 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-dawn-bone: var(--dawn-bone);
+  --color-dawn-head: var(--dawn-head);
+  --color-dawn-input: var(--dawn-input);
+  --color-dawn-btn: var(--dawn-btn);
 }
 
 @layer base {
   * {
     @apply border-border outline-ring/50;
   }
+  html {
+    /* /about is a long scrolling page with in-page anchors. */
+    scroll-behavior: smooth;
+  }
   body {
     @apply bg-background text-foreground font-sans;
+  }
+}
+
+/**
+ * The reference's load reveal (dawn.css §1) waits on JS to set
+ * `body.dawn-ready`, because it has to survive a full page load. React only
+ * mounts once, so the mount itself is the trigger and this needs no script —
+ * just an animation that runs on first paint, with the stagger passed in per
+ * element as `--dawn-delay`.
+ */
+@layer components {
+  @keyframes dawn-fade-up {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .dawn-enter {
+    animation: dawn-fade-up 620ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+    animation-delay: var(--dawn-delay, 0ms);
+  }
+
+  /**
+   * The pill's light sweep (dawn.css §3): a skewed translucent band parked off
+   * the left edge that crosses the button on hover.
+   */
+  .dawn-shimmer {
+    position: relative;
+    overflow: hidden;
+    isolation: isolate;
+  }
+  .dawn-shimmer::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: -140%;
+    width: 60%;
+    height: 100%;
+    background: linear-gradient(
+      100deg,
+      transparent 0%,
+      rgb(255 255 255 / 0.06) 45%,
+      rgb(255 255 255 / 0.14) 50%,
+      rgb(255 255 255 / 0.06) 55%,
+      transparent 100%
+    );
+    transform: skewX(-18deg);
+    pointer-events: none;
+    transition: left 800ms cubic-bezier(0.22, 0.61, 0.36, 1);
+  }
+  .dawn-shimmer:hover::after {
+    left: 140%;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .dawn-enter {
+      animation: none;
+    }
+    .dawn-shimmer::after {
+      display: none;
+    }
   }
 }

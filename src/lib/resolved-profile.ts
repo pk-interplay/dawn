@@ -18,6 +18,15 @@ import type { Person } from "./types";
  * yet (open question in the plan: they're operational eligibility flags, not
  * reported facts) — defaulted here rather than sourced, since fetchCandidates'
  * eligibility filtering is out of scope for steps 1-3 against entities.
+ *
+ * `expertise` and `interests` (written by the Gmail onboarding flow's profile
+ * synthesis) are stored as their own attributes so the admin entity view and the
+ * review queue can show what each one was inferred from separately — but `Person`
+ * mirrors the legacy `people` columns and has no slot for them, so they are folded
+ * into `tags` here. That is where rerank()'s prompt already looks for "what is this
+ * person about" keywords, so folding costs nothing and the alternative — adding
+ * fields to `Person` that no `people` column backs — would put the legacy type out
+ * of sync with the table it describes.
  */
 
 const SCALAR_ATTRS = [
@@ -34,7 +43,18 @@ const SCALAR_ATTRS = [
   "intro_cadence",
 ] as const;
 
-const ARRAY_ATTRS = ["goals", "background", "tags", "ask_must_haves", "ask_nice_to_haves"] as const;
+const ARRAY_ATTRS = [
+  "goals",
+  "background",
+  "tags",
+  "ask_must_haves",
+  "ask_nice_to_haves",
+  "expertise",
+  "interests",
+] as const;
+
+/** Attributes with no `Person` field of their own, merged into `tags` — see the header. */
+const TAG_LIKE_ATTRS = ["expertise", "interests"] as const;
 
 export async function buildPersonLikeView(client: SupabaseClient, subjectId: string): Promise<Person> {
   const { data, error } = await client
@@ -68,6 +88,10 @@ export async function buildPersonLikeView(client: SupabaseClient, subjectId: str
   const s = (attr: string) => (scalar.get(attr) as string | undefined) ?? null;
   const a = (attr: string) => (arrays.get(attr) as string[] | undefined) ?? [];
 
+  // De-duplicated so a term claimed as both an interest and a tag isn't repeated
+  // into rerank()'s prompt.
+  const tags = [...new Set([...a("tags"), ...TAG_LIKE_ATTRS.flatMap((attr) => a(attr))])];
+
   return {
     id: entity.id,
     name: entity.display_name ?? s("email") ?? "Unknown",
@@ -77,7 +101,7 @@ export async function buildPersonLikeView(client: SupabaseClient, subjectId: str
     looking_for: s("looking_for"),
     goals: a("goals"),
     background: a("background"),
-    tags: a("tags"),
+    tags,
     industry: s("industry"),
     career_stage: s("career_stage"),
     location: s("location"),
