@@ -75,3 +75,14 @@ export async function requireAdmin(_req?: Request): Promise<AdminCheck> {
   }
   return { ok: true, email };
 }
+
+/**
+ * Boolean form of requireAdmin, for gating UI rather than a route. Same
+ * allowlist, same deny-by-default: false unless the signed-in email is on
+ * ADMIN_EMAILS or in an ADMIN_EMAIL_DOMAINS domain. Used to decide whether the
+ * rail even shows the Admin tab, so non-admins never see a control that only
+ * 403s when clicked.
+ */
+export async function isAdmin(): Promise<boolean> {
+  return (await requireAdmin()).ok;
+}

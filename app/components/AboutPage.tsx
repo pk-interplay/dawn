@@ -17,13 +17,16 @@ import Link from "next/link";
 
 import { auth } from "@/src/auth";
 import { Button } from "@/components/ui/button";
+import { isAdmin } from "@/app/lib/admin-auth";
+import { startGoogleSignIn } from "@/app/lib/auth-actions";
 import { DawnMark } from "./DawnMark";
 import { DawnRail } from "./DawnRail";
 
 // Every CTA on this page is the same action, because there is only one way in.
 // It used to read "Join the Waitlist" pointing at /join — there is no waitlist and
 // no /join: signing in with Google IS onboarding, and it lands on the ingest flow.
-const SIGN_IN_HREF = "/api/auth/signin?callbackUrl=%2Fonboarding";
+// The action is `startGoogleSignIn` (a POST server action), NOT a link to
+// /api/auth/signin — see that file for why a GET there loops back to home.
 
 const STEPS = [
   {
@@ -72,9 +75,11 @@ function TopBar() {
           <DawnMark idSuffix="brand" className="h-[26px] shrink-0" />
           Dawn
         </Link>
-        <Button asChild variant="pill" size="pill-sm">
-          <Link href={SIGN_IN_HREF}>Continue with Gmail</Link>
-        </Button>
+        <form action={startGoogleSignIn}>
+          <Button type="submit" variant="pill" size="pill-sm">
+            Continue with Gmail
+          </Button>
+        </form>
       </div>
     </header>
   );
@@ -101,9 +106,11 @@ function Hero() {
         inbox, when it matters.
       </p>
 
-      <Button asChild variant="pill" size="pill-lg" className="dawn-shimmer">
-        <Link href={SIGN_IN_HREF}>Continue with Gmail</Link>
-      </Button>
+      <form action={startGoogleSignIn}>
+        <Button type="submit" variant="pill" size="pill-lg" className="dawn-shimmer">
+          Continue with Gmail
+        </Button>
+      </form>
     </section>
   );
 }
@@ -177,9 +184,11 @@ function ClosingCta() {
         <p className="max-w-[620px] text-base leading-relaxed text-muted-foreground">
           Join the waitlist. We&apos;ll send you a set-up link the moment your seat opens.
         </p>
-        <Button asChild variant="pill" size="pill-lg" className="dawn-shimmer">
-          <Link href={SIGN_IN_HREF}>Continue with Gmail</Link>
-        </Button>
+        <form action={startGoogleSignIn}>
+          <Button type="submit" variant="pill" size="pill-lg" className="dawn-shimmer">
+            Continue with Gmail
+          </Button>
+        </form>
       </div>
     </section>
   );
@@ -194,9 +203,11 @@ function SiteFooter() {
           Home
         </Link>
         <span aria-hidden>·</span>
-        <Link href={SIGN_IN_HREF} className="transition-colors hover:text-dawn-bone">
-          Sign In
-        </Link>
+        <form action={startGoogleSignIn} className="inline">
+          <button type="submit" className="transition-colors hover:text-dawn-bone">
+            Sign In
+          </button>
+        </form>
       </div>
     </footer>
   );
@@ -207,6 +218,7 @@ export async function AboutPage() {
   // rather than flashing the signed-out one.
   const session = await auth();
   const signedIn = Boolean(session?.user?.id);
+  const admin = signedIn && (await isAdmin());
 
   return (
     <>
@@ -218,7 +230,7 @@ export async function AboutPage() {
         <ClosingCta />
         <SiteFooter />
       </main>
-      <DawnRail signedIn={signedIn} />
+      <DawnRail signedIn={signedIn} isAdmin={admin} />
     </>
   );
 }

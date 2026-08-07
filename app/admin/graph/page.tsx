@@ -14,6 +14,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import { signIn } from "next-auth/react";
 import { Loader2 } from "lucide-react";
 
 import { adminFetch } from "../../lib/admin-fetch";
@@ -67,8 +68,10 @@ export default function GraphPage() {
       <main className="mx-auto flex min-h-screen w-full max-w-sm flex-col justify-center gap-4 px-4 text-center">
         <h1 className="font-serif text-2xl text-dawn-bone">Dawn · network space</h1>
         <p className="text-muted-foreground text-sm">{gate.reason}</p>
-        <Button asChild>
-          <Link href="/api/auth/signin?callbackUrl=%2Fadmin%2Fgraph">Sign in</Link>
+        {/* signIn (POST + CSRF), not a link to /api/auth/signin — pages.signIn is
+            "/", so a GET there just loops back to home. */}
+        <Button onClick={() => void signIn("google", { callbackUrl: "/admin/graph" })}>
+          Sign in
         </Button>
       </main>
     );
