@@ -36,9 +36,9 @@ export async function POST(request: Request) {
   // `people` row.
   //
   // This route is legacy and effectively dark: its only caller was the /join
-  // onboarding flow, replaced by the Gmail flow which writes claims instead. GET is
-  // still read by /admin/console. It retires with `people` at SPEC build step 5. The
-  // signed-in identity↔entity link lives on `entities.auth_user_id` (migration 0029).
+  // onboarding flow, replaced by the Gmail flow which writes claims instead. It
+  // retires with `people` at SPEC build step 5. The signed-in identity↔entity link
+  // lives on `entities.auth_user_id` (migration 0029).
 
   const {
     name,
