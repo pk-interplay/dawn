@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { redirect } from "next/navigation";
 
 import { auth } from "../../src/auth";
-import { db } from "../lib/db";
+import { supabase } from "../../src/lib/supabase";
 import { resolveViewerEntity } from "../../src/lib/entity-identity";
 import { DawnRail } from "../components/DawnRail";
 import { ChatSurface } from "./ChatSurface";
@@ -23,12 +23,16 @@ export default async function Chat() {
   const session = await auth();
   if (!session?.user?.id) redirect("/api/auth/signin?callbackUrl=%2Fchat");
 
-  const viewer = await resolveViewerEntity(db, session);
+  // Service-role client, matching /onboarding. Resolving identity through the
+  // publishable-key `db` gated the answer behind RLS on `entities`, so onboarding
+  // (service role) saw the user as onboarded and bounced them here while chat saw
+  // nothing and bounced them back — an infinite /chat ⇄ /onboarding loop.
+  const viewer = await resolveViewerEntity(supabase, session);
   // No entity at all, or never confirmed a profile — either way onboarding is the next
   // step, and it short-circuits to here if it turns out they are already done.
   if (!viewer || !viewer.onboardedAt) redirect("/onboarding");
 
-  const { count } = await db
+  const { count } = await supabase
     .from("edges")
     .select("id", { count: "exact", head: true })
     .eq("kind", "knows")

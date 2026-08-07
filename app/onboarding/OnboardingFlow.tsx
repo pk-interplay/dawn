@@ -13,12 +13,14 @@
  * an edited field would be the user's own words and should be written
  * `method: 'self_reported'` at full confidence, which is a different claim with a
  * different provenance and needs its own affordance. Regenerate is the honest escape
- * hatch for "that's not right" until then.
+ * hatch for "that's not right" until then — and "Add guidance" lets the user steer a
+ * regenerate ("I'm a founder, not an investor") without crossing into editing: the
+ * text nudges the model's framing, it never becomes a self-reported claim.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowRight, Loader2, RefreshCw } from "lucide-react";
+import { ArrowRight, Loader2, Pencil, RefreshCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { DawnMark } from "../components/DawnMark";
@@ -52,11 +54,27 @@ const INGEST_LINES = [
   "Working out what you're known for.",
 ];
 
+interface StreamedContact {
+  name: string;
+  email: string;
+}
+
+const THIN_REASON: Record<string, string> = {
+  not_enough_activity: "There isn't enough recent sent mail yet to say anything real about you.",
+  no_api_key: "The profile writer isn't configured on this deployment.",
+};
+const THIN_REASON_DEFAULT = "Dawn couldn't draft a profile this time.";
+
 export function OnboardingFlow({ firstName }: { firstName: string | null }) {
   const router = useRouter();
   const [stage, setStage] = useState<Stage>({ name: "ingesting" });
   const [line, setLine] = useState(0);
   const [busy, setBusy] = useState(false);
+  // The optional steer on the review screen: an expander plus its free text.
+  const [showGuidance, setShowGuidance] = useState(false);
+  const [guidance, setGuidance] = useState("");
+  // Correspondents streamed back from the ingest, newest last. Feeds the live ticker.
+  const [contacts, setContacts] = useState<StreamedContact[]>([]);
   // StrictMode mounts effects twice in dev. Without this guard the ingest — six months
   // of Gmail and a Sonnet call — runs twice on every local load.
   const started = useRef(false);
@@ -68,22 +86,57 @@ export function OnboardingFlow({ firstName }: { firstName: string | null }) {
     (async () => {
       try {
         const res = await fetch("/api/onboarding/ingest", { method: "POST" });
-        const body = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(body.error ?? `Sync failed (${res.status})`);
+        if (!res.ok || !res.body) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error ?? `Sync failed (${res.status})`);
+        }
 
-        if (body.draft) {
-          setStage({ name: "review", draft: body.draft, ingest: body.ingest ?? null });
-        } else {
-          setStage({
-            name: "thin",
-            ingest: body.ingest ?? null,
-            reason:
-              body.reason === "not_enough_activity"
-                ? "There isn't enough recent sent mail yet to say anything real about you."
-                : body.reason === "no_api_key"
-                  ? "The profile writer isn't configured on this deployment."
-                  : "Dawn couldn't draft a profile this time.",
-          });
+        // The route streams newline-delimited JSON: a "contact" per correspondent as
+        // it's found, then a terminal "result" or "error". Read incrementally and hold
+        // a buffer for the partial trailing line each chunk leaves behind.
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        const handle = (event: Record<string, unknown>) => {
+          if (event.type === "contact") {
+            const name = String(event.name ?? "");
+            const email = String(event.email ?? "");
+            setContacts((prev) => [...prev, { name, email }]);
+          } else if (event.type === "error") {
+            setStage({ name: "error", message: String(event.error ?? "Something went wrong") });
+          } else if (event.type === "result") {
+            if (event.draft) {
+              setStage({
+                name: "review",
+                draft: event.draft as ProfileDraft,
+                ingest: (event.ingest as IngestSummary) ?? null,
+              });
+            } else {
+              setStage({
+                name: "thin",
+                ingest: (event.ingest as IngestSummary) ?? null,
+                reason: THIN_REASON[String(event.reason)] ?? THIN_REASON_DEFAULT,
+              });
+            }
+          }
+        };
+
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const raw of lines) {
+            const trimmed = raw.trim();
+            if (!trimmed) continue;
+            try {
+              handle(JSON.parse(trimmed));
+            } catch {
+              // A malformed line is not worth aborting a live ingest over; skip it.
+            }
+          }
         }
       } catch (err) {
         setStage({ name: "error", message: err instanceof Error ? err.message : "Something went wrong" });
@@ -98,10 +151,15 @@ export function OnboardingFlow({ firstName }: { firstName: string | null }) {
     return () => clearInterval(id);
   }, [stage.name]);
 
-  const regenerate = useCallback(async () => {
+  const regenerate = useCallback(async (steer?: string) => {
+    const guidanceText = steer?.trim() ?? "";
     setBusy(true);
     try {
-      const res = await fetch("/api/onboarding/synthesize", { method: "POST" });
+      const res = await fetch("/api/onboarding/synthesize", {
+        method: "POST",
+        headers: guidanceText ? { "Content-Type": "application/json" } : undefined,
+        body: guidanceText ? JSON.stringify({ guidance: guidanceText }) : undefined,
+      });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error ?? `Regenerate failed (${res.status})`);
       if (body.draft) {
@@ -152,6 +210,7 @@ export function OnboardingFlow({ firstName }: { firstName: string | null }) {
             <Loader2 className="size-4 shrink-0 animate-spin" />
             {INGEST_LINES[line]}
           </p>
+          <ContactTicker contacts={contacts} />
         </div>
       )}
 
@@ -201,15 +260,37 @@ export function OnboardingFlow({ firstName }: { firstName: string | null }) {
             </p>
           )}
 
+          {showGuidance && (
+            <div className="mt-6">
+              <Kicker>Steer the rewrite</Kicker>
+              <textarea
+                value={guidance}
+                onChange={(e) => setGuidance(e.target.value)}
+                disabled={busy}
+                rows={2}
+                maxLength={500}
+                autoFocus
+                placeholder="Optional — tell Dawn what to change. e.g. “I'm a founder, not an investor” or “lead with my climate work”."
+                className="border-dawn-btn bg-card text-foreground placeholder:text-muted-foreground focus-visible:ring-ring mt-2 w-full resize-none rounded-[--radius] border p-3 text-sm leading-relaxed outline-none focus-visible:ring-2"
+              />
+            </div>
+          )}
+
           <div className="mt-8 flex flex-wrap items-center gap-3">
             <Button variant="pill" size="pill" disabled={busy} onClick={confirm} className="dawn-shimmer">
               {busy ? <Loader2 className="size-4 animate-spin" /> : <ArrowRight className="size-4" />}
               Confirm and join the network
             </Button>
-            <Button variant="ghost" size="sm" disabled={busy} onClick={regenerate}>
+            <Button variant="ghost" size="sm" disabled={busy} onClick={() => regenerate(guidance)}>
               <RefreshCw className="size-3.5" />
-              Regenerate
+              {guidance.trim() ? "Regenerate with guidance" : "Regenerate"}
             </Button>
+            {!showGuidance && (
+              <Button variant="ghost" size="sm" disabled={busy} onClick={() => setShowGuidance(true)}>
+                <Pencil className="size-3.5" />
+                Add guidance
+              </Button>
+            )}
           </div>
         </div>
       )}
@@ -235,7 +316,7 @@ export function OnboardingFlow({ firstName }: { firstName: string | null }) {
                 Go to the chat
               </a>
             </Button>
-            <Button variant="ghost" size="sm" disabled={busy} onClick={regenerate}>
+            <Button variant="ghost" size="sm" disabled={busy} onClick={() => regenerate()}>
               <RefreshCw className="size-3.5" />
               Try again
             </Button>
@@ -276,6 +357,51 @@ export function OnboardingFlow({ firstName }: { firstName: string | null }) {
         </div>
       )}
     </main>
+  );
+}
+
+/**
+ * A ~4-line window of correspondents streaming in from the ingest, newest at the
+ * bottom, older ones scrolling up under a fade. Purely presentational — it renders
+ * whatever the stream has handed us so far. Shows only the tail so a 2,000-contact
+ * mailbox doesn't mount 2,000 rows; the running count carries the sense of scale.
+ */
+const TICKER_WINDOW = 4;
+
+function ContactTicker({ contacts }: { contacts: StreamedContact[] }) {
+  if (contacts.length === 0) return null;
+  const tail = contacts.slice(-TICKER_WINDOW);
+
+  return (
+    <div className="mt-6">
+      <div
+        className="relative h-[5.5rem] overflow-hidden"
+        // Fade the top edge so rows dissolve upward as new ones arrive.
+        style={{
+          maskImage: "linear-gradient(to bottom, transparent, black 38%)",
+          WebkitMaskImage: "linear-gradient(to bottom, transparent, black 38%)",
+        }}
+      >
+        <ul className="absolute inset-x-0 bottom-0 flex flex-col justify-end gap-1">
+          {tail.map((c, i) => (
+            // Key by position in the stream so each newly-arrived row remounts and
+            // replays its fade-in, while the rows above it stay put.
+            <li
+              key={`${contacts.length - tail.length + i}-${c.email}`}
+              className="dawn-enter flex items-baseline gap-2 text-sm"
+            >
+              <span className="text-dawn-bone truncate">{c.name || c.email}</span>
+              {c.name && c.name !== c.email && (
+                <span className="text-muted-foreground truncate text-xs">{c.email}</span>
+              )}
+            </li>
+          ))}
+        </ul>
+      </div>
+      <p className="text-dawn-head mt-2 text-[11px] font-medium tracking-[2.4px] uppercase">
+        {contacts.length} {contacts.length === 1 ? "person" : "people"} so far
+      </p>
+    </div>
   );
 }
 
