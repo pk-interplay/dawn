@@ -16,11 +16,13 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useChat } from "@ai-sdk/react";
-import { DefaultChatTransport } from "ai";
-import { ArrowUp, Loader2 } from "lucide-react";
+import { DefaultChatTransport, type UIMessage } from "ai";
+import { ArrowUp, ChevronDown, Loader2, MessagesSquare, Plus, Trash2 } from "lucide-react";
 import Markdown from "react-markdown";
 
+import type { ChatThreadSummary } from "../../src/lib/chat-threads";
 import type { DawnScope } from "../../src/lib/network-tools";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -62,10 +64,18 @@ const MARKDOWN_CLASSES = cn(
 export function ChatSurface({
   firstName,
   networkSize,
+  threads,
+  threadId,
+  initialMessages,
 }: {
   firstName: string | null;
   networkSize: number;
+  threads: ChatThreadSummary[];
+  /** Always set, and always what `?t=` says — the page mints one before rendering. */
+  threadId: string;
+  initialMessages: UIMessage[];
 }) {
+  const router = useRouter();
   const [scope, setScope] = useState<DawnScope>("mine");
   const [input, setInput] = useState("");
 
@@ -73,12 +83,25 @@ export function ChatSurface({
   // conversation itself deliberately survives the flip — which is exactly why
   // getEntityProfile re-checks reachability server-side instead of trusting history.
   const transport = useMemo(
-    () => new DefaultChatTransport({ api: "/api/chat", body: { scope } }),
-    [scope],
+    () => new DefaultChatTransport({ api: "/api/chat", body: { scope, threadId } }),
+    [scope, threadId],
   );
 
-  const { messages, sendMessage, status, error } = useChat({ transport });
+  const { messages, sendMessage, status, error } = useChat({
+    id: threadId,
+    messages: initialMessages,
+    transport,
+  });
   const busy = status === "submitted" || status === "streaming";
+
+  // A brand-new thread only exists in the database once its first turn lands. Refresh
+  // the server component after that turn so the menu picks up its title, once.
+  const announced = useRef(initialMessages.length > 0);
+  useEffect(() => {
+    if (announced.current || status !== "ready" || messages.length === 0) return;
+    announced.current = true;
+    router.refresh();
+  }, [status, messages.length, router]);
 
   // The home page's starter questions link here as `/chat?q=…`. Fire that once on
   // mount and strip it from the URL, so a refresh doesn't resend and the address bar
@@ -91,8 +114,9 @@ export function ChatSurface({
     if (!q) return;
     firedInitial.current = true;
     void sendMessage({ text: q });
-    window.history.replaceState(null, "", window.location.pathname);
-  }, [sendMessage]);
+    // Strip `q` but keep `t`, so the address still points at this conversation.
+    window.history.replaceState(null, "", `${window.location.pathname}?t=${threadId}`);
+  }, [sendMessage, threadId]);
 
   function submit(text: string) {
     const trimmed = text.trim();
@@ -108,7 +132,10 @@ export function ChatSurface({
           <DawnMark idSuffix="chat" className="h-6 shrink-0 select-none" />
           <span className="font-serif text-xl leading-none tracking-[0.3px]">Dawn</span>
         </Link>
-        <ScopeToggle scope={scope} onChange={setScope} />
+        <div className="flex items-center gap-3">
+          <ThreadMenu threads={threads} activeId={threadId} />
+          <ScopeToggle scope={scope} onChange={setScope} />
+        </div>
       </header>
 
       <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col overflow-hidden px-6">
@@ -169,6 +196,151 @@ export function ChatSurface({
       </div>
     </main>
   );
+}
+
+/**
+ * Past sessions, as a dropdown beside the scope toggle.
+ *
+ * Hand-built rather than shadcn's `dropdown-menu`, which is not installed here — the
+ * same call ScopeToggle and DawnRail already made. Everything is a real navigation:
+ * picking a thread goes to `/chat?t=…` and lets the server hydrate the history, which
+ * beats a client fetch that would have to reconstruct message state by hand.
+ */
+function ThreadMenu({
+  threads,
+  activeId,
+}: {
+  threads: ChatThreadSummary[];
+  activeId: string;
+}) {
+  const router = useRouter();
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const active = threads.find((thread) => thread.id === activeId);
+
+  useEffect(() => {
+    if (!open) return;
+
+    function onPointerDown(event: PointerEvent) {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    }
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      setOpen(false);
+      triggerRef.current?.focus();
+    }
+
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  async function remove(id: string) {
+    await fetch(`/api/chat/threads?id=${id}`, { method: "DELETE" });
+    // Leaving the user staring at a conversation that no longer exists would be worse
+    // than the extra navigation, so deleting the open thread also starts a fresh one.
+    if (id === activeId) router.push(`/chat?t=${crypto.randomUUID()}`);
+    else router.refresh();
+  }
+
+  return (
+    <div ref={rootRef} className="relative">
+      <button
+        ref={triggerRef}
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+        className="border-dawn-btn bg-card text-muted-foreground hover:text-dawn-bone flex max-w-[240px] items-center gap-2 rounded-full border px-3.5 py-2 text-xs transition-colors"
+      >
+        <MessagesSquare className="size-3.5 shrink-0" />
+        <span className="truncate">{active?.title ?? "New chat"}</span>
+        <ChevronDown className="size-3.5 shrink-0" />
+      </button>
+
+      {open && (
+        <div
+          role="menu"
+          aria-label="Past chats"
+          className="border-dawn-btn bg-card absolute right-0 z-30 mt-2 max-h-80 w-72 overflow-y-auto rounded-2xl border p-1.5 shadow-lg"
+        >
+          {/* A button rather than a Link: the destination is a freshly minted id, so it
+              differs on every click and there is nothing stable to put in an href. That
+              is also what makes this work from an unsaved chat, where a link back to
+              /chat would just be the URL you are already on and navigate nowhere. */}
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              router.push(`/chat?t=${crypto.randomUUID()}`);
+            }}
+            className="text-muted-foreground hover:text-dawn-bone flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs transition-colors"
+          >
+            <Plus className="size-3.5 shrink-0" />
+            New chat
+          </button>
+
+          {threads.length > 0 && <div className="bg-dawn-btn my-1.5 h-px" />}
+
+          {threads.map((thread) => (
+            <div
+              key={thread.id}
+              className={cn(
+                "group flex items-center gap-1 rounded-xl",
+                thread.id === activeId ? "bg-dawn-btn" : "hover:bg-dawn-btn/40",
+              )}
+            >
+              <Link
+                href={`/chat?t=${thread.id}`}
+                role="menuitem"
+                onClick={() => setOpen(false)}
+                className={cn(
+                  "min-w-0 flex-1 px-3 py-2 text-xs",
+                  thread.id === activeId ? "text-dawn-bone" : "text-muted-foreground",
+                )}
+              >
+                <span className="block truncate">{thread.title ?? "Untitled chat"}</span>
+                <span className="text-dawn-head mt-0.5 block text-[10px]">
+                  {relativeTime(thread.updatedAt)}
+                </span>
+              </Link>
+              <button
+                type="button"
+                aria-label={`Delete ${thread.title ?? "untitled chat"}`}
+                onClick={() => void remove(thread.id)}
+                className="text-muted-foreground hover:text-destructive mr-2 shrink-0 opacity-0 transition group-hover:opacity-100 focus-visible:opacity-100"
+              >
+                <Trash2 className="size-3.5" />
+              </button>
+            </div>
+          ))}
+
+          {threads.length === 0 && (
+            <p className="text-muted-foreground px-3 py-2 text-xs">
+              No past chats yet.
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Coarse on purpose: the menu wants "when, roughly", not a timestamp to read. */
+function relativeTime(iso: string): string {
+  const minutes = Math.round((Date.now() - new Date(iso).getTime()) / 60_000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  return days < 7 ? `${days}d ago` : new Date(iso).toLocaleDateString();
 }
 
 function ScopeToggle({

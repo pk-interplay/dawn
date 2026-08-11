@@ -1,5 +1,11 @@
 /**
- * The About page, following the pitch at interplay.bot/Dawn/pitch.html: a
+ * The unauthenticated landing experience. `/` renders this whenever there is no
+ * session (see app/page.tsx) — a first-time visitor gets the pitch and a sign-in CTA
+ * rather than a locked viewport with one button. Signed in, `/` is the home screen
+ * instead, and this page has no other entry point: /about is hidden for now, so
+ * nothing signed-in reaches it.
+ *
+ * It follows the pitch at interplay.bot/Dawn/pitch.html: a
  * stated hero, three numbered steps, who it's for, and a closing ask. Copy is
  * taken from the pitch verbatim — including Dawn's voice, which refers to the
  * agent as "she".
@@ -111,6 +117,13 @@ function Hero() {
           Continue with Gmail
         </Button>
       </form>
+
+      {/* Carried over from the old signed-out home screen. Whatever else the pitch
+          says, the visitor is about to hand over Gmail access, so what Dawn reads
+          belongs next to the button that asks for it. */}
+      <p className="max-w-[80vw] text-[13px] text-muted-foreground">
+        Maps your network from who you email and meet — metadata only, never message content.
+      </p>
     </section>
   );
 }
@@ -182,7 +195,7 @@ function ClosingCta() {
           The connection you need is one email away.
         </h2>
         <p className="max-w-[620px] text-base leading-relaxed text-muted-foreground">
-          Join the waitlist. We&apos;ll send you a set-up link the moment your seat opens.
+          Sign in with Gmail and Dawn starts mapping who you already know. It takes a minute.
         </p>
         <form action={startGoogleSignIn}>
           <Button type="submit" variant="pill" size="pill-lg" className="dawn-shimmer">
