@@ -28,7 +28,6 @@ import {
   LogIn,
   LogOut,
   MessageCircle,
-  Settings,
   Shield,
   type LucideIcon,
 } from "lucide-react";
@@ -84,13 +83,14 @@ export function DawnRail({
         // same note in app/page.tsx). This is the client-side twin of the home
         // screen's server action.
         { label: "Sign In", icon: LogIn, onSelect: () => void signIn("google", { callbackUrl: "/onboarding" }) },
-        { label: "About", icon: HelpCircle, href: "/about" },
+        // The About tab is hidden while /about is (it redirects to `/` now). Signed
+        // out, `/` already IS the pitch, so the tab pointed at the current page.
       ];
 
   const toolItems: RailItem[] = [
-    // There is no settings route in this app yet, so the slot is kept for shape
-    // and says so rather than linking nowhere.
-    { label: "Settings", icon: Settings, onSelect: () => flash(SOON_MESSAGE) },
+    // Settings is hidden for now: there is no settings route yet, so the slot
+    // only ever flashed a "coming soon" toast. Restore this when one exists.
+    // { label: "Settings", icon: Settings, onSelect: () => flash(SOON_MESSAGE) },
     // The Admin tab is only shown to allowlisted operators — everyone else never
     // sees a control that would just 403 (or gate-toast) when clicked.
     ...(isAdmin ? [{ label: "Admin", icon: Shield, href: "/admin" } as RailItem] : []),
