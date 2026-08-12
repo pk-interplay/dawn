@@ -4,16 +4,29 @@ import { auth } from "../../../../src/auth";
 import { supabase } from "../../../../src/lib/supabase";
 import { resolveViewerEntity } from "../../../../src/lib/entity-identity";
 import { writeProfileClaims } from "../../../../src/lib/profile-claims";
+import { parseAsks, writeAsks } from "../../../../src/lib/asks";
 import { summarizeEntity } from "../../../../src/lib/summarize-entity";
 import { ProfileDraftSchema, SYNTHESIS_MODEL } from "../../../../src/lib/synthesize-profile";
 
 /**
  * Onboarding step 2: the user pressed Confirm. This is where they join the network.
  *
- * Takes NO body. The draft is read from `profile_drafts` server-side rather than
- * accepted from the client — a client-supplied profile is a client-supplied set of
- * claims about a person, and this route writes with the service-role key. The button
- * confirms; it does not author.
+ * The draft is still read from `profile_drafts` server-side, never accepted from the
+ * client — a client-supplied profile is a client-supplied set of claims about a person,
+ * and this route writes with the service-role key.
+ *
+ * The body it now takes does not weaken that. It carries two things, and neither can
+ * author a claim:
+ *
+ *   `hidden` — array-field values the user dismissed. It can only ever *subtract* from
+ *     what the staged draft already says, so the worst a hostile client achieves is a
+ *     thinner profile of itself.
+ *   `asks`  — free text the user wrote about what they want. This is authorship, which
+ *     is exactly why it does not become a claim: it goes to the `asks` table (migration
+ *     0038, SPEC §10) as self-authored text, outside the vocabulary matching trusts.
+ *
+ * So the rule holds in the form that matters: the button still cannot invent a fact
+ * about a person. It can only narrow one, or record a want alongside it.
  *
  * Three things happen, in a deliberate order:
  *   1. draft → claims (writeProfileClaims)
@@ -33,11 +46,26 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
 
-export async function POST() {
+export async function POST(request: Request) {
   const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Not signed in" }, { status: 401 });
   }
+
+  // Tolerant of no body at all: Regenerate-then-Confirm and any older client still
+  // post empty, and that should mean "confirm the draft as staged", not a 400.
+  const body = await request
+    .json()
+    .then((b) => (b && typeof b === "object" ? (b as Record<string, unknown>) : {}))
+    .catch(() => ({}) as Record<string, unknown>);
+
+  const hidden = new Set(
+    (Array.isArray(body.hidden) ? body.hidden : [])
+      .filter((v): v is string => typeof v === "string")
+      .map((v) => v.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const asks = parseAsks(typeof body.asks === "string" ? body.asks : "");
 
   const viewer = await resolveViewerEntity(supabase, session);
   if (!viewer) {
@@ -87,7 +115,21 @@ export async function POST() {
     draft: parsed.data,
     evidence,
     model,
+    hidden,
   });
+
+  // After the claims, and non-fatally. The profile is what joins someone to the
+  // network; an ask that failed to save is a line of text they can retype, and it must
+  // not un-confirm a profile that is already written and correct.
+  let asksWritten = 0;
+  try {
+    ({ written: asksWritten } = await writeAsks(supabase, {
+      entityId: viewer.entityId,
+      asks,
+    }));
+  } catch (err) {
+    console.error("[onboarding] failed to write asks:", err);
+  }
 
   const { error: stampError } = await supabase
     .from("entities")
@@ -116,6 +158,7 @@ export async function POST() {
     entityId: viewer.entityId,
     claimsWritten: result.written,
     claimsFailed: result.failed,
+    asksWritten,
     embedded,
   });
 }

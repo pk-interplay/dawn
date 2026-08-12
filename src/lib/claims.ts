@@ -94,6 +94,83 @@ export async function writeClaims(
   return { written, failed };
 }
 
+/**
+ * Every live claim an entity holds for the given attributes.
+ *
+ * `resolved_attributes` is `distinct on (subject_id, attribute)`, so it answers "the
+ * one value that wins" — right for scalars, wrong for the attributes stored as one
+ * claim per item (`goals`, `ask_must_haves`, …), where it silently returns a single
+ * goal no matter how many were written. Anything editing or displaying those has to
+ * read the claims themselves, which is what this is for. Ordered oldest-first so a
+ * list the user typed keeps the order they typed it in.
+ */
+export async function listLiveClaims(
+  client: SupabaseClient,
+  subjectId: string,
+  attributes: readonly string[],
+): Promise<ClaimRow[]> {
+  if (!attributes.length) return [];
+  const { data, error } = await client
+    .from("claims")
+    .select("*")
+    .eq("subject_id", subjectId)
+    .in("attribute", attributes as string[])
+    .is("superseded_by", null)
+    .order("id", { ascending: true });
+  if (error) throw new Error(`listLiveClaims failed: ${error.message}`);
+  return (data ?? []) as ClaimRow[];
+}
+
+/**
+ * Retire claims by pointing them at the claim that replaced them.
+ *
+ * The append-only invariant is that a claim is never edited and never deleted — so
+ * "I no longer want that goal listed" cannot be a delete. It is this: the old rows
+ * drop out of `resolved_attributes` (which filters `superseded_by is null`) while
+ * staying on the record, with a pointer to what replaced them.
+ *
+ * `replacedBy` is the claim that took its place — a corrected headline. Omit it for a
+ * pure retraction ("that goal is no longer true and nothing replaces it"), and the row
+ * is pointed at ITSELF. That sentinel is forced by the view: it hides a claim on
+ * `superseded_by is not null`, so leaving the column null would retire nothing at all.
+ * Self-reference reads as "retired, no successor", which is exactly the case, and it
+ * satisfies the FK without inventing a tombstone row.
+ */
+export async function supersedeClaims(
+  client: SupabaseClient,
+  claimIds: number[],
+  replacedBy?: number,
+): Promise<number> {
+  if (!claimIds.length) return 0;
+
+  if (replacedBy !== undefined) {
+    const { data, error } = await client
+      .from("claims")
+      .update({ superseded_by: replacedBy })
+      .in("id", claimIds)
+      .is("superseded_by", null)
+      .select("id");
+    if (error) throw new Error(`supersedeClaims failed: ${error.message}`);
+    return (data ?? []).length;
+  }
+
+  // Self-reference can't be expressed as one column-to-column update through PostgREST,
+  // so retractions go one row at a time. These are hand-edited lists — a handful of
+  // rows, not a batch job.
+  let retired = 0;
+  for (const id of claimIds) {
+    const { data, error } = await client
+      .from("claims")
+      .update({ superseded_by: id })
+      .eq("id", id)
+      .is("superseded_by", null)
+      .select("id");
+    if (error) throw new Error(`supersedeClaims failed: ${error.message}`);
+    retired += (data ?? []).length;
+  }
+  return retired;
+}
+
 export interface EntityMatchHint {
   email?: string;
   name?: string;
@@ -201,7 +278,34 @@ export async function findOrCreateEntity(
     .select("id")
     .single();
   if (insertError) throw new Error(`findOrCreateEntity insert failed: ${insertError.message}`);
-  return created.id as string;
+  const entityId = created.id as string;
+
+  // Write the email as a claim on the way out, so the entity is findable by the very
+  // hint that created it. Without this the row is unresolvable: the next caller with
+  // the same email fails `findEntityIdByEmail` and creates a *second* entity. That is
+  // not hypothetical — it split the first user on an empty database into two entities,
+  // one holding the auth_user_id and the confirmed profile, the other holding every
+  // edge Gmail ingest wrote, which reads downstream as "your network never synced".
+  if (email) {
+    const { failed } = await writeClaims(client, [
+      {
+        subjectId: entityId,
+        attribute: "email",
+        value: email,
+        source: "identity",
+        method: "self_reported",
+        confidence: 1,
+        observedAt: new Date().toISOString(),
+        evidence: "Address this entity was created from.",
+      },
+    ]);
+    if (failed.length) {
+      // Leaving a findable-by-nothing entity behind is the bug above, so this is loud.
+      throw new Error(`findOrCreateEntity could not claim ${email}: ${failed[0].error}`);
+    }
+  }
+
+  return entityId;
 }
 
 /**

@@ -1,4 +1,4 @@
-import { generateObject } from "ai";
+import { streamObject } from "ai";
 import { anthropic } from "@ai-sdk/anthropic";
 import { z } from "zod";
 
@@ -81,6 +81,17 @@ export interface SynthesisResult {
   evidence: { subjects: number; domains: number; events: number };
 }
 
+/**
+ * A draft mid-flight: every field optional, strings arriving a fragment at a time.
+ * This is what the onboarding screen renders while the model is still writing, so
+ * the wait shows real work instead of a spinner.
+ */
+export type PartialProfileDraft = {
+  [K in keyof ProfileDraft]?: ProfileDraft[K] extends string[]
+    ? (string | undefined)[]
+    : ProfileDraft[K];
+};
+
 export async function synthesizeProfile(opts: {
   accessToken: string;
   email: string;
@@ -91,6 +102,17 @@ export async function synthesizeProfile(opts: {
    * license inventing claims the evidence doesn't support (the prompt says so).
    */
   guidance?: string | null;
+  /**
+   * Called with the evidence base the moment it's counted, before the model call.
+   * The onboarding screen shows this while the model works — it is the honest answer
+   * to "what does it actually know about me", available seconds before the draft is.
+   */
+  onEvidence?: (evidence: SynthesisResult["evidence"]) => void;
+  /**
+   * Called repeatedly as the model writes, with the draft so far. Lets the caller
+   * stream the profile in rather than holding a spinner over the whole generation.
+   */
+  onPartial?: (draft: PartialProfileDraft) => void;
 }): Promise<SynthesisResult> {
   const you = opts.email.trim().toLowerCase();
 
@@ -131,6 +153,8 @@ export async function synthesizeProfile(opts: {
     events: events.length,
   };
 
+  opts.onEvidence?.(evidence);
+
   if (outboundSubjects.length < MIN_OUTBOUND) {
     return { draft: null, generated: false, reason: "not_enough_activity", evidence };
   }
@@ -163,7 +187,11 @@ export async function synthesizeProfile(opts: {
       .join("\n")}`,
   ].join("\n\n");
 
-  const { object } = await generateObject({
+  // streamObject rather than generateObject: same model, same schema, same validated
+  // result at the end — but the caller can show the profile being written instead of
+  // holding a spinner over the full generation. `object` only settles once the stream
+  // is drained, so the loop below is required, not optional.
+  const { partialObjectStream, object: finalObject } = streamObject({
     model: anthropic(SYNTHESIS_MODEL),
     schema: ProfileDraftSchema,
     prompt:
@@ -194,6 +222,13 @@ export async function synthesizeProfile(opts: {
         : "") +
       context,
   });
+
+  for await (const partial of partialObjectStream) {
+    opts.onPartial?.(partial as PartialProfileDraft);
+  }
+  // Throws on schema-invalid output, exactly as generateObject did — the caller's
+  // catch still treats that as "synthesis failed", not as a partial success.
+  const object = await finalObject;
 
   return { draft: object, generated: true, reason: "ok", evidence };
 }

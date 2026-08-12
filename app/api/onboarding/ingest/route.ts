@@ -87,7 +87,17 @@ export async function POST() {
       // part; a missing draft is recoverable by pressing Regenerate.
       let synthesis;
       try {
-        synthesis = await synthesizeProfile({ accessToken, email: viewer.email, name });
+        synthesis = await synthesizeProfile({
+          accessToken,
+          email: viewer.email,
+          name,
+          // Both of these exist to fill the synthesis wait with the real thing. The
+          // evidence counts land the moment they're known; the draft streams in field
+          // by field as Sonnet writes it, so the review screen assembles in front of
+          // the user rather than appearing all at once after a silent pause.
+          onEvidence: (evidence) => send({ type: "evidence", evidence }),
+          onPartial: (draft) => send({ type: "draft_partial", draft }),
+        });
       } catch (err) {
         console.error("[onboarding] synthesis failed:", err);
         send({
