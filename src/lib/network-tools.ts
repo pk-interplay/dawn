@@ -38,6 +38,13 @@ export type DawnScope = "mine" | "all";
 
 export interface DawnToolContext {
   client: SupabaseClient;
+  /**
+   * Service-role handle, used by NOTHING in this file — the profile tools
+   * (profile-tools.ts) are the only writers, and only to the viewer's own claims.
+   * It rides in this context because both tool sets are built from one object in
+   * dawn-agent.ts.
+   */
+  writeClient: SupabaseClient;
   viewerEntityId: string;
   viewerEmail: string;
   scope: DawnScope;

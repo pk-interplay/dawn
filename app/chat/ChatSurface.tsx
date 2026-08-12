@@ -19,7 +19,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport, type UIMessage } from "ai";
-import { ArrowUp, ChevronDown, Loader2, MessagesSquare, Plus, Trash2 } from "lucide-react";
+import { ArrowUp, Check, ChevronDown, Loader2, MessagesSquare, Plus, Trash2 } from "lucide-react";
 import Markdown from "react-markdown";
 
 import type { ChatThreadSummary } from "../../src/lib/chat-threads";
@@ -29,9 +29,9 @@ import { cn } from "@/lib/utils";
 import { DawnMark } from "../components/DawnMark";
 
 const SUGGESTIONS = [
-  "Who are my most active relationships?",
+  "Who should I be talking to this week?",
   "Who do I know at Anthropic?",
-  "Who haven't I talked to in a while?",
+  "Who have I gone quiet on?",
   "Who could introduce me to someone at Stripe?",
 ];
 
@@ -41,11 +41,11 @@ const SUGGESTIONS = [
  * the UI.
  */
 const TOOL_LABELS: Record<string, string> = {
-  searchNetwork: "Searching the network",
-  lookupByNameOrDomain: "Looking up names and domains",
-  listTopConnections: "Reading your strongest relationships",
+  searchNetwork: "Scanning your network",
+  lookupByNameOrDomain: "Checking names and companies",
+  listTopConnections: "Going through who you know",
   getEntityProfile: "Pulling up their profile",
-  findWarmPath: "Finding who can introduce you",
+  findWarmPath: "Working out your way in",
 };
 
 // Tailwind can't reach into react-markdown's output, so the prose styles are applied
@@ -126,7 +126,7 @@ export function ChatSurface({
   }
 
   return (
-    <main className="flex h-screen flex-col pl-[72px]">
+    <main className="flex h-full min-h-0 flex-col">
       <header className="border-dawn-btn flex shrink-0 flex-wrap items-center justify-between gap-3 border-b px-6 py-4">
         <Link href="/" className="flex items-center gap-2.5 text-dawn-bone">
           <DawnMark idSuffix="chat" className="h-6 shrink-0 select-none" />
@@ -138,8 +138,17 @@ export function ChatSurface({
         </div>
       </header>
 
-      <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col overflow-hidden px-6">
-        <div className="flex-1 overflow-y-auto py-8">
+      {/*
+        The scroll container is full-bleed, NOT the centred track: scrolling the track
+        parks the scrollbar a few pixels off the messages in the middle of the screen,
+        which reads as a stray line rather than window chrome. Centring happens on the
+        inner div instead.
+
+        The message track is deliberately wider than the composer — reading wants the
+        room, typing a one-line question does not.
+      */}
+      <div className="flex-1 overflow-y-auto overscroll-contain">
+        <div className="mx-auto w-full max-w-5xl px-6 py-8">
           {messages.length === 0 ? (
             networkSize === 0 ? (
               <EmptyNoNetwork />
@@ -151,7 +160,11 @@ export function ChatSurface({
               {messages.map((message) => (
                 <Message key={message.id} message={message} />
               ))}
-              {status === "submitted" && <StatusPill label="Thinking" />}
+              {status === "submitted" && (
+                <div className="pl-1">
+                  <StatusLine label="Thinking" />
+                </div>
+              )}
             </div>
           )}
 
@@ -161,14 +174,16 @@ export function ChatSurface({
             </p>
           )}
         </div>
+      </div>
 
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            submit(input);
-          }}
-          className="shrink-0 pb-8"
-        >
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          submit(input);
+        }}
+        className="shrink-0"
+      >
+        <div className="mx-auto w-full max-w-3xl px-6 pb-8">
           <div className="border-dawn-btn bg-dawn-input flex items-center gap-2 rounded-full border px-2 py-1.5 pl-5">
             <input
               value={input}
@@ -192,8 +207,8 @@ export function ChatSurface({
               )}
             </Button>
           </div>
-        </form>
-      </div>
+        </div>
+      </form>
     </main>
   );
 }
@@ -202,7 +217,7 @@ export function ChatSurface({
  * Past sessions, as a dropdown beside the scope toggle.
  *
  * Hand-built rather than shadcn's `dropdown-menu`, which is not installed here — the
- * same call ScopeToggle and DawnRail already made. Everything is a real navigation:
+ * same call ScopeToggle already makes. Everything is a real navigation:
  * picking a thread goes to `/chat?t=…` and lets the server hydrate the history, which
  * beats a client fetch that would have to reconstruct message state by hand.
  */
@@ -394,39 +409,63 @@ function Message({ message }: { message: UIMessageLike }) {
   const isUser = message.role === "user";
   const parts = message.parts ?? [];
 
+  // Tool parts arrive as `tool-<name>`. They're process, not answer, so they render as a
+  // bare trail above the reply rather than inside a bubble — a bubble containing only
+  // "Reading your strongest relationships…" reads as if that were Dawn's response.
+  const steps = parts
+    .filter((part) => part.type.startsWith("tool-"))
+    .map((part) => TOOL_LABELS[part.type.slice("tool-".length)] ?? "Looking things up");
+  const textParts = parts.filter((part) => part.type === "text" && part.text?.trim());
+
   return (
-    <div className={cn("flex", isUser ? "justify-end" : "justify-start")}>
-      <div
-        className={cn(
-          "max-w-[85%] rounded-3xl px-4 py-2.5",
-          isUser ? "bg-dawn-btn text-dawn-bone" : "bg-card text-foreground",
-        )}
-      >
-        {parts.map((part, i) => {
-          if (part.type === "text") {
-            return (
-              <div key={i} className={MARKDOWN_CLASSES}>
-                <Markdown>{part.text ?? ""}</Markdown>
-              </div>
-            );
-          }
-          // Tool parts arrive as `tool-<name>`; show what Dawn is doing, not the payload.
-          if (part.type.startsWith("tool-")) {
-            const name = part.type.slice("tool-".length);
-            return <StatusPill key={i} label={TOOL_LABELS[name] ?? "Looking things up"} />;
-          }
-          return null;
-        })}
-      </div>
+    <div className={cn("flex flex-col gap-2", isUser ? "items-end" : "items-start")}>
+      {steps.length > 0 && (
+        <div className="flex flex-col gap-1 pl-1">
+          {steps.map((label, i) => (
+            <StatusLine
+              key={i}
+              label={label}
+              // Only the last step is still in flight once text starts arriving.
+              done={i < steps.length - 1 || textParts.length > 0}
+            />
+          ))}
+        </div>
+      )}
+
+      {textParts.length > 0 && (
+        <div
+          className={cn(
+            "max-w-[72%] rounded-3xl px-4 py-2.5",
+            isUser ? "bg-dawn-btn text-dawn-bone" : "bg-card text-foreground",
+          )}
+        >
+          {textParts.map((part, i) => (
+            <div key={i} className={MARKDOWN_CLASSES}>
+              <Markdown>{part.text ?? ""}</Markdown>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
-function StatusPill({ label }: { label: string }) {
+/**
+ * One line of "here's what Dawn is doing". In flight it shimmers; finished, it settles
+ * into a dim check so the trail reads as a record of the work rather than stale spinners.
+ */
+function StatusLine({ label, done = false }: { label: string; done?: boolean }) {
   return (
-    <p className="text-muted-foreground flex items-center gap-2 py-1 text-xs">
-      <span className="bg-muted-foreground size-1.5 animate-pulse rounded-full" />
-      {label}…
+    <p className="dawn-enter text-muted-foreground flex items-center gap-2 text-xs">
+      {done ? (
+        <Check className="size-3 shrink-0 opacity-60" strokeWidth={2.5} />
+      ) : (
+        <Loader2 className="size-3 shrink-0 animate-spin opacity-70" strokeWidth={2.5} />
+      )}
+      <span className={cn(!done && "dawn-working")}>
+        {label}
+        {done ? "" : "…"}
+      </span>
     </p>
   );
 }
@@ -446,8 +485,8 @@ function EmptyWithSuggestions({
         {firstName ? `What are you looking for, ${firstName}?` : "What are you looking for?"}
       </h1>
       <p className="text-muted-foreground mt-3 text-sm">
-        {networkSize.toLocaleString()} relationships in your network. Dawn knows who you
-        email and meet, and how recently — never what was said.
+        {networkSize.toLocaleString()} people in your network. Dawn knows who you email
+        and meet, and how recently — never what was said.
       </p>
 
       <p className="text-dawn-head mt-10 text-[11px] font-medium tracking-[2.4px] uppercase">
@@ -476,7 +515,7 @@ function EmptyNoNetwork() {
         Dawn hasn&rsquo;t synced your network yet.
       </h1>
       <p className="text-muted-foreground mt-3 text-sm">
-        There are no relationships to search, so every question would come back empty.
+        There&rsquo;s no one to search yet, so every question would come back empty.
         Connecting Gmail takes a minute and only happens once.
       </p>
       <Button variant="pill" size="pill" asChild className="dawn-shimmer mt-8">

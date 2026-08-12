@@ -24,6 +24,7 @@ function fakeClient(): SupabaseClient {
 function toolsFor(scope: DawnScope) {
   return createDawnTools({
     client: fakeClient(),
+    writeClient: fakeClient(),
     viewerEntityId: VIEWER,
     viewerEmail: "viewer@example.com",
     scope,

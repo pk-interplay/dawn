@@ -56,7 +56,9 @@ export async function GET(req: Request) {
         introsPending: mine.filter((i) =>
           ["proposed", "a_invited", "b_invited", "a_opted_in", "b_opted_in"].includes(String(i.state)),
         ).length,
-        introsCompleted: mine.filter((i) => ["scheduled", "completed"].includes(String(i.state))).length,
+        introsCompleted: mine.filter((i) =>
+          ["introduced", "scheduled", "completed"].includes(String(i.state)),
+        ).length,
         answered,
         yeses,
         optInRate: answered ? yeses / answered : null,

@@ -30,6 +30,9 @@ const INTRO_STATE_ROLE: Record<string, StatusRole> = {
   a_opted_in: "active",
   b_opted_in: "active",
   both_opted_in: "active",
+  // The terminal success state: both sides said yes and the warm intro went out.
+  introduced: "good",
+  // Legacy, for rows opened before Dawn stopped owning the calendar.
   scheduling: "active",
   scheduled: "good",
   completed: "good",

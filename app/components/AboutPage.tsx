@@ -26,7 +26,7 @@ import { Button } from "@/components/ui/button";
 import { isAdmin } from "@/app/lib/admin-auth";
 import { startGoogleSignIn } from "@/app/lib/auth-actions";
 import { DawnMark } from "./DawnMark";
-import { DawnRail } from "./DawnRail";
+import { DawnShell } from "./DawnSidebar";
 
 // Every CTA on this page is the same action, because there is only one way in.
 // It used to read "Join the Waitlist" pointing at /join — there is no waitlist and
@@ -234,16 +234,17 @@ export async function AboutPage() {
   const admin = signedIn && (await isAdmin());
 
   return (
-    <>
-      <TopBar />
-      <main className={`mx-auto max-w-[980px] pb-[120px] max-[820px]:pb-20 ${GUTTER}`}>
-        <Hero />
-        <HowItWorks />
-        <WhoItsFor />
-        <ClosingCta />
-        <SiteFooter />
-      </main>
-      <DawnRail signedIn={signedIn} isAdmin={admin} />
-    </>
+    <DawnShell signedIn={signedIn} isAdmin={admin}>
+      <div className="h-full overflow-y-auto">
+        <TopBar />
+        <main className={`mx-auto max-w-[980px] pb-[120px] max-[820px]:pb-20 ${GUTTER}`}>
+          <Hero />
+          <HowItWorks />
+          <WhoItsFor />
+          <ClosingCta />
+          <SiteFooter />
+        </main>
+      </div>
+    </DawnShell>
   );
 }

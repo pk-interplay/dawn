@@ -85,6 +85,9 @@ export async function POST(req: Request) {
 
   const agent = await createDawnAgent({
     client: db,
+    // Reads stay on the publishable key so RLS is live on every graph query; the
+    // profile tools need a writer, and it is scoped to this one entity's own claims.
+    writeClient: supabase,
     viewerEntityId: viewer.entityId,
     viewerEmail: viewer.email,
     scope,
