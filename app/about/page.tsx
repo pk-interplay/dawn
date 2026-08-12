@@ -5,7 +5,7 @@
  * on links already in the wild.
  *
  * To bring the route back: render <AboutPage /> here again and restore the two
- * entry points that were removed with it, the rail's About tab (DawnRail) and the
+ * entry points that were removed with it, the rail's About tab (DawnSidebar) and the
  * signed-in home screen's corner link (app/page.tsx).
  */
 

@@ -14,6 +14,7 @@ const STATES = [
   "a_opted_in",
   "b_opted_in",
   "both_opted_in",
+  "introduced",
   "scheduling",
   "scheduled",
   "completed",

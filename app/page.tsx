@@ -7,24 +7,24 @@
  * redirects here, and the links to it are gone (see app/about/page.tsx).
  *
  * Signed in, `/` stays the reference build's /Dawn/ home: a locked viewport holding
- * the wordmark lockup, a greeting, and four starter questions that each open a chat
- * already asking something. Onboarding is not a third case — `/chat` sends anyone who
- * hasn't finished it to `/onboarding` itself, so nothing here has to know.
+ * the wordmark lockup, a greeting, and a composer that opens the chat already saying
+ * something. The composer replaced four fixed starter links — it takes anything,
+ * including "here's what I'm working on now", which is how profile maintenance gets an
+ * entry point at all (see HomeComposer, and the profile tools in src/lib/profile-tools).
+ * Onboarding is not a third case — `/chat` sends anyone who hasn't finished it to
+ * `/onboarding` itself, so nothing here has to know.
  *
  * A server component on purpose. Reading the session here means the right screen and
  * the correct rail render on the first paint; `useSession()` in the client would flash
  * the signed-out state on every load, on the one screen where that is most visible.
  */
 
-import Link from "next/link";
-import { MessageCircle } from "lucide-react";
-
 import { auth } from "../src/auth";
-import { cn } from "@/lib/utils";
 import { isAdmin } from "./lib/admin-auth";
 import { AboutPage } from "./components/AboutPage";
 import { DawnMark } from "./components/DawnMark";
-import { DawnRail } from "./components/DawnRail";
+import { HomeComposer } from "./components/HomeComposer";
+import { DawnShell } from "./components/DawnSidebar";
 
 export default async function Home() {
   const session = await auth();
@@ -34,25 +34,14 @@ export default async function Home() {
   // session and renders its own rail, so there is nothing to thread through.
   if (!signedIn) return <AboutPage />;
 
-  // Gates the Admin rail tab (see DawnRail).
+  // Gates the Admin rail item (see DawnSidebar).
   const admin = await isAdmin();
 
   // Google gives a full name; there is no separate first-name field to read.
   const firstName = session?.user?.name?.trim().split(/\s+/)[0];
 
-  // The home screen no longer opens an empty chat — it opens a chat that is already
-  // asking something. Four starter questions the graph can actually answer, so the
-  // first thing Dawn does is answer rather than sit at a blank prompt. Each one is
-  // about *your* network, which is why this screen is the signed-in one.
-  const questions = [
-    "Who are my most active relationships?",
-    "Who do I know at Anthropic?",
-    "Who haven't I talked to in a while?",
-    "Who could introduce me to someone at Stripe?",
-  ];
-
   return (
-    <div className="flex h-screen overflow-hidden">
+    <DawnShell signedIn isAdmin={admin}>
       {/* The corner About link is hidden along with /about; the greeting now has the
           top-right corner to itself. */}
       {firstName && (
@@ -75,34 +64,9 @@ export default async function Home() {
           </span>
         </h1>
 
-        <div
-          style={{ "--dawn-delay": "380ms" } as React.CSSProperties}
-          className="dawn-enter grid w-full max-w-[560px] grid-cols-2 gap-3 px-6"
-        >
-          {questions.map((question, i) => (
-            // Each question opens the chat already asking it.
-            <Link
-              key={question}
-              href={`/chat?q=${encodeURIComponent(question)}`}
-              style={{ "--dawn-delay": `${420 + i * 60}ms` } as React.CSSProperties}
-              className={cn(
-                "dawn-enter border-dawn-btn bg-dawn-input group flex items-start gap-3 rounded-2xl border",
-                "px-4 py-3.5 text-left transition-colors hover:border-muted-foreground/40",
-              )}
-            >
-              <MessageCircle
-                className="text-muted-foreground group-hover:text-dawn-bone mt-0.5 size-[17px] shrink-0 transition-colors"
-                strokeWidth={2}
-              />
-              <span className="text-muted-foreground group-hover:text-dawn-bone text-sm leading-snug transition-colors">
-                {question}
-              </span>
-            </Link>
-          ))}
-        </div>
+        <HomeComposer />
       </main>
 
-      <DawnRail signedIn isAdmin={admin} />
-    </div>
+    </DawnShell>
   );
 }

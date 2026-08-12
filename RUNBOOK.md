@@ -28,8 +28,9 @@ email while your teammates' experience — the matching, the asking, the replyin
 entirely real.
 
 What this exercises end to end: onboarding → embedding-based matching → double opt-in
-→ inbound reply parsing → scheduling. What it deliberately doesn't: a meeting actually
-happening.
+→ inbound reply parsing → the warm introduction. What it deliberately doesn't: a
+meeting actually happening — Dawn hands the thread over and stops, so whether the two
+of them meet is not something the pilot can observe.
 
 Order matters in one place. **Personas are generated from what your teammates
 actually asked for**, so onboarding has to finish before you create them, and the cron
@@ -166,12 +167,27 @@ select vault.create_secret('<CRON_SECRET>',    'dawn_cron_secret');
 select schedule_dawn_jobs();
 ```
 
-Expect: `Scheduled dawn-run-matches (hourly). decay-proximity and expire-intros are
+Expect: `Scheduled dawn-run-matches (hourly), dawn-nudge-intros (every 6h at :20) and
+dawn-reconcile-companies (daily 03:30 UTC). decay-proximity and expire-intros remain
 intentionally unscheduled — see 0031.`
 
-Volume is governed in two independent places and both have to allow it: the schedule
-(every 3h) and each member's `intro_cadence` (`burst` = one intro per 6h). The ceiling
-is four opt-in asks per member per day. Lower either one to slow it down.
+Volume is governed in three independent places and all of them have to allow it: the
+schedule (every 3h), the initiating member's `intro_cadence` (`burst` = one intro per
+6h), and — since migration 0036 — **the suggested person's own cadence**. That third
+gate is why a run can report `no eligible match (… candidates over their own
+cadence)` while both people look idle: under double opt-in the suggested party gets a
+real email, so they are metered by their own tolerance, counting asks in both
+directions. Lower any one of the three to slow things down.
+
+Separately, `dawn-nudge-intros` follows up on unanswered asks at +3d and +7d and then
+expires the introduction quietly (`MAX_NUDGES` in `src/lib/intro-flow.ts`). The side
+that did say yes is deliberately not told it fell through. That puts the ceiling at
+three Dawn emails per person per introduction. To follow up on one intro immediately:
+
+```sh
+curl -H "Authorization: Bearer $CRON_SECRET" \
+  "https://your-app/api/cron/nudge-intros?introduction_id=<uuid>"
+```
 
 Want the first batch immediately rather than at the top of the next third hour:
 

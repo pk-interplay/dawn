@@ -12,7 +12,7 @@ import {
   threadExists,
   isThreadId,
 } from "../../src/lib/chat-threads";
-import { DawnRail } from "../components/DawnRail";
+import { DawnShell } from "../components/DawnSidebar";
 import { ChatSurface } from "./ChatSurface";
 
 export const metadata: Metadata = {
@@ -70,7 +70,7 @@ export default async function Chat({
   if (!stored && (await threadExists(supabase, threadId))) redirect(freshThreadUrl(params.q));
 
   return (
-    <>
+    <DawnShell signedIn isAdmin={await isAdmin()}>
       <ChatSurface
         // Remount on thread switch. `?t=` changes are a soft navigation, so without a
         // key the surface would keep the previous thread's useChat state alive.
@@ -84,8 +84,7 @@ export default async function Chat({
         // helpers free of an AI SDK type dependency.
         initialMessages={(stored ?? []) as UIMessage[]}
       />
-      <DawnRail signedIn isAdmin={await isAdmin()} />
-    </>
+    </DawnShell>
   );
 }
 

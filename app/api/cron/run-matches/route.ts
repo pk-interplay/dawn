@@ -38,6 +38,36 @@ const CADENCE_DAYS: Record<string, number> = {
 
 type RunResult = Record<string, unknown>;
 
+/**
+ * How many opt-in asks this person has received inside their own cadence window.
+ *
+ * Counts intros in BOTH directions — ones opened on their behalf (`requester_ref`)
+ * and ones where they were the person suggested (`introduced_to_id`). The gate used
+ * to count only the first, which made the cadence cap one-sided: it governed how
+ * often someone was the *subject* of matching, and said nothing about how often they
+ * were suggested *to*. That was survivable while only person A was ever emailed, but
+ * under double opt-in person B receives a real email — so a well-connected member
+ * could be asked any number of times in a week while their own `intro_cadence` said
+ * "monthly", and nothing in the system was counting.
+ *
+ * The window is the person's own cadence scaled by the network intensity dial, so
+ * both sides of a pair are judged by their own tolerance rather than the initiator's.
+ */
+async function asksInWindow(
+  personId: string,
+  cadence: string,
+  intensity: number,
+): Promise<{ count: number; days: number }> {
+  const days = (CADENCE_DAYS[cadence] ?? 7) / intensity;
+  const since = new Date(Date.now() - days * 86_400_000).toISOString();
+  const { count } = await db
+    .from("intros")
+    .select("*", { count: "exact", head: true })
+    .or(`requester_ref.eq.${personId},introduced_to_id.eq.${personId}`)
+    .gte("created_at", since);
+  return { count: count ?? 0, days };
+}
+
 async function run(req: Request) {
   if (!isAuthorized(req)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -112,15 +142,12 @@ async function run(req: Request) {
       // The member's base window, scaled by the network intensity dial: a higher
       // intensity shortens the window (more frequent intros), a lower one lengthens
       // it. At intensity 1.0 this is exactly the member's own cadence.
-      const baseDays = CADENCE_DAYS[person.intro_cadence] ?? 7;
-      const days = baseDays / settings.intensity;
-      const since = new Date(Date.now() - days * 86_400_000).toISOString();
-      const { count: introsRecent } = await db
-        .from("intros")
-        .select("*", { count: "exact", head: true })
-        .eq("requester_ref", person.id)
-        .gte("created_at", since);
-      if (!onlyPersonId && (introsRecent ?? 0) > 0) {
+      const { count: introsRecent, days } = await asksInWindow(
+        person.id,
+        person.intro_cadence,
+        settings.intensity,
+      );
+      if (!onlyPersonId && introsRecent > 0) {
         results.push({
           person: person.name,
           skipped: `over cadence (${introsRecent} in ${days.toFixed(2)}d @ ${settings.intensity}×)`,
@@ -148,8 +175,13 @@ async function run(req: Request) {
         continue;
       }
 
-      // Pick the best candidate we haven't already opened an introduction with.
+      // Pick the best candidate that we haven't already introduced them to AND whose
+      // own inbox has room. Walking the shortlist means a candidate who is over their
+      // cadence costs this member their second choice, not their whole run — which is
+      // why the cap is applied here rather than as a filter in `fetchCandidates`
+      // (a filter there would silently shrink the shortlist the reranker sees).
       let chosen: (typeof valid)[number] | null = null;
+      const passedOver: string[] = [];
       for (const m of valid) {
         const { count } = await db
           .from("introductions")
@@ -158,13 +190,37 @@ async function run(req: Request) {
             `and(person_a_id.eq.${person.id},person_b_id.eq.${m.candidate_id}),` +
               `and(person_a_id.eq.${m.candidate_id},person_b_id.eq.${person.id})`,
           );
-        if ((count ?? 0) === 0) {
-          chosen = m;
-          break;
+        if ((count ?? 0) > 0) continue;
+
+        // The suggested person is about to receive a real email under double opt-in,
+        // so they get the same protection as the member being helped. Bypassed by
+        // ?person_id= for the same reason A's gate is: targeted test runs.
+        if (!onlyPersonId) {
+          const { data: candidateRow } = await db
+            .from("people")
+            .select("intro_cadence")
+            .eq("id", m.candidate_id)
+            .maybeSingle();
+          const theirs = await asksInWindow(
+            m.candidate_id,
+            candidateRow?.intro_cadence ?? "weekly",
+            settings.intensity,
+          );
+          if (theirs.count > 0) {
+            passedOver.push(`${m.name} (${theirs.count} in ${theirs.days.toFixed(2)}d)`);
+            continue;
+          }
         }
+
+        chosen = m;
+        break;
       }
       if (!chosen) {
-        results.push({ person: person.name, skipped: "top matches already introduced" });
+        results.push({
+          person: person.name,
+          skipped: "no eligible match (already introduced, or candidates over their own cadence)",
+          ...(passedOver.length ? { over_cadence: passedOver } : {}),
+        });
         continue;
       }
 

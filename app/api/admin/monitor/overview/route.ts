@@ -16,6 +16,11 @@ const STATE_RANK: Record<string, number> = {
   a_opted_in: 2,
   b_opted_in: 2,
   both_opted_in: 3,
+  // `introduced` is the funnel's real end: the warm intro has been sent and Dawn is
+  // out. It shares rank 4 with the legacy `scheduling` step it replaced, so intros
+  // opened either side of the handoff change still land in one comparable funnel
+  // rather than splitting the chart in two.
+  introduced: 4,
   scheduling: 4,
   scheduled: 5,
   completed: 6,
@@ -26,7 +31,8 @@ const FUNNEL_STAGES = [
   { label: "Invited", rank: 1 },
   { label: "One opted in", rank: 2 },
   { label: "Both opted in", rank: 3 },
-  { label: "Scheduling", rank: 4 },
+  { label: "Introduced", rank: 4 },
+  // Only ever non-zero for pre-handoff rows; kept so their history stays visible.
   { label: "Scheduled", rank: 5 },
   { label: "Completed", rank: 6 },
 ];

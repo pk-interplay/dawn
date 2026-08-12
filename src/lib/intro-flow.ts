@@ -39,6 +39,24 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// ---- Nudge cadence ----------------------------------------------------------
+// Silence is the majority outcome of a first ask, so it gets a real sequence rather
+// than a single seven-day timeout. Two follow-ups, then the intro dies quietly — the
+// side that DID say yes is deliberately not told it fell through, because a "this
+// didn't work out" email is one more message about a person they never met.
+//
+// Three total emails per person per introduction is the ceiling this implies, and
+// that ceiling is the point: a matchmaker that chases harder than that reads as a
+// mailing list, and AgentMail's sending reputation is a shared, network-wide asset.
+export const NUDGE_FIRST_DELAY_DAYS = 3;
+export const NUDGE_REPEAT_DELAY_DAYS = 4;
+export const MAX_NUDGES = 2;
+
+/** An ISO timestamp `days` from now, for `introductions.next_action_at`. */
+export function dueInDays(days: number): string {
+  return new Date(Date.now() + days * 86_400_000).toISOString();
+}
+
 // Supabase writes return `{ error }` instead of throwing, and most of the writes
 // below used to discard it. That is how the `intros` insert failed on every single
 // introduction without anyone noticing (RLS was enabled with no policies — see
@@ -112,7 +130,7 @@ export async function draftOptInEmail(helped: Party, suggested: Party, rationale
     `You are Dawn, a warm, concise professional-networking agent. You write short, natural plain-text emails. No markdown, no placeholders like "[Name]" — ready to send as-is.`,
     `Draft a double opt-in introduction email to ${helped.name}. You want to introduce them to ${suggested.name}` +
       `${suggested.headline ? ` (${suggested.headline})` : ""}. Reason this is a strong match: ${rationale}. ` +
-      `Explain the value briefly and ask if they'd be open to the intro — tell them to just reply "yes" and you'll coordinate a time. Sign off as Dawn.`,
+      `Explain the value briefly and ask if they'd be open to the intro — tell them to just reply "yes" and you'll introduce them once the other person is in. Sign off as Dawn.`,
   );
   if (drafted) return drafted;
   return {
@@ -121,7 +139,7 @@ export async function draftOptInEmail(helped: Party, suggested: Party, rationale
       `Hi ${helped.name},\n\n` +
       `I came across ${suggested.name}${suggested.headline ? ` (${suggested.headline})` : ""} and think you two should meet. ` +
       `${rationale}\n\n` +
-      `Would you be open to an introduction? Just reply "yes" and I'll coordinate a time that works.\n\n— Dawn`,
+      `Would you be open to an introduction? Just reply "yes" and I'll check they're up for it too, then put you in touch.\n\n— Dawn`,
   };
 }
 
@@ -140,7 +158,7 @@ export async function draftSecondSideOptInEmail(helped: Party, suggested: Party,
       `${helped.name}${helped.headline ? ` (${helped.headline})` : ""} has already said they would like to meet them. ` +
       `Reason the two are a strong match: ${rationale}. ` +
       `Briefly introduce yourself as an agent that makes introductions, say who wants to meet them and why it could be worth their time, ` +
-      `and make clear nothing is scheduled and they are free to decline. Ask them to reply "yes" if they're open to it and you'll coordinate a time. Sign off as Dawn.`,
+      `and make clear nothing is scheduled and they are free to decline. Ask them to reply "yes" if they're open to it and you'll introduce the two of them by email. Sign off as Dawn.`,
   );
   if (drafted) return drafted;
   return {
@@ -150,7 +168,7 @@ export async function draftSecondSideOptInEmail(helped: Party, suggested: Party,
       `I'm Dawn — I make introductions between people who should know each other. ` +
       `${helped.name}${helped.headline ? ` (${helped.headline})` : ""} would like to meet you. ` +
       `${rationale}\n\n` +
-      `Nothing is scheduled and there's no obligation. If you're open to it, just reply "yes" and I'll find a time that suits you both.\n\n— Dawn`,
+      `Nothing is scheduled and there's no obligation. If you're open to it, just reply "yes" and I'll introduce you both by email — you can take it from there.\n\n— Dawn`,
   };
 }
 
@@ -208,10 +226,26 @@ function inSameCity(a: string | null, b: string | null): boolean {
   return left === right;
 }
 
-async function draftSchedulingEmail(
+/**
+ * The email the whole product exists to send: both sides said yes, so name each of
+ * them to the other, say why they should meet, and hand the thread over.
+ *
+ * This replaces the scheduling email that used to sit here. The difference is not
+ * cosmetic — the old email proposed three specific times and kept Dawn in the middle
+ * until something was booked, which made Dawn a standing dependency on every
+ * relationship it created and meant a meeting only happened if Dawn's calendar
+ * wrangling worked. A matchmaker's job is the handoff.
+ *
+ * The meeting-format preferences are still read, because they change what to suggest
+ * even when Dawn isn't the one arranging it: two people who both asked to start over
+ * email should not be told to grab coffee. Dawn suggests a shape and stops; the two
+ * of them settle the details.
+ */
+async function draftWarmIntroEmail(
   client: SupabaseClient,
   helped: Party,
   suggested: Party,
+  rationale: string,
 ) {
   const tzNote = [helped.timezone, suggested.timezone].filter(Boolean).join(" and ") || "their timezones";
 
@@ -229,70 +263,118 @@ async function draftSchedulingEmail(
   const format =
     shared[0] === "in_person_coffee" && !sameCity ? (shared[1] ?? null) : (shared[0] ?? null);
 
+  // What to suggest they do — a suggestion only. Dawn is not arranging any of these,
+  // so none of these branches proposes a specific time: naming times commits Dawn to
+  // chasing whether they were taken, which is exactly the loop being removed.
   let formatInstruction: string;
   if (format === "in_person_coffee") {
     formatInstruction =
-      `They have both said they'd like to meet for coffee in person, and they are both in ${helped.location}. ` +
-      `Propose coffee: suggest three specific day-and-time options over the next two weeks, and ask them to settle on a spot ` +
-      `convenient for both of them — do not invent a venue yourself.`;
+      `They have both said they'd like to meet in person, and they are both in ${helped.location} — suggest they grab a coffee. ` +
+      `Do not propose specific times or a venue; leave both to them.`;
   } else if (format === "phone_call") {
     formatInstruction =
-      `They have both said they'd prefer a phone call over video. Propose exactly three specific time options over the next two ` +
-      `weeks (spread across days) and mention it's just a call, so no link is needed.`;
+      `They have both said they'd prefer a phone call over video — suggest a call. Do not propose specific times.`;
   } else if (format === "async_email") {
     formatInstruction =
-      `Neither of them wants to start with a meeting — they both said they'd rather begin over email. Do NOT propose times. ` +
-      `Instead, introduce them to each other properly in this thread and invite them to take it from here by replying, ` +
-      `noting they can ask me to find a time whenever they want one.`;
+      `Neither wants to start with a meeting — they both said they'd rather begin over email. Do not suggest a call at all; ` +
+      `invite them to simply carry on in this thread.`;
   } else {
     // Includes video_call, no overlap, and nobody having answered.
     formatInstruction =
-      `Propose exactly three specific meeting time options over the next two weeks (spread across days) and ask them to reply ` +
-      `with the one that works.`;
+      `Suggest they find half an hour for a call in the next couple of weeks. Do not propose specific times — they can sort ` +
+      `that out between themselves.`;
   }
 
   const drafted = await draftEmail(
-    `You are Dawn, coordinating a first meeting between two people who both said yes to an intro. Warm, concise, plain text, ready to send.`,
-    `Both ${helped.name} and ${suggested.name} are keen to meet, and BOTH are recipients of this email. Address them both by name. ` +
-      `${formatInstruction} Account for ${tzNote}. Keep it short and sign off as Dawn.`,
+    `You are Dawn, a professional-networking agent making a warm introduction between two people who have each separately agreed to it. ` +
+      `Warm, concise, plain text, ready to send. You are handing off, not coordinating: never propose specific times, never ask them ` +
+      `to report back to you, and never imply you will follow up.`,
+    `Write the introduction email. BOTH ${helped.name} and ${suggested.name} are recipients — address them both by name. ` +
+      `Tell each of them who the other is and what they do: ${helped.name}${helped.headline ? ` is ${helped.headline}` : ""}; ` +
+      `${suggested.name}${suggested.headline ? ` is ${suggested.headline}` : ""}. ` +
+      `Say specifically why the two of them are worth each other's time: ${rationale}. ` +
+      `${formatInstruction} They are in ${tzNote}, so if you mention timing at all keep it vague. ` +
+      `Close by explicitly leaving it with them. Keep it short and sign off as Dawn.`,
   );
   if (drafted) return drafted;
 
-  // Fallbacks, for when the model call fails. Only the async case needs its own:
-  // proposing times to two people who both asked not to meet yet is worse than
-  // sending nothing useful.
+  // Fallbacks for a failed model call. Each still does the one essential job — say
+  // who each person is and why — because an intro email without that is just two
+  // strangers cc'd on a greeting.
+  const bios =
+    `${helped.name}${helped.headline ? ` — ${helped.headline}` : ""}\n` +
+    `${suggested.name}${suggested.headline ? ` — ${suggested.headline}` : ""}`;
+
   if (format === "async_email") {
     return {
-      subject: `${helped.name} & ${suggested.name} — introducing you two`,
+      subject: `${helped.name} ↔ ${suggested.name}`,
       body:
         `Hi ${helped.name} and ${suggested.name},\n\n` +
-        `You're both up for connecting, and you both mentioned you'd rather start over email — so here you are.\n\n` +
-        `${helped.name}${helped.headline ? `: ${helped.headline}` : ""}\n` +
-        `${suggested.name}${suggested.headline ? `: ${suggested.headline}` : ""}\n\n` +
-        `Reply here and take it from there. If you'd like me to find a time later, just ask.\n\n— Dawn`,
+        `You've both said you're up for this, and you both mentioned you'd rather start over email — so here you are.\n\n` +
+        `${bios}\n\n` +
+        `Why I thought of you two: ${rationale}\n\n` +
+        `I'll leave you to it — just reply to each other here.\n\n— Dawn`,
     };
   }
-  // `format` can only be coffee at this point if they're co-located — the selection
-  // above already dropped it otherwise.
   if (format === "in_person_coffee") {
     return {
-      subject: `Coffee? — ${helped.name} & ${suggested.name}`,
+      subject: `${helped.name} ↔ ${suggested.name}`,
       body:
         `Hi ${helped.name} and ${suggested.name},\n\n` +
-        `Great news — you're both up for connecting, and you're both in ${helped.location}, so coffee seems right.\n\n` +
-        `A few times that could work:\n` +
-        `• Tue 10:00am\n• Wed 2:00pm\n• Thu 4:30pm\n\n` +
-        `Reply with your pick and somewhere convenient for you both.\n\n— Dawn`,
+        `You've both said you're up for this, and you're both in ${helped.location} — so a coffee seems right.\n\n` +
+        `${bios}\n\n` +
+        `Why I thought of you two: ${rationale}\n\n` +
+        `Over to you both to find a time and a place.\n\n— Dawn`,
     };
   }
   return {
-    subject: `Let's find a time — ${helped.name} & ${suggested.name}`,
+    subject: `${helped.name} ↔ ${suggested.name}`,
     body:
       `Hi ${helped.name} and ${suggested.name},\n\n` +
-      `Great news — you're both up for connecting!\n\n` +
-      `Here are a few times to get started (let me know which works):\n` +
-      `• Tue 10:00am\n• Wed 2:00pm\n• Thu 4:30pm\n\n` +
-      `Reply with your pick and I'll lock it in.\n\n— Dawn`,
+      `You've both said you're up for this, so let me introduce you properly.\n\n` +
+      `${bios}\n\n` +
+      `Why I thought of you two: ${rationale}\n\n` +
+      `Worth half an hour, I think. I'll leave the two of you to sort out when.\n\n— Dawn`,
+  };
+}
+
+/**
+ * A follow-up to one side that hasn't answered its opt-in ask.
+ *
+ * Deliberately shorter and softer than the original, and it never repeats the full
+ * pitch: someone who ignored the first email does not need a second copy of it, they
+ * need a one-line out. `attempt` is 1-indexed, and the second nudge says outright
+ * that it is the last one — the honest version of a follow-up sequence tells you when
+ * it ends, and it also gives the recipient a reason to answer now.
+ */
+export async function draftNudgeEmail(
+  recipient: Party,
+  other: Party,
+  attempt: number,
+) {
+  const isFinal = attempt >= MAX_NUDGES;
+  const drafted = await draftEmail(
+    `You are Dawn, a professional-networking agent. You are following up ONCE on an introduction you suggested and have not heard back about. ` +
+      `Very short — three sentences at most. Warm, never guilt-trippy, no "just circling back". Plain text, ready to send. ` +
+      `Do not re-pitch the match in detail; they already have that email.`,
+    `Follow up with ${recipient.name} about the introduction to ${other.name}` +
+      `${other.headline ? ` (${other.headline})` : ""} that you suggested and haven't heard back on. ` +
+      `Make it easy to answer either way — a "yes" or a "no thanks" are equally fine. ` +
+      (isFinal
+        ? `This is your last follow-up: say plainly that you won't chase it again, so they know silence closes it.`
+        : `Keep it light and leave the door open.`) +
+      ` Sign off as Dawn.`,
+  );
+  if (drafted) return drafted;
+  return {
+    subject: `Re: ${other.name}`,
+    body:
+      `Hi ${recipient.name},\n\n` +
+      `Just checking whether you'd like me to introduce you to ${other.name}${other.headline ? ` (${other.headline})` : ""}. ` +
+      `A "no thanks" is a perfectly good answer.\n\n` +
+      (isFinal
+        ? `This is the last I'll ask about this one — if I don't hear back I'll let it go.\n\n— Dawn`
+        : `— Dawn`),
   };
 }
 
@@ -800,7 +882,16 @@ export async function startIntroduction(
     (
       await client
         .from("introductions")
-        .update({ state: "a_invited", updated_at: nowIso() })
+        .update({
+          state: "a_invited",
+          // A now owes us a reply. Arming the clock here (rather than letting the
+          // nudge sweep infer a due time from `updated_at`) means every later state
+          // change can re-arm or disarm it explicitly, so a row is never both
+          // terminal and due.
+          awaiting: "a",
+          next_action_at: dueInDays(NUDGE_FIRST_DELAY_DAYS),
+          updated_at: nowIso(),
+        })
         .eq("id", intro.id)
     ).error,
   );
@@ -907,7 +998,9 @@ export interface AdvanceResult {
   action:
     | "opted_in_waiting"
     | "invited_second_side"
-    | "proposed_times"
+    | "introduced"
+    // Only reachable for rows already in `scheduling` when the handoff shipped; new
+    // introductions terminate at `introduced` and never enter the scheduling states.
     | "scheduled"
     | "declined"
     | "noop";
@@ -955,7 +1048,15 @@ export async function advanceOnReply(
       (
         await client
           .from("introductions")
-          .update({ [respField]: "no", state: "declined", updated_at: nowIso() })
+          .update({
+            [respField]: "no",
+            state: "declined",
+            // Terminal — disarm, so the nudge sweep can never chase someone who has
+            // explicitly said no.
+            awaiting: null,
+            next_action_at: null,
+            updated_at: nowIso(),
+          })
           .eq("id", intro.id)
       ).error,
     );
@@ -1027,7 +1128,15 @@ export async function advanceOnReply(
           (
             await client
               .from("introductions")
-              .update({ a_response: "yes", state: "b_invited", updated_at: nowIso() })
+              .update({
+                a_response: "yes",
+                state: "b_invited",
+                // The wait transfers to B, and B's nudge allowance is its own
+                // counter — A having been chased twice must not shorten B's rope.
+                awaiting: "b",
+                next_action_at: dueInDays(NUDGE_FIRST_DELAY_DAYS),
+                updated_at: nowIso(),
+              })
               .eq("id", intro.id)
           ).error,
         );
@@ -1040,36 +1149,53 @@ export async function advanceOnReply(
         };
       }
 
+      // Waiting on the other side — but only if they have actually been asked and
+      // are still pending. If they already answered "no" there is nobody left to
+      // chase, and arming the clock would have the sweep nudging a person who has
+      // already declined.
+      const otherPending = (isA ? intro.b_response : intro.a_response) === "pending";
       warnOnError(
         "introductions update (one side opted in)",
         (
           await client
             .from("introductions")
-            .update({ [respField]: "yes", state: isA ? "a_opted_in" : "b_opted_in", updated_at: nowIso() })
+            .update({
+              [respField]: "yes",
+              state: isA ? "a_opted_in" : "b_opted_in",
+              awaiting: otherPending ? (isA ? "b" : "a") : null,
+              next_action_at: otherPending ? dueInDays(NUDGE_FIRST_DELAY_DAYS) : null,
+              updated_at: nowIso(),
+            })
             .eq("id", intro.id)
         ).error,
       );
       return { state: isA ? "a_opted_in" : "b_opted_in", action: "opted_in_waiting", note: "One side in; awaiting the other." };
     }
 
-    // Both in → propose times to BOTH parties and move to scheduling. This used to
-    // send only to person A while the drafted body addressed them both, so A would
-    // read "you're both up for connecting" and act on times B had never seen.
-    const draft = await draftSchedulingEmail(client, helped, suggested);
-    const schedulingBody = withUnsubscribe(draft.body);
+    // Both in → send the warm introduction to BOTH parties and step out. This is the
+    // terminal happy path: Dawn's job was to find the pair and get consent from each
+    // side, and it is now done. (It previously proposed times here and stayed in the
+    // thread until a booking; see draftWarmIntroEmail for why that changed.)
+    const draft = await draftWarmIntroEmail(
+      client,
+      helped,
+      suggested,
+      intro.rationale ?? "You have overlapping interests.",
+    );
+    const introBody = withUnsubscribe(draft.body);
     const recipients = [helped.email, suggested.email].filter((e): e is string => Boolean(e));
     const send = await sendThreadedOrFresh({
       // Deliberately NOT threaded. AgentMail's reply() takes no recipient list — it
       // answers whoever sent the parent — so threading here would deliver the
-      // proposed times to one side only, which is the exact bug being fixed. A fresh
-      // send is the only way to address both parties.
+      // delivered the introduction to one side only. A fresh send is the only way to
+      // address both parties.
       replyToMessageId: null,
       to: recipients,
       subject: draft.subject,
-      text: schedulingBody,
+      text: introBody,
     });
     warnOnError(
-      "messages insert (scheduling)",
+      "messages insert (warm intro)",
       (
         await client.from("messages").insert({
           conversation_id: args.conversationId,
@@ -1078,30 +1204,53 @@ export async function advanceOnReply(
           from_email: AGENTMAIL_INBOX_ID,
           to_emails: recipients,
           subject: draft.subject,
-          body: schedulingBody,
+          body: introBody,
         })
       ).error,
     );
     warnOnError(
-      "introductions update (scheduling)",
+      "introductions update (introduced)",
       (
         await client
           .from("introductions")
-          .update({ a_response: aResp, b_response: bResp, state: "scheduling", updated_at: nowIso() })
+          .update({
+            a_response: aResp,
+            b_response: bResp,
+            state: "introduced",
+            // Terminal: nobody owes Dawn a reply, so disarm the clock. Leaving a due
+            // time on a finished row is how a sweep ends up nudging people about an
+            // introduction that already happened.
+            awaiting: null,
+            next_action_at: null,
+            updated_at: nowIso(),
+          })
           .eq("id", intro.id)
       ).error,
     );
     warnOnError(
-      "conversations update (scheduling)",
+      "conversations update (introduced)",
       (
         await client
           .from("conversations")
-          .update({ purpose: "scheduling", updated_at: nowIso() })
+          .update({ purpose: "intro", updated_at: nowIso() })
           .eq("id", args.conversationId)
       ).error,
     );
+    // The success signal for the reranker now fires here rather than on a booked
+    // meeting, because there is no longer a booking for Dawn to observe. It is an
+    // honestly weaker proxy for "this was a good match" — both sides said yes, which
+    // is not the same as them getting on — but losing the feedback loop entirely
+    // would be worse. Inferring an actual meeting would need reply detection on the
+    // handed-off thread, which is a later addition.
+    await recordMatchOutcome(client, {
+      matchId: intro.match_id ?? null,
+      aId: intro.person_a_id,
+      bId: intro.person_b_id,
+      status: "accepted",
+    });
+    await closeIntroductionConversations(client, intro.id);
 
-    return { state: "scheduling", action: "proposed_times", note: "Both opted in; proposed meeting times." };
+    return { state: "introduced", action: "introduced", note: "Both opted in; sent the introduction." };
   }
 
   // Already scheduling and they picked a time → lock it in.
@@ -1123,7 +1272,7 @@ export async function advanceOnReply(
       (
         await client
           .from("introductions")
-          .update({ state: "scheduled", updated_at: nowIso() })
+          .update({ state: "scheduled", awaiting: null, next_action_at: null, updated_at: nowIso() })
           .eq("id", intro.id)
       ).error,
     );
@@ -1140,4 +1289,224 @@ export async function advanceOnReply(
   }
 
   return { state: intro.state, action: "noop", note: "No state change (unclear reply)." };
+}
+
+// ---- Nudge a stalled introduction (called by /api/cron/nudge-intros) --------
+
+export interface NudgeResult {
+  introductionId: string;
+  /** 'nudged' sent a follow-up; 'expired' used up the last one; 'skipped' did nothing. */
+  action: "nudged" | "expired" | "skipped";
+  side: "a" | "b" | null;
+  attempt: number;
+  note: string;
+}
+
+/**
+ * Follow up with whichever side of an introduction has gone quiet, or retire the
+ * introduction once its allowance is spent.
+ *
+ * The row's own `awaiting` column decides who to chase, and that side's own counter
+ * decides whether to chase at all — so this is safe to call on any row the sweep
+ * hands it, including one that raced with an inbound reply between the sweep's
+ * SELECT and this call. Every exit path either re-arms `next_action_at` or clears it,
+ * because a row left due-and-unchanged is one the sweep will pick up forever.
+ */
+export async function nudgeIntroduction(
+  client: SupabaseClient,
+  introductionId: string,
+): Promise<NudgeResult> {
+  const { data: intro } = await client
+    .from("introductions")
+    .select("*")
+    .eq("id", introductionId)
+    .single();
+  if (!intro) {
+    return { introductionId, action: "skipped", side: null, attempt: 0, note: "introduction not found" };
+  }
+
+  // Re-check state at execution time. The sweep selected this row a moment ago and a
+  // reply may have landed since; nudging someone who has just answered is the single
+  // worst failure mode this route has, so it is checked twice rather than once.
+  const NUDGEABLE = ["proposed", "a_invited", "b_invited", "a_opted_in", "b_opted_in"];
+  if (!NUDGEABLE.includes(intro.state) || !intro.awaiting) {
+    warnOnError(
+      "introductions update (nudge disarm)",
+      (
+        await client
+          .from("introductions")
+          .update({ next_action_at: null, updated_at: nowIso() })
+          .eq("id", intro.id)
+      ).error,
+    );
+    return {
+      introductionId,
+      action: "skipped",
+      side: null,
+      attempt: 0,
+      note: `state '${intro.state}' is no longer waiting on anyone; clock disarmed`,
+    };
+  }
+
+  const side: "a" | "b" = intro.awaiting === "a" ? "a" : "b";
+  const recipientId = side === "a" ? intro.person_a_id : intro.person_b_id;
+  const otherId = side === "a" ? intro.person_b_id : intro.person_a_id;
+  const sent = (side === "a" ? intro.a_nudges : intro.b_nudges) ?? 0;
+  const countField = side === "a" ? "a_nudges" : "b_nudges";
+
+  // Allowance spent → retire it silently. The other side is deliberately NOT told
+  // this fell through: they said yes to meeting a person, and "that didn't work out"
+  // is one more email about someone they never met. They will get a different match.
+  if (sent >= MAX_NUDGES) {
+    warnOnError(
+      "introductions update (nudges exhausted)",
+      (
+        await client
+          .from("introductions")
+          .update({ state: "expired", awaiting: null, next_action_at: null, updated_at: nowIso() })
+          .eq("id", intro.id)
+      ).error,
+    );
+    await closeIntroductionConversations(client, intro.id);
+    return {
+      introductionId,
+      action: "expired",
+      side,
+      attempt: sent,
+      note: `no reply after ${sent} follow-ups; expired quietly`,
+    };
+  }
+
+  const { data: people } = await client
+    .from("people")
+    .select("id, name, email, headline, timezone, location, paused")
+    .in("id", [recipientId, otherId]);
+  const byId = new Map((people ?? []).map((p) => [p.id, p]));
+  const recipientRow = byId.get(recipientId);
+  const otherRow = byId.get(otherId);
+
+  // A member who asked Dawn to stop must not be chased. `paused` is checked here and
+  // not only in candidate selection because pausing happens *between* the original
+  // ask and the follow-up — that gap is exactly what a nudge sequence introduces.
+  if (!recipientRow || !recipientRow.email || recipientRow.paused) {
+    warnOnError(
+      "introductions update (unreachable recipient)",
+      (
+        await client
+          .from("introductions")
+          .update({ state: "expired", awaiting: null, next_action_at: null, updated_at: nowIso() })
+          .eq("id", intro.id)
+      ).error,
+    );
+    await closeIntroductionConversations(client, intro.id);
+    return {
+      introductionId,
+      action: "skipped",
+      side,
+      attempt: sent,
+      note: recipientRow?.paused ? "recipient is paused; expired without nudging" : "recipient unreachable",
+    };
+  }
+
+  // Thread onto that side's own conversation. Each side has its own (see
+  // inviteSecondSide) precisely so their opt-ins stay private, so the nudge has to
+  // pick the right one — a follow-up for B landing in A's thread would leak that B
+  // was asked at all.
+  const { data: convos } = await client
+    .from("conversations")
+    .select("id, participants")
+    .eq("introduction_id", intro.id);
+  const convo =
+    (convos ?? []).find((c) => {
+      const first = Array.isArray(c.participants) ? c.participants[0] : null;
+      return first && (first as { person_id?: string }).person_id === recipientId;
+    }) ?? (convos ?? [])[0];
+  if (!convo) {
+    return { introductionId, action: "skipped", side, attempt: sent, note: "no conversation to thread onto" };
+  }
+
+  // Reply to the last thing we sent them, so the follow-up appears under the original
+  // ask rather than as a second unexplained email from a stranger.
+  const { data: lastOutbound } = await client
+    .from("messages")
+    .select("agentmail_message_id")
+    .eq("conversation_id", convo.id)
+    .eq("direction", "outbound")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const attempt = sent + 1;
+  const draft = await draftNudgeEmail(
+    recipientRow as Party,
+    (otherRow ?? { id: otherId, name: "someone", email: null, headline: null, timezone: null, location: null }) as Party,
+    attempt,
+  );
+  const outgoing = withUnsubscribe(draft.body);
+
+  let send: SendResult = { messageId: null, threadId: null, simulated: true };
+  try {
+    send = await sendThreadedOrFresh({
+      replyToMessageId: lastOutbound?.agentmail_message_id ?? null,
+      to: [recipientRow.email],
+      subject: draft.subject,
+      text: outgoing,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[intro-flow] nudge send failed for ${recipientRow.email}: ${message}`);
+    // Back off a full cycle rather than burning the attempt: the send failing is
+    // Dawn's problem, not evidence the recipient is ignoring us. The counter is
+    // untouched, so the allowance still buys two delivered follow-ups.
+    warnOnError(
+      "introductions update (nudge send failed)",
+      (
+        await client
+          .from("introductions")
+          .update({ next_action_at: dueInDays(NUDGE_REPEAT_DELAY_DAYS), updated_at: nowIso() })
+          .eq("id", intro.id)
+      ).error,
+    );
+    return { introductionId, action: "skipped", side, attempt: sent, note: `send failed: ${message}` };
+  }
+
+  warnOnError(
+    "messages insert (nudge)",
+    (
+      await client.from("messages").insert({
+        conversation_id: convo.id,
+        agentmail_message_id: send.messageId,
+        direction: "outbound",
+        from_email: AGENTMAIL_INBOX_ID,
+        to_emails: [recipientRow.email],
+        subject: draft.subject,
+        body: outgoing,
+      })
+    ).error,
+  );
+
+  // Re-arm even on the final attempt: the next sweep is what turns a spent allowance
+  // into `expired` (the branch at the top of this function). Without a due time that
+  // row would wait for expire-intros' seven-day backstop instead.
+  warnOnError(
+    "introductions update (nudged)",
+    (
+      await client
+        .from("introductions")
+        .update({
+          [countField]: attempt,
+          next_action_at: dueInDays(NUDGE_REPEAT_DELAY_DAYS),
+          updated_at: nowIso(),
+        })
+        .eq("id", intro.id)
+    ).error,
+  );
+
+  return {
+    introductionId,
+    action: "nudged",
+    side,
+    attempt,
+    note: `follow-up ${attempt}/${MAX_NUDGES} sent to ${recipientRow.name}`,
+  };
 }

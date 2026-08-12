@@ -27,11 +27,19 @@ import type { ProfileDraft } from "./synthesize-profile";
  * stored separately so the admin entity view can show what each was inferred from,
  * and folded into `tags` when building the flat `Person` view that `rerank()` wants.
  *
- * `suggestedIntros` is deliberately NOT written. SPEC §10: "a reason is not a claim."
- * A guess about what introductions someone might like is not a fact about them — it
- * is a suggestion, and writing it would put model speculation into the controlled
- * vocabulary the matching layer reads as ground truth. It is shown on the confirm
- * screen and then dropped. It belongs in an `asks`-shaped table at build step 5.
+ * `suggestedIntros` is still deliberately NOT written here. SPEC §10: "a reason is not
+ * a claim." A guess about what introductions someone might like is not a fact about
+ * them, and writing it would put model speculation into the controlled vocabulary the
+ * matching layer reads as ground truth.
+ *
+ * What changed: the confirm screen now seeds an editable box with those suggestions,
+ * and what the user submits is written by `writeAsks` to the `asks` table (migration
+ * 0038) — the `asks`-shaped home SPEC §10 pointed at. That is authorship, not
+ * inference, so it lives outside claims and never touches this function.
+ *
+ * The user can also dismiss individual expertise/interests/goals on that screen. Those
+ * arrive as `hidden` and are skipped before any claim is built, so a rejected item is
+ * never written rather than written-and-superseded.
  */
 
 const SCALAR_FIELDS = ["headline", "bio"] as const;
@@ -54,6 +62,13 @@ export async function writeProfileClaims(
     evidence: string;
     /** Model id, so a bad prompt version can be traced back from the claims. */
     model: string;
+    /**
+     * Array-field values the user dismissed on the review screen, lowercased for
+     * comparison. These are never written — not written-then-superseded. A claim the
+     * person rejected before it existed has no history worth keeping, and writing it
+     * would make it briefly true and permanently visible in the claim log.
+     */
+    hidden?: Set<string>;
   },
 ): Promise<WriteProfileResult> {
   const observedAt = new Date().toISOString();
@@ -81,6 +96,7 @@ export async function writeProfileClaims(
     for (const item of opts.draft[field] ?? []) {
       const value = typeof item === "string" ? item.trim() : "";
       if (!value) continue;
+      if (opts.hidden?.has(value.toLowerCase())) continue;
       claims.push({ ...base, attribute: field, value });
     }
   }
