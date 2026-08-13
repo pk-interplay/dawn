@@ -1,25 +1,29 @@
 # Pilot runbook — 5 teammates, 3 days of introductions
 
-> ## ⚠️ This pilot is no longer runnable as written.
+> ## ⚠️ The pipeline is complete; delivery is switched off.
 >
-> The email layer it depends on has been removed: no AgentMail inbox, no send gateway,
-> no inbound webhook, no inbox/exchange UI. `src/lib/agentmail.ts` is a typed no-op and
-> a CI guard fails the build if any send path returns. So **steps 4 and 6–8 below cannot
-> be executed** — nothing will be delivered and no reply can arrive.
+> The email layer is back and wired end to end — AgentMail inbox, SPEC §3.2's send
+> gateway, the inbound webhook, and the double opt-in state machine. `run-matches` is now
+> an agent (`src/lib/matchmaker-agent.ts`) that opens real introductions rather than a
+> pipeline that stops at a `matches` row.
 >
-> What still works: onboarding, embedding-based matching, `rerank`, and the
-> `/admin/monitor` views. `run-matches` still computes and persists matches; it simply
-> stops there instead of opening an introduction.
+> **Nothing is delivered.** `DAWN_DELIVERY_ENABLED` defaults to off, so every message is
+> composed, given its unsubscribe footer, written to the `sends` ledger with the exact
+> body, and held as a `draft`. Read them at `/admin/monitor` → **Outbox**. Flipping that
+> one variable is the only remaining step to go live — see step 10.
 >
-> The double opt-in machinery (`intro-flow.ts`, `introductions`, the opt-in states) is
-> deliberately kept in the repo, dark, to be rewired to a channel later — see SPEC §3.2's
-> send gateway, build step 5. Migration 0031 unschedules `dawn-decay-proximity` and
-> `dawn-expire-intros`, both of which became no-ops.
+> So every step below **does** execute, with one caveat: steps 6–8 advance the state
+> machine and produce drafts rather than mail, and no reply can arrive until delivery is
+> on. Play-the-other-side (step 8) needs step 10 first.
 >
-> **This file needs a rewrite** once the Gmail onboarding flow and `/chat` land, at which
-> point the operator story is: sign in with Google → ingest → confirm profile → query the
-> graph. Kept in the meantime because the environment, cron, and troubleshooting sections
-> are still accurate, and because the pilot's hard-won failure modes are worth preserving.
+> Migration 0031 unschedules `dawn-decay-proximity` and `dawn-expire-intros`. Both are
+> live paths again now that introductions are really opened, so consider scheduling them
+> when you switch delivery on.
+>
+> **This file still needs a rewrite** once the Gmail onboarding flow and `/chat` land, at
+> which point the operator story is: sign in with Google → ingest → confirm profile →
+> query the graph. Kept because the environment, cron, and troubleshooting sections are
+> accurate, and because the pilot's hard-won failure modes are worth preserving.
 
 The test: a handful of real colleagues onboard at `/join`, and over the following days
 Dawn emails each of them a few warm introductions. Every counterpart is fictional and
@@ -62,17 +66,30 @@ Set these on the deployment (see `.env.example` for the full annotated list):
 | `RESEND_API_KEY`, `AUTH_SENDER_EMAIL` | required for password reset — see step 2b |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `AUTH_SECRET` | Gmail ingest sign-in (`src/auth.ts`) |
 
-The AgentMail, inbound-gating, and mail-redirect variables are gone with the email
-layer. `DEMO_PERSONA_INBOX` and `INTRO_TEST_SINGLE_SIDED` went with them — both existed
-only so one inbox could play both sides of an email round trip.
+### Email variables
+
+| Variable | Value | Default if unset |
+|---|---|---|
+| `DAWN_DELIVERY_ENABLED` | `"true"` to actually deliver. **Anything else means off.** | **off** |
+| `AGENTMAIL_API_KEY` | required once delivery is on; without it a live deploy fails every send loudly rather than silently pretending | — |
+| `AGENTMAIL_INBOX_ID` | the inbox Dawn sends from and receives on | `dawnagent@agentmail.to` |
+| `MAIL_REDIRECT_TO` | send everything here instead of the real recipient (personas have undeliverable `@example.com` addresses) | off |
+| `INBOUND_AUTOREPLY` | `"true"` to let Dawn answer non-members and out-of-scope asks | off |
+| `INTRO_TEST_SINGLE_SIDED` | `"true"` auto-opts-in person B so one real inbox can reach scheduling | off |
+
+`DAWN_DELIVERY_ENABLED` is read in exactly one place — `src/lib/send-gateway.ts` — as
+`=== "true"`. Unset, empty, `"TRUE"`, `"1"`, and typos all mean **off**, and CI fails the
+build if anyone rewrites it as `!== "false"`. Absence must mean off; the inverted form
+has already cost this project once (see `isSingleSided`).
 
 The scripts (`npm run personas`) additionally need `SUPABASE_SERVICE_ROLE_KEY` in your
 local `.env`.
 
-The plus-addressing setup that used to be required here is not any more: personas needed
-one deliverable address each only so an operator could reply as them over real email.
-They are still generated as matching fixtures, and `people.email` is still unique, but
-nothing sends to those addresses.
+Plus-addressing matters again once delivery is on: personas need one deliverable address
+each so an operator can reply as them over real email. `people.email` is unique, so
+`you+persona1@gmail.com` style addressing is the way to give twenty fixtures twenty
+addresses that all land in one inbox. Until then they are matching fixtures only and
+nothing is sent to them.
 
 ## 2b. Auth email (password reset)
 
@@ -111,22 +128,54 @@ isn't a project member — so the third teammate to forget their password gets n
 
 ## 3. Migrations
 
-Apply everything through `0019`:
+Apply everything through `0039`:
 
 ```sh
-supabase db push        # or apply 0018_demo_cohort.sql and 0019_pilot_schedule.sql via the dashboard
+supabase db push        # or apply the outstanding files via the dashboard
 ```
 
 `0018` adds the demo-persona marker. `0019` redefines `schedule_dawn_jobs()` for a
 three-hourly cadence and adds `unschedule_dawn_jobs()` — **neither is called at
 migration time**, deliberately. You call them in step 7.
 
-## 4. Inbound email — removed
+`0039` adds the three tables the send gateway and the matchmaker need:
 
-The `agentmail-webhook` Edge Function, `/api/agent/inbound`, and `src/lib/triage.ts` are
-deleted. Nothing can arrive, so there is nothing to register. SPEC §3.4 keeps the triage
-design (replay guard → self-send guard → sender resolution → trust → rate ceiling) for
-whenever inbound returns; recover the implementation from git history at `3171c91`.
+- **`sends`** — the outbound ledger. A row is written *before* the provider call and the
+  gateway throws if that write fails, which is what makes a duplicate send a database
+  error rather than a second email. While delivery is off, every row here is a `draft`
+  holding the exact body.
+- **`suppressions`** — global opt-out, keyed by address rather than by person so it still
+  works for someone who has no `people` row. Checked first, hard fail.
+- **`agent_notes`** — what the matchmaker learned, append-only with supersede. Not
+  `claims`: a claim is a fact about a person that the ranker reads as ground truth, and a
+  matchmaker's working hypotheses are not that.
+
+## 4. Inbound email
+
+`/api/agent/inbound` and `src/lib/triage.ts` are back. The route is the dispatcher, all
+the judgement is in `triage.ts`, and the invariant is that **every inbound message writes
+exactly one `inbound_events` row, including the ones Dawn refuses** — that row is
+simultaneously the replay guard, the rate-limit counter, and the audit trail.
+
+Register the `agentmail-webhook` Edge Function to POST at
+`${APP_URL}/api/agent/inbound` with `Authorization: Bearer $CRON_SECRET`. Nothing will
+arrive until delivery is on and someone replies, but the route is safe to enable now.
+
+To forward replies by hand while `APP_URL` points somewhere you can't reach:
+
+```bash
+npx tsx src/scripts/replay-inbound.ts          # list what's replayable
+npx tsx src/scripts/replay-inbound.ts --send   # forward them
+```
+
+Safe to re-run — the replay guard means a message forwarded twice is recorded and
+ignored the second time rather than advancing the state machine twice.
+
+**Unsubscribes.** A member who asks Dawn to stop is paused (`people.paused`), which is
+reversible and matches what the reply promises. A **non-member** has no row to pause, so
+their address goes into `suppressions` instead — checked first by the send gateway, ahead
+of everything else. Without that, the `Reply "unsubscribe"` promise in every email footer
+had no mechanism behind it for anyone who wasn't a member.
 
 ## 5. Onboard the team (day 0)
 
@@ -196,21 +245,93 @@ curl -H "Authorization: Bearer $CRON_SECRET" \
   "https://your-app/api/cron/run-matches?synthetic=false&limit=10"
 ```
 
-## 8. Play the other side (daily) — not possible
+## 8. Read the drafts — do this before step 10
 
-This step was the heart of the pilot: persona mail landed in one inbox, you replied as
-each persona, and inbound triage attributed the reply so the double opt-in advanced. All
-three of those pieces are gone — no send, no inbox, no triage — so there is nothing to
-reply to and no way for a reply to be recorded.
+With delivery off, the run produces introductions and messages that go nowhere. That is
+the point: **read them before anyone else can.**
 
-Until a channel is rewired (SPEC §3.2, build step 5), the closest thing to exercising the
-other side is `/admin/console` → Network, which runs matching for a person and records a
-Pass — the same rejection signal the calibration loop reads.
+`/admin/monitor` → **Outbox**. Filter to `draft`, open a few, read the exact body that
+would have been transmitted — unsubscribe footer included, because the footer is stored
+with the message rather than appended at send time. The banner at the top states plainly
+whether delivery is on.
 
-Check the run in `/admin/monitor`: introductions by state and members with nothing in
-flight. The inbox tab and the per-intro thread reader are gone with the email layer.
+What to check:
 
-## 9. Stop, and clean up
+- Does the opt-in ask sound like a person, and does the rationale actually say why these
+  two? A rationale that could describe any two members is the failure mode to look for.
+- Is the direction right — does A genuinely have what B is looking for, in that order?
+- Does the run summary in the `run-matches` response agree with what got opened? The
+  agent explains its reasoning there, including when it declined to open anything.
+- `agent_notes` — has it written anything, and is it specific enough to be useful?
+
+The Intros tab shows the same runs by state, and `/admin/console` → Network runs matching
+for one person and records a Pass, which is the same rejection signal the calibration
+loop reads.
+
+## 9. Play the other side (daily) — needs delivery on
+
+The heart of the original pilot: persona mail lands in one inbox, you reply as each
+persona, and inbound triage attributes the reply so the double opt-in advances. Every
+piece of that is back, but it needs step 10 first — with delivery off there is nothing to
+reply to.
+
+Once delivery is on: set `MAIL_REDIRECT_TO` to your inbox so persona addresses resolve,
+reply as each persona, and watch `introductions` advance. If a reply doesn't land, use
+`replay-inbound.ts` (step 4) before debugging anything else — the most common cause is
+`APP_URL` pointing at a deployment the webhook can't reach.
+
+## 10. Go live — switch delivery on
+
+Deliberately last, and deliberately its own step.
+
+**First, clear the drafts.** Everything opened while delivery was off left an
+introduction in `a_invited` with `next_action_at` armed, and a `sends` row that never
+went anywhere. Switch delivery on with those in place and the first nudge sweep chases
+people about introductions they were never told about — the follow-up arrives before the
+ask. Retire them:
+
+```sql
+-- Introductions opened while nothing could be delivered.
+update introductions set state = 'expired', next_action_at = null
+ where state in ('a_invited','b_invited')
+   and id in (select introduction_id from sends where status = 'draft');
+
+delete from sends where status = 'draft';
+```
+
+(Deleting the drafts also frees the idempotency key, so those pairs can be re-opened
+properly on the next run rather than colliding.)
+
+Then:
+
+0. Prove the gates still refuse what they claim to refuse:
+
+```sh
+npm run verify:gateway
+```
+
+   Creates a throwaway synthetic pair, drives `send()` through suppression, consent,
+   idempotency, and the delivery switch, and deletes everything after. It forces delivery
+   off regardless of your environment, so it is safe to run at any point. 17 checks; any
+   failure is a reason not to proceed.
+
+1. Set `AGENTMAIL_API_KEY`, and `MAIL_REDIRECT_TO` if the cohort is synthetic.
+2. Set `DAWN_DELIVERY_ENABLED=true`.
+3. Target one real address and watch it land:
+
+```sh
+curl -H "Authorization: Bearer $CRON_SECRET" \
+  "https://your-app/api/cron/run-matches?person_id=<uuid>&limit=1"
+```
+
+4. Confirm in Outbox that the row is `sent` with a `provider_message_id`. A row stuck at
+   `draft` means the variable did not take; a `failed` row with
+   `AGENTMAIL_API_KEY unset` means the key did not.
+
+To stop: set `DAWN_DELIVERY_ENABLED` to anything else (or unset it). The gateway drafts
+again from the next send; nothing else changes and no code is touched.
+
+## 11. Stop, and clean up
 
 ```sql
 select unschedule_dawn_jobs();   -- stop proposing; in-flight intros can still be replied to
@@ -238,4 +359,9 @@ but nobody should be left wondering whether an intro is still coming.
 | No intros at all | Cron never scheduled (`select * from cron.job`), or the Vault secrets are missing |
 | One member never gets an intro | No embeddings on their row, or `paused = true` |
 | `run-matches` returns `skipped: "no candidates"` | Not enough personas answering that member's ask — generate more |
-| Nothing is ever delivered | Expected — the email layer is removed. `run-matches` stops at the match. |
+| Nothing is ever delivered | Expected until step 10. Check Outbox: rows at `draft` mean the pipeline is working and the switch is off. |
+| `run-matches` opens nothing, and `summary` explains why | Also expected. The agent declining a weak run is a feature; read the summary before treating it as a fault. |
+| Rows stuck at `draft` after step 10 | `DAWN_DELIVERY_ENABLED` isn't exactly `"true"` on that deployment. `"TRUE"`, `"1"`, and a trailing space all read as off, by design. |
+| `sends.failure_reason` says `AGENTMAIL_API_KEY unset` | Delivery is on but the transport has no credentials — a deploy that thinks it's live and isn't. |
+| A nudge arrives before the opt-in it follows up | Draft-era introductions weren't cleared before go-live. See the SQL in step 10. |
+| Someone is emailed after unsubscribing | Should be impossible — check `suppressions` for their address, and remember a member is `people.paused` instead. Both are checked; only the second is reversible by them. |

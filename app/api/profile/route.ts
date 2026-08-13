@@ -7,7 +7,7 @@ import {
   applyProfilePatch,
   loadEditableProfile,
   ProfilePatchSchema,
-  refreshProfileEmbedding,
+  syncProfileDownstream,
 } from "../../../src/lib/profile-edit";
 
 /**
@@ -24,8 +24,9 @@ import {
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-// A save re-summarises and re-embeds inline: one Haiku call plus one embedding.
-export const maxDuration = 60;
+// A save syncs downstream inline (profile-edit.ts::syncProfileDownstream): up to two
+// Haiku calls and three embeddings before the response.
+export const maxDuration = 120;
 
 type Resolved =
   | { viewer: ViewerIdentity; error: null }
@@ -78,12 +79,14 @@ export async function PATCH(req: Request) {
     source: "profile-form",
   });
 
-  // Only when something moved — re-embedding an unchanged profile is a wasted model
-  // call on every stray save.
-  const embedded = result.written || result.retired
-    ? await refreshProfileEmbedding(supabase, viewer.entityId)
-    : true;
+  // Only when something moved — re-deriving, re-projecting and re-embedding an unchanged
+  // profile is three wasted calls on every stray save.
+  const sync = result.written || result.retired
+    ? await syncProfileDownstream(supabase, viewer.entityId)
+    : null;
 
+  // Loaded AFTER the sync: deriveAsks may have rewritten the asks, and the form renders
+  // what it returns. Reading first would show the previous decomposition.
   const profile = await loadEditableProfile(supabase, viewer.entityId);
-  return NextResponse.json({ profile, ...result, embedded });
+  return NextResponse.json({ profile, ...result, embedded: sync?.projected ?? true, sync });
 }

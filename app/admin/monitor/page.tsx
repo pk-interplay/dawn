@@ -9,6 +9,7 @@ import { adminFetch } from "../../lib/admin-fetch";
 import OverviewTab from "./OverviewTab";
 import IntrosTab from "./IntrosTab";
 import MembersTab from "./MembersTab";
+import OutboxTab from "./OutboxTab";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 
@@ -72,12 +73,14 @@ export default function Monitor() {
         <TabsList className="mb-6">
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="intros">Intros</TabsTrigger>
+          <TabsTrigger value="outbox">Outbox</TabsTrigger>
           <TabsTrigger value="members">Members</TabsTrigger>
         </TabsList>
 
         {/* Each tab fetches on mount; unmounting on switch keeps the data fresh. */}
         <TabsContent value="overview">{tab === "overview" && <OverviewTab />}</TabsContent>
         <TabsContent value="intros">{tab === "intros" && <IntrosTab />}</TabsContent>
+        <TabsContent value="outbox">{tab === "outbox" && <OutboxTab />}</TabsContent>
         <TabsContent value="members">{tab === "members" && <MembersTab />}</TabsContent>
       </Tabs>
     </main>

@@ -5,9 +5,22 @@ import { z } from "zod";
  * they're called, and what a valid value looks like.
  *
  * Split out of profile-edit.ts so the form can import it. That file reaches Supabase and
- * (through refreshProfileEmbedding) the Anthropic and OpenAI clients; a client component
+ * (through syncProfileDownstream) the Anthropic and OpenAI clients; a client component
  * importing it for a label would drag all of that toward the browser bundle. Everything
  * here is constants and a zod schema — no I/O, safe on either side.
+ *
+ * ## Stated vs. derived
+ *
+ * The form used to ask for the same thing three times: `looking_for` in prose, then the
+ * same ask taken apart by hand into `ask_must_haves` and `ask_nice_to_haves`. That
+ * decomposition is a machine's job — rerank.ts weighs must-haves heavily, so they have
+ * to exist, but nobody should have to write their ask twice to get them.
+ *
+ * So the asks are DERIVED (derive-asks.ts) from `looking_for`, and land as `inferred`
+ * claims. They stay in `ProfilePatchSchema` on purpose: if the member corrects them —
+ * in the form or by telling Dawn in chat — that write is `self_reported`, which outranks
+ * the inference and switches the deriver off for that field permanently. Stating beats
+ * inferring here exactly like it does everywhere else in the claims model.
  */
 
 export const SCALAR_FIELDS = [
@@ -18,16 +31,26 @@ export const SCALAR_FIELDS = [
   "location",
 ] as const;
 
-export const LIST_FIELDS = [
-  "goals",
-  "ask_must_haves",
-  "ask_nice_to_haves",
-  "expertise",
-  "interests",
-] as const;
+/** Lists the member edits directly. */
+export const EDITABLE_LIST_FIELDS = ["goals", "tags"] as const;
+
+/** Lists Dawn derives from `looking_for` unless the member has stated them. */
+export const DERIVED_LIST_FIELDS = ["ask_must_haves", "ask_nice_to_haves"] as const;
+
+export const LIST_FIELDS = [...EDITABLE_LIST_FIELDS, ...DERIVED_LIST_FIELDS] as const;
+
+/**
+ * Older attributes folded into `tags`. `resolved-profile.ts` already unions all three
+ * into one `tags` array for rerank(), so they were never two different things to the
+ * matcher — only to the form. Editing `tags` retires claims under these names too, which
+ * makes the merge self-migrating: nobody has to backfill.
+ */
+export const MERGED_INTO_TAGS = ["expertise", "interests"] as const;
 
 export type ScalarField = (typeof SCALAR_FIELDS)[number];
 export type ListField = (typeof LIST_FIELDS)[number];
+export type EditableListField = (typeof EDITABLE_LIST_FIELDS)[number];
+export type DerivedListField = (typeof DERIVED_LIST_FIELDS)[number];
 
 /** Human labels, shared by the form and the agent's tool description. */
 export const FIELD_LABELS: Record<ScalarField | ListField, string> = {
@@ -37,10 +60,9 @@ export const FIELD_LABELS: Record<ScalarField | ListField, string> = {
   offering: "What you can offer",
   location: "Location",
   goals: "What you're working on",
-  ask_must_haves: "Asks — must haves",
-  ask_nice_to_haves: "Asks — nice to haves",
-  expertise: "Expertise",
-  interests: "Interests",
+  tags: "Topics",
+  ask_must_haves: "Must haves",
+  ask_nice_to_haves: "Nice to haves",
 };
 
 /** Long enough for a real bio, short enough that nobody pastes a CV into a claim. */
@@ -65,12 +87,10 @@ export const ProfilePatchSchema = z
     offering: scalarValue.optional(),
     location: scalarValue.optional(),
     goals: listValue.optional(),
+    tags: listValue.optional(),
     ask_must_haves: listValue.optional(),
     ask_nice_to_haves: listValue.optional(),
-    expertise: listValue.optional(),
-    interests: listValue.optional(),
   })
   .strict();
 
 export type ProfilePatch = z.infer<typeof ProfilePatchSchema>;
-
