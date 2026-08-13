@@ -3,12 +3,16 @@ import Anthropic from "@anthropic-ai/sdk";
 import { anthropic, textOf } from "./anthropic";
 import type { MatchDirection, Person } from "./types";
 import { MEETING_FORMATS, type MeetingFormat } from "../../lib/onboarding";
+// Every send in this file goes through the gateway, which owns suppression, consent,
+// rate limiting, the idempotency ledger, and the delivery switch (SPEC §3.2). This
+// module used to import the transport directly; it no longer can, and CI enforces that.
+// Imported under an alias because `send` is already a local variable name at three of
+// the call sites below.
 import {
   AGENTMAIL_INBOX_ID,
-  sendEmail,
-  sendThreadedOrFresh,
+  send as sendViaGateway,
   type SendResult,
-} from "./agentmail";
+} from "./send-gateway";
 
 // Orchestrates the double opt-in introduction lifecycle on top of a `matches`
 // suggestion: create the introduction + conversation, email an opt-in, ingest
@@ -804,13 +808,27 @@ export async function startIntroduction(
   let send: SendResult = { messageId: null, threadId: null, simulated: true };
   let sendError: string | null = null;
   if (helped.email) {
-    // sendEmail throws on an AgentMail 4xx/5xx/timeout. Left unhandled it escapes
-    // startIntroduction into the /api/cron/run-matches try block, which 500s the
-    // WHOLE batch — one bad send would silently skip every remaining member.
-    // Contain it here so the batch continues, and mark this one introduction
-    // terminal below so the pair stays retryable on the next run.
+    // The gateway returns rather than throws for ordinary refusals, but it deliberately
+    // DOES throw when its own safety checks are the thing that broke — an unreadable
+    // suppression table or a failed ledger write. Left unhandled either escapes
+    // startIntroduction into the /api/cron/run-matches try block, which 500s the WHOLE
+    // batch: one bad send would silently skip every remaining member. Contain it here
+    // so the batch continues, and mark this one introduction terminal below so the pair
+    // stays retryable on the next run.
     try {
-      send = await sendEmail({ to: [helped.email], subject: draft.subject, text: outgoing });
+      const result = await sendViaGateway(client, {
+        introductionId: intro.id,
+        kind: "opt_in_a",
+        to: [helped.email],
+        subject: draft.subject,
+        text: outgoing,
+      });
+      send = result;
+      // A refusal is not an exception, but it is still a reason not to claim delivery.
+      // `failure: null` is the drafted case — the gate is closed and this is expected,
+      // so it must NOT be treated as an error (see the branch below, which would
+      // otherwise expire every introduction the moment delivery is switched off).
+      if (result.failure !== null) sendError = result.failure;
     } catch (err) {
       sendError = err instanceof Error ? err.message : String(err);
       console.error(`[intro-flow] opt-in send failed for ${helped.email}: ${sendError}`);
@@ -957,7 +975,9 @@ async function inviteSecondSide(
 
   const draft = await draftSecondSideOptInEmail(p.helped, p.suggested, p.rationale);
   const outgoing = withUnsubscribe(draft.body);
-  const send = await sendThreadedOrFresh({
+  const send = await sendViaGateway(client, {
+    introductionId: p.introductionId,
+    kind: "opt_in_b",
     replyToMessageId: null, // B has no prior message to thread onto.
     to: [p.suggested.email],
     subject: draft.subject,
@@ -988,7 +1008,12 @@ async function inviteSecondSide(
     ).error,
   );
 
-  return send.delivered;
+  // The caller turns this boolean into a human-readable note whose false branch reads
+  // "…has no reachable email address". So the question being answered is specifically
+  // "did we have somewhere to send it", NOT "did it leave the building" — a drafted
+  // message under a closed delivery gate has a perfectly good address and must not be
+  // reported as an unreachable one.
+  return send.failure !== "no_recipient";
 }
 
 // ---- Advance an introduction when a reply arrives (called by /api/agent/inbound)
@@ -1184,11 +1209,13 @@ export async function advanceOnReply(
     );
     const introBody = withUnsubscribe(draft.body);
     const recipients = [helped.email, suggested.email].filter((e): e is string => Boolean(e));
-    const send = await sendThreadedOrFresh({
+    const send = await sendViaGateway(client, {
+      introductionId: intro.id,
+      kind: "introduction",
       // Deliberately NOT threaded. AgentMail's reply() takes no recipient list — it
       // answers whoever sent the parent — so threading here would deliver the
-      // delivered the introduction to one side only. A fresh send is the only way to
-      // address both parties.
+      // introduction to one side only. A fresh send is the only way to address both
+      // parties.
       replyToMessageId: null,
       to: recipients,
       subject: draft.subject,
@@ -1446,7 +1473,13 @@ export async function nudgeIntroduction(
 
   let send: SendResult = { messageId: null, threadId: null, simulated: true };
   try {
-    send = await sendThreadedOrFresh({
+    send = await sendViaGateway(client, {
+      introductionId: intro.id,
+      kind: "nudge",
+      // The nudge counter is the idempotency discriminator: nudges are the one kind
+      // that legitimately repeats, so without `attempt` the second follow-up would
+      // collide with the first on the unique index and be dropped as a duplicate.
+      attempt,
       replyToMessageId: lastOutbound?.agentmail_message_id ?? null,
       to: [recipientRow.email],
       subject: draft.subject,

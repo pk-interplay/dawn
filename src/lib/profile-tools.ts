@@ -4,12 +4,13 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 
 import {
   applyProfilePatch,
+  DERIVED_LIST_FIELDS,
+  EDITABLE_LIST_FIELDS,
   FIELD_LABELS,
   loadEditableProfile,
-  LIST_FIELDS,
   ProfilePatchSchema,
-  refreshProfileEmbedding,
   SCALAR_FIELDS,
+  syncProfileDownstream,
 } from "./profile-edit";
 
 /**
@@ -40,9 +41,11 @@ export interface ProfileToolContext {
   viewerEntityId: string;
 }
 
-const FIELD_GUIDE = [...SCALAR_FIELDS, ...LIST_FIELDS]
+const FIELD_GUIDE = [...SCALAR_FIELDS, ...EDITABLE_LIST_FIELDS]
   .map((field) => `- ${field}: ${FIELD_LABELS[field]}`)
   .join("\n");
+
+const ASK_GUIDE = DERIVED_LIST_FIELDS.map((field) => `- ${field}: ${FIELD_LABELS[field]}`).join("\n");
 
 export function createProfileTools(ctx: ProfileToolContext): ToolSet {
   const getMyProfile = tool({
@@ -62,6 +65,13 @@ export function createProfileTools(ctx: ProfileToolContext): ToolSet {
       "Record something the person told you about themselves. Only include the fields " +
       "they actually spoke to; anything you leave out is untouched.\n\n" +
       `Fields:\n${FIELD_GUIDE}\n\n` +
+      `Their ask, broken into parts:\n${ASK_GUIDE}\n\n` +
+      "These two are normally DERIVED from looking_for — you do not need to write them, " +
+      "and writing them as a guess is worse than leaving them alone, because a written " +
+      "one permanently replaces the derivation. Write them only when the person tells " +
+      "you directly what is and isn't negotiable about their ask ('it has to be someone " +
+      "who's actually shipped this, Europe would be nice but I don't mind'). Otherwise " +
+      "update looking_for and let the decomposition follow.\n\n" +
       "List fields are REPLACED wholesale, not appended to — call getMyProfile first " +
       "and send the full list you want them to end up with, or you will silently drop " +
       "the items you didn't repeat. Send an empty list to clear one.\n\n" +
@@ -80,10 +90,19 @@ export function createProfileTools(ctx: ProfileToolContext): ToolSet {
         return { changed: {}, note: "Nothing changed — their profile already said that." };
       }
 
-      // Their new description is what the rest of the network will find them by, so the
-      // embedding is refreshed before the turn ends rather than on some later cron.
-      await refreshProfileEmbedding(ctx.writeClient, ctx.viewerEntityId);
-      return { changed: result.changed };
+      // Their new description is what the rest of the network will find them by, so this
+      // runs before the turn ends rather than on some later cron — it is also what pushes
+      // the edit into the `people` row the matcher ranks on (profile-edit.ts).
+      await syncProfileDownstream(ctx.writeClient, ctx.viewerEntityId);
+
+      // Re-read so the model can tell them how their ask now reads: if they changed
+      // looking_for, the derived must-haves changed underneath this call.
+      const after = await loadEditableProfile(ctx.writeClient, ctx.viewerEntityId);
+      return {
+        changed: result.changed,
+        ask_must_haves: after.lists.ask_must_haves,
+        ask_nice_to_haves: after.lists.ask_nice_to_haves,
+      };
     },
   });
 

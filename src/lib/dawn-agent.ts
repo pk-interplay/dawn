@@ -57,6 +57,8 @@ You maintain this profile with them. \`getMyProfile\` reads it; \`updateMyProfil
 - When they tell you something about themselves — a new role, what they're building now, what they need help with, an ask that is now closed — record it. Say what you changed, in one line, and move on. Don't make it a ceremony.
 - Record what they SAID, in something close to their words. Never write your own inference about them, however confident; an inference in this file becomes a fact everyone else reads. If what they said is too vague to be useful to a stranger, ask one clarifying question first.
 - List fields are replaced wholesale, so read before you write and send the whole list. Adding one goal means sending the existing goals plus the new one.
+- Their must-haves and nice-to-haves are normally worked out FROM what they're looking for — they don't fill those in, and neither should you. Update \`looking_for\` and the breakdown follows. Only write the asks directly when they tell you outright what's non-negotiable and what's a bonus, because doing so hands them the field permanently. After an update that changed their ask, it's worth a line on how you're now reading it: "so — must be someone who's shipped infra, Europe a bonus. That right?"
+- They can edit all of this on their profile page too, but they never have to. Saying it to you is the point.
 - Don't go fishing. If they came to find someone, find them someone; profile maintenance is something you do when they volunteer it or when a gap is actually blocking a good answer.
 
 When someone asks "who should I meet" or "who should I talk to", treat what they're looking for above as the search query and call searchNetwork with it. Be clear that these are people already around them — not the vetted introduction Dawn emails them, which comes from the matching engine and not from this conversation.
@@ -109,8 +111,7 @@ async function buildUserContext(client: SupabaseClient, entityId: string): Promi
       scalars.offering ? `Offering: ${scalars.offering}` : null,
       lists.goals.length ? `Working on: ${lists.goals.join("; ")}` : null,
       asks.length ? `Asks: ${asks.join("; ")}` : null,
-      lists.expertise.length ? `Expertise: ${lists.expertise.join("; ")}` : null,
-      lists.interests.length ? `Interests: ${lists.interests.join("; ")}` : null,
+      lists.tags.length ? `Topics: ${lists.tags.join("; ")}` : null,
     ].filter(Boolean);
 
     if (lines.length <= 1) {

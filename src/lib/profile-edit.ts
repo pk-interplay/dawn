@@ -1,7 +1,9 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import {
+  DERIVED_LIST_FIELDS,
   LIST_FIELDS,
+  MERGED_INTO_TAGS,
   SCALAR_FIELDS,
   type ListField,
   type ProfilePatch,
@@ -59,7 +61,16 @@ export interface EditableProfile {
   selfReported: Record<string, boolean>;
 }
 
-const ALL_FIELDS = [...SCALAR_FIELDS, ...LIST_FIELDS] as readonly string[];
+const ALL_FIELDS = [...SCALAR_FIELDS, ...LIST_FIELDS, ...MERGED_INTO_TAGS] as readonly string[];
+
+/**
+ * Which claim attributes a form field owns. `tags` owns the two attributes folded into
+ * it, so removing a chip that arrived as `expertise` actually retires it instead of
+ * leaving a live claim the form can no longer see.
+ */
+function attributesFor(field: ScalarField | ListField): readonly string[] {
+  return field === "tags" ? ["tags", ...MERGED_INTO_TAGS] : [field];
+}
 
 function asText(value: unknown): string {
   return typeof value === "string" ? value : value == null ? "" : String(value);
@@ -105,8 +116,17 @@ export async function loadEditableProfile(
 
   const lists = {} as Record<ListField, string[]>;
   for (const field of LIST_FIELDS) {
-    const claims = byAttr.get(field) ?? [];
-    lists[field] = claims.map((row) => asText(row.value)).filter(Boolean);
+    const claims = attributesFor(field).flatMap((attr) => byAttr.get(attr) ?? []);
+    // Case-insensitive dedupe because the merge can collide: the same word claimed once
+    // as `expertise` and once as `tags` is one chip, not two.
+    const seen = new Set<string>();
+    lists[field] = claims
+      .map((row) => asText(row.value))
+      .filter((value) => {
+        if (!value || seen.has(value.toLowerCase())) return false;
+        seen.add(value.toLowerCase());
+        return true;
+      });
     selfReported[field] = claims.length > 0 && claims.every((row) => row.method === "self_reported");
   }
 
@@ -196,18 +216,40 @@ export async function applyProfilePatch(
     });
     const wantedKeys = new Set(wanted.map((item) => item.toLowerCase()));
 
-    const live = rows.filter((row) => row.attribute === field);
+    const attrs = attributesFor(field);
+    const live = rows.filter((row) => attrs.includes(row.attribute));
     const liveKeys = new Set(live.map((row) => asText(row.value).toLowerCase()));
 
-    const additions = wanted.filter((item) => !liveKeys.has(item.toLowerCase()));
-    const removals = live.filter((row) => !wantedKeys.has(asText(row.value).toLowerCase()));
+    // Claiming a derivation as your own is a real edit even when you change none of the
+    // words. The values match, so the diff below would find nothing and write nothing —
+    // and the claims would stay `inferred`, which is exactly the state the member was
+    // trying to leave. Restating rewrites them as self_reported, and that is what stops
+    // derive-asks.ts from ever overwriting them again.
+    const restate =
+      (DERIVED_LIST_FIELDS as readonly string[]).includes(field) &&
+      live.some((row) => row.method !== "self_reported");
+
+    const additions = restate
+      ? wanted
+      : wanted.filter((item) => !liveKeys.has(item.toLowerCase()));
+    const removals = restate
+      ? live
+      : live.filter((row) => !wantedKeys.has(asText(row.value).toLowerCase()));
     if (!additions.length && !removals.length) continue;
 
+    let successor: number | undefined;
     for (const item of additions) {
-      await writeClaim(client, { ...base, attribute: field, value: item });
+      const claim = await writeClaim(client, { ...base, attribute: field, value: item });
+      // Only a restate has a successor to point at. A normal list edit removes items that
+      // genuinely went away and adds unrelated new ones, so pairing them would assert a
+      // replacement that never happened — those stay pure retractions. A restate is the
+      // one case where the outgoing and incoming claims are the same facts, so the old
+      // ones are superseded BY the new ones and the review queue can still show that
+      // Dawn read the ask one way before the member corrected it.
+      if (restate) successor ??= claim.id;
       written += 1;
     }
-    retired += await supersedeClaims(client, removals.map((row) => row.id));
+    retired += await supersedeClaims(client, removals.map((row) => row.id), successor);
     changed[field] = wanted;
   }
 
@@ -219,23 +261,78 @@ export async function applyProfilePatch(
 }
 
 /**
- * Re-summarise and re-embed after an edit.
+ * Everything an edit has to reach before it counts as having happened.
  *
- * Separate from `applyProfilePatch` and always caught: `match_entities` skips rows with
- * a null embedding, so a stale one makes you findable under your OLD description — bad,
- * but nowhere near bad enough to fail the save the user already watched succeed. Same
- * posture as the onboarding confirm route.
+ * Three steps, in this order because each one feeds the next:
+ *
+ *   1. `deriveAsks` — re-decompose `looking_for` into must-haves/nice-to-haves, unless
+ *      the member has stated them. Runs first so step 2 projects the fresh asks.
+ *   2. `projectPersonFromProfile` — write the resolved profile onto the `people` row and
+ *      rebuild `embedding_offering`/`embedding_looking_for`. THIS is what makes an edit
+ *      change who you get introduced to; without it the save was cosmetic (see
+ *      project-person.ts for the full account of that bug).
+ *   3. `summarizeEntity` — refresh `entities.summary`/`embedding` for the claims-model
+ *      search path.
+ *
+ * Separate from `applyProfilePatch` and always caught: a stale embedding makes you
+ * findable under your OLD description, which is bad but nowhere near bad enough to fail
+ * a save the user already watched succeed. Same posture as the onboarding confirm route.
+ * Each step is caught individually so one model call failing doesn't skip the other two.
  */
-export async function refreshProfileEmbedding(
+export interface ProfileSyncResult {
+  asksDerived: boolean;
+  projected: boolean;
+  summarized: boolean;
+}
+
+export async function syncProfileDownstream(
   client: SupabaseClient,
   entityId: string,
-): Promise<boolean> {
+): Promise<ProfileSyncResult> {
+  const result: ProfileSyncResult = { asksDerived: false, projected: false, summarized: false };
+
+  try {
+    const before = await loadEditableProfile(client, entityId);
+    const { deriveAsks } = await import("./derive-asks");
+    const derived = await deriveAsks(client, entityId, {
+      looking_for: before.scalars.looking_for,
+      goals: before.lists.goals,
+    });
+    result.asksDerived = derived.skipped === null;
+  } catch (err) {
+    console.error("[profile-edit] deriveAsks failed:", err);
+  }
+
+  try {
+    // Re-read: the asks just changed underneath the snapshot above, and the projection
+    // has to carry the new ones or `people.ask_must_haves` lags a save behind.
+    const profile = await loadEditableProfile(client, entityId);
+    const { projectPersonFromProfile } = await import("./project-person");
+    await projectPersonFromProfile(client, entityId, {
+      name: profile.name,
+      email: profile.email,
+      headline: profile.scalars.headline,
+      bio: profile.scalars.bio,
+      offering: profile.scalars.offering,
+      looking_for: profile.scalars.looking_for,
+      location: profile.scalars.location,
+      goals: profile.lists.goals,
+      tags: profile.lists.tags,
+      ask_must_haves: profile.lists.ask_must_haves,
+      ask_nice_to_haves: profile.lists.ask_nice_to_haves,
+    });
+    result.projected = true;
+  } catch (err) {
+    console.error("[profile-edit] projectPersonFromProfile failed:", err);
+  }
+
   try {
     const { summarizeEntity } = await import("./summarize-entity");
     await summarizeEntity(client, entityId);
-    return true;
+    result.summarized = true;
   } catch (err) {
     console.error("[profile-edit] summarizeEntity failed:", err);
-    return false;
   }
+
+  return result;
 }

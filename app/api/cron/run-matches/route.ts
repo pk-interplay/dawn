@@ -2,20 +2,17 @@ import { NextResponse } from "next/server";
 import { db } from "../../../lib/db";
 import { isAuthorized } from "../../../lib/authz";
 import type { Person } from "../../../../src/lib/types";
-import {
-  fetchCandidates,
-  fetchCalibration,
-  fetchPreferences,
-  fetchRecentHistory,
-} from "../../../../src/lib/candidates";
-import { rerank, validateMatches } from "../../../../src/lib/rerank";
 import { readNetworkSettings } from "../../../../src/lib/network-settings";
+import { runMatchmaker, type EligibleMember } from "../../../../src/lib/matchmaker-agent";
 
 export const runtime = "nodejs";
-// Matching + reranking is slow; give the batch room. Vercel/host caps still apply.
+// An agent loop over several members — many tool calls, each with a model round trip.
+// Slower and more variable than the fixed pipeline this replaced, so the ceiling
+// matters more than it used to. Vercel/host caps still apply, and MAX_STEPS in
+// matchmaker-agent.ts is the other end of the same bound.
 export const maxDuration = 300;
 
-const DEFAULT_BATCH = 3; // people to actually open an intro for per run (keep runs light)
+const DEFAULT_BATCH = 3; // introductions this run may open (keep runs light)
 const SCAN_LIMIT = 200; // how many members to consider per run
 // Windows in days; fractional on purpose. `burst` is the pilot tier — a member on it
 // can receive an introduction every six hours, which with the three-hourly schedule
@@ -103,7 +100,6 @@ async function run(req: Request) {
   }
 
   const results: RunResult[] = [];
-  let processed = 0;
 
   try {
     const { data: peopleData, error } = onlyPersonId
@@ -123,9 +119,15 @@ async function run(req: Request) {
     if (error) throw new Error(error.message);
     const people = (peopleData ?? []) as Person[];
 
+    // ---- Build the eligible set ------------------------------------------
+    //
+    // Everything in this loop is a HARD invariant, and it stays here rather than being
+    // exposed to the agent. The matchmaker decides who is worth introducing; it does
+    // not decide who is allowed to be introduced, and it has no tool that could widen
+    // this list. A model that can talk its way past a rate limit does not have a rate
+    // limit.
+    const eligible: EligibleMember[] = [];
     for (const person of people) {
-      if (processed >= limit) break;
-
       if (!person.email) {
         results.push({ person: person.name, skipped: "no email" });
         continue;
@@ -155,129 +157,83 @@ async function run(req: Request) {
         continue;
       }
 
-      const { candidates } = await fetchCandidates(db, person);
-      if (candidates.length === 0) {
-        results.push({ person: person.name, skipped: "no candidates" });
-        continue;
-      }
-
-      // Three independent sources of learned signal, all keyed on this person:
-      // past accept/reject outcomes, durable preferences, and what they last said.
-      const [calibration, preferences, history] = await Promise.all([
-        fetchCalibration(db, person.id),
-        fetchPreferences(db, person.id),
-        fetchRecentHistory(db, person.id),
-      ]);
-      const ranked = await rerank(person, candidates, calibration, preferences, history);
-      const { valid } = validateMatches(ranked, candidates);
-      if (valid.length === 0) {
-        results.push({ person: person.name, skipped: "no valid matches" });
-        continue;
-      }
-
-      // Pick the best candidate that we haven't already introduced them to AND whose
-      // own inbox has room. Walking the shortlist means a candidate who is over their
-      // cadence costs this member their second choice, not their whole run — which is
-      // why the cap is applied here rather than as a filter in `fetchCandidates`
-      // (a filter there would silently shrink the shortlist the reranker sees).
-      let chosen: (typeof valid)[number] | null = null;
-      const passedOver: string[] = [];
-      for (const m of valid) {
-        const { count } = await db
-          .from("introductions")
-          .select("*", { count: "exact", head: true })
-          .or(
-            `and(person_a_id.eq.${person.id},person_b_id.eq.${m.candidate_id}),` +
-              `and(person_a_id.eq.${m.candidate_id},person_b_id.eq.${person.id})`,
-          );
-        if ((count ?? 0) > 0) continue;
-
-        // The suggested person is about to receive a real email under double opt-in,
-        // so they get the same protection as the member being helped. Bypassed by
-        // ?person_id= for the same reason A's gate is: targeted test runs.
-        if (!onlyPersonId) {
-          const { data: candidateRow } = await db
-            .from("people")
-            .select("intro_cadence")
-            .eq("id", m.candidate_id)
-            .maybeSingle();
-          const theirs = await asksInWindow(
-            m.candidate_id,
-            candidateRow?.intro_cadence ?? "weekly",
-            settings.intensity,
-          );
-          if (theirs.count > 0) {
-            passedOver.push(`${m.name} (${theirs.count} in ${theirs.days.toFixed(2)}d)`);
-            continue;
-          }
-        }
-
-        chosen = m;
-        break;
-      }
-      if (!chosen) {
-        results.push({
-          person: person.name,
-          skipped: "no eligible match (already introduced, or candidates over their own cadence)",
-          ...(passedOver.length ? { over_cadence: passedOver } : {}),
-        });
-        continue;
-      }
-
-      // Persist the chosen match (get its id for the introduction).
-      const { data: matchRow } = await db
-        .from("matches")
-        .upsert(
-          {
-            person_a_id: person.id,
-            person_b_id: chosen.candidate_id,
-            score: chosen.score,
-            direction: chosen.direction,
-            rationale: chosen.rationale,
-          },
-          { onConflict: "person_low,person_high" },
-        )
-        .select()
-        .single();
-
-      const { data: suggested } = await db
-        .from("people")
-        .select("*")
-        .eq("id", chosen.candidate_id)
-        .single();
-
-      // This is where the run used to call startIntroduction(), which wrote the
-      // introductions/conversations/intros rows and then sent the opt-in email.
-      // The email layer is gone, so the run now stops at the match: candidates are
-      // fetched, reranked, validated, and the winner is persisted to `matches`.
-      //
-      // Deliberately NOT calling startIntroduction() with sending neutered. It also
-      // writes the `intros` ledger row that the cadence gate above counts, so
-      // leaving it in would silently rate-limit members out of being matched for an
-      // intro that never reaches them. Rewiring the intro machinery to a new channel
-      // is what re-opens this call site — see SPEC §3.2's send gateway (step 5).
-      results.push({
-        person: person.name,
-        suggested: (suggested as Person | null)?.name ?? null,
-        score: chosen.score,
-        matchId: matchRow?.id ?? null,
-        direction: chosen.direction,
-        introduced: false as const,
-      });
-      processed++;
+      eligible.push({ person, cadence: person.intro_cadence });
     }
+
+    // ---- The pair gate, as a closure the agent must pass through ----------
+    //
+    // Was inline in the old shortlist walk. It is a function now because the agent
+    // proposes a pair rather than accepting a pre-picked winner, so the check has to
+    // run at proposal time — and running it here rather than inside the agent module
+    // keeps `?person_id=` and the intensity dial in one place.
+    //
+    // A candidate over their OWN cadence costs the member that candidate, not their
+    // whole run: the agent gets a reason back and can pick someone else. That is the
+    // same trade the old shortlist walk made, and it is why this is not a filter
+    // applied to the candidate list before the model sees it — filtering there would
+    // silently shrink the shortlist without saying why.
+    const isEligiblePair = async (aId: string, bId: string) => {
+      const { count } = await db
+        .from("introductions")
+        .select("*", { count: "exact", head: true })
+        .or(`and(person_a_id.eq.${aId},person_b_id.eq.${bId}),and(person_a_id.eq.${bId},person_b_id.eq.${aId})`);
+      if ((count ?? 0) > 0) {
+        return { ok: false, reason: "These two have already been introduced." };
+      }
+
+      // The suggested person receives a real email under double opt-in, so they get the
+      // same cadence protection as the member being helped. Bypassed by ?person_id= for
+      // the same reason A's gate is: targeted test runs.
+      if (!onlyPersonId) {
+        const { data: candidateRow } = await db
+          .from("people")
+          .select("intro_cadence, paused, is_synthetic")
+          .eq("id", bId)
+          .maybeSingle();
+        if (!candidateRow) return { ok: false, reason: "No such person." };
+        if (candidateRow.paused) return { ok: false, reason: "That person has paused introductions." };
+        if (candidateRow.is_synthetic !== synthetic) {
+          return { ok: false, reason: "That person is in a different cohort." };
+        }
+        const theirs = await asksInWindow(bId, candidateRow.intro_cadence ?? "weekly", settings.intensity);
+        if (theirs.count > 0) {
+          return {
+            ok: false,
+            reason: `They are over their own cadence (${theirs.count} in ${theirs.days.toFixed(2)}d).`,
+          };
+        }
+      }
+      return { ok: true };
+    };
+
+    // ---- Hand the eligible set to the matchmaker --------------------------
+    const runId = `run-${new Date().toISOString()}`;
+    const outcome = await runMatchmaker({
+      client: db,
+      eligible,
+      limit,
+      runId,
+      isEligiblePair,
+    });
 
     return NextResponse.json({
       ok: true,
-      processed,
+      runId,
+      processed: outcome.introductionsOpened,
       considered: people.length,
+      eligible: eligible.length,
       networkEnabled: settings.enabled,
       intensity: settings.intensity,
-      results,
+      // What the agent did, and what it said about why. The summary is the part worth
+      // reading when a run opens nothing — "nothing was worth opening" and "the run
+      // fell over" look identical in a count.
+      summary: outcome.summary,
+      notesWritten: outcome.notesWritten,
+      results: [...results, ...outcome.proposals],
     });
   } catch (err) {
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : "run-matches failed", processed, results },
+      { error: err instanceof Error ? err.message : "run-matches failed", results },
       { status: 500 },
     );
   }

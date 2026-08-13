@@ -63,6 +63,37 @@ export interface IntroRow {
   match: { id: string; score: number | null; direction: string; status: string } | null;
 }
 
+/** One row of the send ledger — a message Dawn sent, or would have. */
+export interface OutboxRow {
+  id: number;
+  consentBasis: string;
+  kind: string;
+  attempt: number;
+  identity: string;
+  toEmails: string[];
+  subject: string | null;
+  /** The exact string transmitted or held, unsubscribe footer included. */
+  body: string;
+  status: string;
+  failureReason: string | null;
+  providerMessageId: string | null;
+  createdAt: string;
+  introduction: {
+    id: string;
+    state: string;
+    personA: string | null;
+    personB: string | null;
+  } | null;
+}
+
+export interface OutboxResponse {
+  /** Whether anything can actually leave the building right now. */
+  deliveryEnabled: boolean;
+  status: string;
+  byStatus: Record<string, number>;
+  outbox: OutboxRow[];
+}
+
 export interface MemberRow extends PersonRef {
   industry: string | null;
   career_stage: string | null;

@@ -5,7 +5,7 @@ import { supabase } from "../../../../src/lib/supabase";
 import { resolveViewerEntity } from "../../../../src/lib/entity-identity";
 import { writeProfileClaims } from "../../../../src/lib/profile-claims";
 import { parseAsks, writeAsks } from "../../../../src/lib/asks";
-import { summarizeEntity } from "../../../../src/lib/summarize-entity";
+import { syncProfileDownstream } from "../../../../src/lib/profile-edit";
 import { ProfileDraftSchema, SYNTHESIS_MODEL } from "../../../../src/lib/synthesize-profile";
 
 /**
@@ -31,15 +31,16 @@ import { ProfileDraftSchema, SYNTHESIS_MODEL } from "../../../../src/lib/synthes
  * Three things happen, in a deliberate order:
  *   1. draft → claims (writeProfileClaims)
  *   2. entities.onboarded_at is stamped — this is what marks onboarding complete
- *   3. summarizeEntity() runs INLINE
+ *   3. syncProfileDownstream() runs INLINE — the `people` row, then the embedding
  *
- * (3) is inline rather than deferred because the embedding is what makes this person
- * findable: `match_entities` skips rows where `embedding is null`, and the admin
- * constellation cannot place them. Deferring it to `after()` means a silent failure
- * leaves someone invisible in the network they were just told they had joined, with
- * nothing to indicate it. It is one Haiku call plus one embedding behind a screen that
- * is already saying "setting up", and it is wrapped so a failure does not un-confirm
- * the profile — the claims are already written and correct either way.
+ * (3) is inline rather than deferred because both halves are what make this person
+ * exist to the rest of the system: `match_entities` skips rows where `embedding is
+ * null` and the admin constellation cannot place them, while the matching cron reads
+ * `people` and cannot see anyone who has no row there at all. Deferring it to `after()`
+ * means a silent failure leaves someone invisible in the network they were just told
+ * they had joined, with nothing to indicate it. It is a couple of model calls behind a
+ * screen that is already saying "setting up", and it is wrapped so a failure does not
+ * un-confirm the profile — the claims are already written and correct either way.
  */
 
 export const runtime = "nodejs";
@@ -142,16 +143,16 @@ export async function POST(request: Request) {
   // Draft has become claims; the staging row is now a stale duplicate.
   await supabase.from("profile_drafts").delete().eq("entity_id", viewer.entityId);
 
-  let embedded = false;
-  try {
-    await summarizeEntity(supabase, viewer.entityId);
-    embedded = true;
-  } catch (err) {
-    // Not fatal, but it does mean this person is not yet findable by semantic search.
-    // `npm run summarize:entities` and the admin page's bounded summarize action are
-    // both able to fix it after the fact.
-    console.error("[onboarding] summarizeEntity failed:", err);
-  }
+  // Everything downstream of a profile write, not just the entity embedding: this is
+  // also the moment a member first gets a `people` row, without which the matching cron
+  // has literally never seen them (project-person.ts). They will still be skipped there
+  // until they say what they offer and want — onboarding infers neither — but they now
+  // exist to be skipped, which is the difference between "not ready" and "not present".
+  // Individually caught inside, and non-fatal here: an unembedded profile is fixable
+  // after the fact by `npm run summarize:entities` or the admin summarize action, and
+  // must not un-confirm a profile that is already written and correct.
+  const sync = await syncProfileDownstream(supabase, viewer.entityId);
+  const embedded = sync.summarized;
 
   return NextResponse.json({
     ok: true,
