@@ -22,6 +22,7 @@ import { DefaultChatTransport, type UIMessage } from "ai";
 import { ArrowUp, Check, ChevronDown, Loader2, MessagesSquare, Plus, Trash2 } from "lucide-react";
 import Markdown from "react-markdown";
 
+import { toSteps } from "../../src/lib/chat-steps";
 import type { ChatThreadSummary } from "../../src/lib/chat-threads";
 import type { DawnScope } from "../../src/lib/network-tools";
 import { Button } from "@/components/ui/button";
@@ -34,19 +35,6 @@ const SUGGESTIONS = [
   "Who have I gone quiet on?",
   "Who could introduce me to someone at Stripe?",
 ];
-
-/**
- * Human labels for the tool-status pill. Typed against the tool names so adding a tool
- * without a label is a compile error rather than a raw camelCase string leaking into
- * the UI.
- */
-const TOOL_LABELS: Record<string, string> = {
-  searchNetwork: "Scanning your network",
-  lookupByNameOrDomain: "Checking names and companies",
-  listTopConnections: "Going through who you know",
-  getEntityProfile: "Pulling up their profile",
-  findWarmPath: "Working out your way in",
-};
 
 // Tailwind can't reach into react-markdown's output, so the prose styles are applied
 // with arbitrary variants. Deliberately not @tailwindcss/typography: it brings a whole
@@ -412,19 +400,18 @@ function Message({ message }: { message: UIMessageLike }) {
   // Tool parts arrive as `tool-<name>`. They're process, not answer, so they render as a
   // bare trail above the reply rather than inside a bubble — a bubble containing only
   // "Reading your strongest relationships…" reads as if that were Dawn's response.
-  const steps = parts
-    .filter((part) => part.type.startsWith("tool-"))
-    .map((part) => TOOL_LABELS[part.type.slice("tool-".length)] ?? "Looking things up");
+  const steps = toSteps(parts);
   const textParts = parts.filter((part) => part.type === "text" && part.text?.trim());
 
   return (
     <div className={cn("flex flex-col gap-2", isUser ? "items-end" : "items-start")}>
       {steps.length > 0 && (
         <div className="flex flex-col gap-1 pl-1">
-          {steps.map((label, i) => (
+          {steps.map((step, i) => (
             <StatusLine
-              key={i}
-              label={label}
+              key={`${step.label}-${i}`}
+              label={step.label}
+              count={step.count}
               // Only the last step is still in flight once text starts arriving.
               done={i < steps.length - 1 || textParts.length > 0}
             />
@@ -454,7 +441,15 @@ function Message({ message }: { message: UIMessageLike }) {
  * One line of "here's what Dawn is doing". In flight it shimmers; finished, it settles
  * into a dim check so the trail reads as a record of the work rather than stale spinners.
  */
-function StatusLine({ label, done = false }: { label: string; done?: boolean }) {
+function StatusLine({
+  label,
+  count = 1,
+  done = false,
+}: {
+  label: string;
+  count?: number;
+  done?: boolean;
+}) {
   return (
     <p className="dawn-enter text-muted-foreground flex items-center gap-2 text-xs">
       {done ? (
@@ -464,6 +459,9 @@ function StatusLine({ label, done = false }: { label: string; done?: boolean }) 
       )}
       <span className={cn(!done && "dawn-working")}>
         {label}
+        {/* A repeated tool call is one line with a count, not five identical lines. Dimmer
+            than the label so it reads as metadata rather than part of the sentence. */}
+        {count > 1 && <span className="opacity-50"> ×{count}</span>}
         {done ? "" : "…"}
       </span>
     </p>
