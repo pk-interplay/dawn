@@ -121,10 +121,18 @@ export async function synthesizeProfile(opts: {
    * ourselves — the regenerate path, where nothing was fetched beforehand.
    */
   activity?: GmailActivity;
+  /**
+   * Wall-clock ceiling for this synthesis, as epoch ms. Only bounds the mailbox read on
+   * the regenerate path (where we do the reading) — the model call itself is left to
+   * finish, because a half-streamed draft is worth less than the seconds it would save
+   * and the caller keeps enough headroom to report either outcome.
+   */
+  deadline?: number;
 }): Promise<SynthesisResult> {
   const you = opts.email.trim().toLowerCase();
 
-  const { headers, events } = opts.activity ?? (await fetchGmailActivity(opts.accessToken));
+  const { headers, events } =
+    opts.activity ?? (await fetchGmailActivity(opts.accessToken, undefined, opts.deadline));
 
   // Outbound only. Inbound subject lines describe what other people want, and a
   // profile built from your inbox reads like a profile of everyone who emails you.
