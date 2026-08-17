@@ -58,6 +58,9 @@ const INGEST_LINES = [
   "Working out what you're known for.",
 ];
 
+/** Past this with no counter movement, say why rather than showing a frozen number. */
+const PACING_HINT_MS = 12_000;
+
 interface StreamedContact {
   name: string;
   email: string;
@@ -75,14 +78,26 @@ interface Progress {
   phase: string;
   done: number;
   total: number;
+  /** How long the counters have been still. Long stalls are the quota window, not a fault. */
+  stalledMs: number;
 }
 
 /** Phase → what to tell the user it's doing. Anything unrecognised falls back to copy. */
 const PHASE_LABEL: Record<string, string> = {
-  reading: "Reading your mail and calendar…",
+  reading: "Opening your mailbox…",
+  reading_sent: "Reading the mail you've sent…",
+  reading_received: "Reading who's been writing to you…",
   writing: "Saving your network…",
   synthesizing: "Working out what you're known for…",
 };
+
+/** The ordered steps shown as a checklist, and which phases satisfy each. */
+const STEPS: { key: string; label: string; phases: string[] }[] = [
+  { key: "sent", label: "Your sent mail", phases: ["reading", "reading_sent"] },
+  { key: "received", label: "Your correspondents", phases: ["reading_received"] },
+  { key: "graph", label: "Your network", phases: ["writing"] },
+  { key: "profile", label: "Your profile", phases: ["synthesizing"] },
+];
 
 /** The draft mid-write: any field may be missing or half-finished. */
 type PartialDraft = Partial<Omit<ProfileDraft, "expertise" | "interests" | "goals" | "suggestedIntros">> & {
@@ -218,6 +233,7 @@ export function OnboardingFlow({
               phase: String(event.phase ?? ""),
               done: Number(event.done ?? 0),
               total: Number(event.total ?? 0),
+              stalledMs: Number(event.stalledMs ?? 0),
             });
           } else if (event.type === "evidence") {
             setEvidence(event.evidence as Evidence);
@@ -405,21 +421,29 @@ export function OnboardingFlow({
             {firstName ? `One moment, ${firstName}.` : "One moment."}
           </h1>
           <p className="text-muted-foreground mt-3 text-sm">This only happens once.</p>
-          <p className="text-muted-foreground mt-6 flex items-center gap-2 text-sm">
+          <p className="text-dawn-bone mt-6 flex items-center gap-2 text-sm">
             <Loader2 className="size-4 shrink-0 animate-spin" />
             {writing
               ? "Writing your profile…"
-              : (progress && PHASE_LABEL[progress.phase]) ?? INGEST_LINES[line]}
+              : ((progress && PHASE_LABEL[progress.phase]) ?? INGEST_LINES[line])}
           </p>
 
-          {/* The graph write streams no contacts, so without this the screen has nothing
-              to say for the longest phase of the run — which is exactly what a hang
-              looks like. */}
-          {progress?.phase === "writing" && progress.total > 0 && (
-            <p className="text-muted-foreground mt-2 text-xs">
-              {progress.done} of {progress.total} saved
+          {/* A running count, because the phases that take longest — the paced mailbox
+              read and the graph write — stream nothing else. A number that moves is the
+              difference between "working" and "hung". */}
+          {!writing && progress && progress.total > 0 && (
+            <p className="text-muted-foreground mt-2 text-xs tabular-nums">
+              {progress.done.toLocaleString()} of {progress.total.toLocaleString()}
+              {progress.phase === "writing" ? " saved" : " messages"}
+              {progress.stalledMs > PACING_HINT_MS && (
+                <span className="ml-2 opacity-70">
+                  · paused for Gmail&rsquo;s rate limit, this is normal
+                </span>
+              )}
             </p>
           )}
+
+          {!writing && <StepList phase={progress?.phase} />}
 
           {/* The ticker is the ingest's progress. Once synthesis starts it has nothing
               left to say, so it yields to the draft rather than competing with it. */}
@@ -717,6 +741,50 @@ function Kicker({ children }: { children: React.ReactNode }) {
     <p className="text-dawn-head text-[11px] font-medium tracking-[2.4px] uppercase">{children}</p>
   );
 }
+
+/**
+ * The four things onboarding does, with the current one lit.
+ *
+ * A single spinner cannot distinguish "two seconds in" from "ninety seconds in", which
+ * is most of why the wait felt broken. A list that fills in left to right answers "how
+ * much of this is left" without promising a duration nobody can predict — the mailbox
+ * read is paced against a quota and genuinely does not know when it will finish.
+ */
+function StepList({ phase }: { phase?: string }) {
+  const current = phase ? STEPS.findIndex((s) => s.phases.includes(phase)) : 0;
+  if (current < 0) return null;
+
+  return (
+    <ol className="mt-6 space-y-1.5">
+      {STEPS.map((step, i) => {
+        const state = i < current ? "done" : i === current ? "active" : "todo";
+        return (
+          <li
+            key={step.key}
+            className={`flex items-center gap-2.5 text-sm transition-opacity duration-500 ${
+              state === "todo" ? "opacity-35" : "opacity-100"
+            }`}
+          >
+            <span
+              aria-hidden
+              className={`size-1.5 shrink-0 rounded-full ${
+                state === "done"
+                  ? "bg-dawn-head"
+                  : state === "active"
+                    ? "bg-dawn-bone animate-pulse"
+                    : "bg-muted-foreground"
+              }`}
+            />
+            <span className={state === "active" ? "text-dawn-bone" : "text-muted-foreground"}>
+              {step.label}
+            </span>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
 
 /**
  * `onHide` is what separates the review screen from the streaming preview: with it,

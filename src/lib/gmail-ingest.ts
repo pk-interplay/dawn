@@ -136,6 +136,22 @@ export interface GmailActivity {
   events: CalendarEventAttendees[];
 }
 
+/**
+ * Where the mailbox read has got to, for a caller showing a live status.
+ *
+ * The read is the longest phase of onboarding and it is paced deliberately — the
+ * quota window blocks whole batches for up to a minute at a time — so without a
+ * running count the screen has nothing to say for minutes and looks hung when it is
+ * merely waiting its turn.
+ */
+export interface ReadProgressUpdate {
+  phase: "sent" | "received";
+  fetched: number;
+  total: number;
+}
+
+export type ReadProgress = (update: ReadProgressUpdate) => void;
+
 function lookbackDate(): Date {
   const d = new Date();
   d.setMonth(d.getMonth() - LOOKBACK_MONTHS);
@@ -433,8 +449,10 @@ async function fetchHeaders(
   label: string,
   onBatch?: (batch: GmailHeaderSet[]) => void,
   deadline?: Deadline,
+  onProgress?: (fetchedInThisDirection: number, totalInThisDirection: number) => void,
 ): Promise<GmailHeaderSet[]> {
   const headers: GmailHeaderSet[] = [];
+  onProgress?.(0, ids.length);
 
   for (let i = 0; i < ids.length; i += BATCH_SIZE) {
     const batch = ids.slice(i, i + BATCH_SIZE);
@@ -486,6 +504,7 @@ async function fetchHeaders(
     );
     headers.push(...results);
     onBatch?.(results);
+    onProgress?.(headers.length, ids.length);
   }
 
   return headers;
@@ -507,9 +526,22 @@ export async function fetchRecentGmailHeaders(
   onBatch?: (batch: GmailHeaderSet[]) => void,
   budget: RunBudget = new RunBudget(),
   deadline?: Deadline,
+  onProgress?: ReadProgress,
 ): Promise<GmailHeaderSet[]> {
   const after = Math.floor(lookbackDate().getTime() / 1000);
   const seen = new Set<string>();
+
+  // Sent is fetched before received is even listed, so the totals arrive in two parts.
+  // Carrying the finished direction forward keeps the count monotonic — a progress
+  // number that resets to zero halfway through reads as a restart, not as progress.
+  let doneBefore = 0;
+  let totalBefore = 0;
+  const report = (direction: "sent" | "received") => (fetched: number, total: number) =>
+    onProgress?.({
+      phase: direction,
+      fetched: doneBefore + fetched,
+      total: totalBefore + total,
+    });
 
   // Sent first, and interleaved list→fetch rather than listing both directions up
   // front: spending the budget in priority order is what makes "sent wins" true.
@@ -523,7 +555,17 @@ export async function fetchRecentGmailHeaders(
     deadline,
   );
   sentIds.forEach((id) => seen.add(id));
-  const sent = await fetchHeaders(token, budget, sentIds, "sent", onBatch, deadline);
+  const sent = await fetchHeaders(
+    token,
+    budget,
+    sentIds,
+    "sent",
+    onBatch,
+    deadline,
+    report("sent"),
+  );
+  doneBefore = sent.length;
+  totalBefore = sentIds.length;
 
   // Whatever survives the sent pass belongs to received mail.
   const receivedCap = Math.floor(budget.remaining() / UNITS_MESSAGES_GET);
@@ -537,7 +579,15 @@ export async function fetchRecentGmailHeaders(
       deadline,
     )
   ).filter((id) => !seen.has(id));
-  const received = await fetchHeaders(token, budget, receivedIds, "received", onBatch, deadline);
+  const received = await fetchHeaders(
+    token,
+    budget,
+    receivedIds,
+    "received",
+    onBatch,
+    deadline,
+    report("received"),
+  );
 
   console.info(
     `[gmail-ingest] fetched ${sent.length} sent + ${received.length} received message headers using ${budget.spentUnits()}/${MAX_UNITS_PER_RUN} quota units`,
@@ -597,9 +647,10 @@ export async function fetchGmailActivity(
   token: string,
   onBatch?: (batch: GmailHeaderSet[]) => void,
   deadline?: Deadline,
+  onProgress?: ReadProgress,
 ): Promise<GmailActivity> {
   const [headers, events] = await Promise.all([
-    fetchRecentGmailHeaders(token, onBatch, new RunBudget(), deadline),
+    fetchRecentGmailHeaders(token, onBatch, new RunBudget(), deadline, onProgress),
     fetchRecentCalendarEvents(token, deadline),
   ]);
   return { headers, events };

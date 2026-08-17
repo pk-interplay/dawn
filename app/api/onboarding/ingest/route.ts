@@ -103,13 +103,31 @@ export async function POST() {
       };
 
       // Phase state, read by the heartbeat. The graph write is the phase that used to go
-      // completely silent for minutes at a time.
+      // completely silent for minutes at a time, and the mailbox read is the one that
+      // stalls for up to a minute whenever the Gmail quota window makes it wait its turn.
       let phase = "reading";
       let done = 0;
       let total = 0;
+      // When the counters last moved. The read is paced deliberately, so a stalled count
+      // is normal — but the screen should say "waiting on Gmail" rather than sit on a
+      // number that has not changed in forty seconds looking broken.
+      let lastAdvance = Date.now();
+      const advance = (nextDone: number, nextTotal: number) => {
+        if (nextDone !== done || nextTotal !== total) lastAdvance = Date.now();
+        done = nextDone;
+        total = nextTotal;
+      };
       const heartbeat = setInterval(() => {
         try {
-          send({ type: "progress", phase, done, total });
+          send({
+            type: "progress",
+            phase,
+            done,
+            total,
+            // Long enough that ordinary batch latency never trips it, short enough to
+            // explain a quota pause while it is still happening.
+            stalledMs: Date.now() - lastAdvance,
+          });
         } catch {
           // Client gone. The deadline check in the work below is what stops the run.
         }
@@ -134,15 +152,17 @@ export async function POST() {
               seen.add(contact.email);
               send({ type: "contact", name: contact.name, email: contact.email });
             },
+            onReadProgress: ({ phase: direction, fetched, total: count }) => {
+              phase = direction === "sent" ? "reading_sent" : "reading_received";
+              advance(fetched, count);
+            },
             onActivity: (fetched) => {
               activity = fetched;
               phase = "writing";
+              advance(0, 0);
               log("gmail read complete", { contacts: seen.size });
             },
-            onWriteProgress: (written, count) => {
-              done = written;
-              total = count;
-            },
+            onWriteProgress: (written, count) => advance(written, count),
           });
           log("graph written", {
             entities: ingest.entitiesTouched,
@@ -180,6 +200,7 @@ export async function POST() {
         let synthesis;
         try {
           phase = "synthesizing";
+          advance(0, 0);
           synthesis = await synthesizeProfile({
             accessToken,
             email: viewer.email,

@@ -3,6 +3,7 @@ import {
   fetchGmailActivity,
   type Deadline,
   type GmailActivity,
+  type ReadProgress,
   type GmailHeaderSet,
 } from "./gmail-ingest";
 import {
@@ -111,6 +112,8 @@ export async function ingestGmailNetwork(
     onActivity?: (activity: GmailActivity) => void;
     /** Progress through the graph write, for callers showing a live status. */
     onWriteProgress?: (written: number, total: number) => void;
+    /** Progress through the mailbox read — the longest and most paced phase. */
+    onReadProgress?: ReadProgress;
     /**
      * Wall-clock ceiling for the whole ingest, as epoch ms. Past it the run stops and
      * returns `truncated: true` rather than continuing into a caller that has already
@@ -119,7 +122,7 @@ export async function ingestGmailNetwork(
     deadline?: Deadline;
   } = {},
 ): Promise<IngestSummary> {
-  const { onContact, onActivity, onWriteProgress, deadline } = opts;
+  const { onContact, onActivity, onWriteProgress, onReadProgress, deadline } = opts;
   const you = youEmail.toLowerCase();
   const outOfTime = () => deadline !== undefined && Date.now() >= deadline;
 
@@ -141,7 +144,7 @@ export async function ingestGmailNetwork(
       }
     : undefined;
 
-  const activity = await fetchGmailActivity(accessToken, onBatch, deadline);
+  const activity = await fetchGmailActivity(accessToken, onBatch, deadline, onReadProgress);
   const { headers, events } = activity;
   onActivity?.(activity);
 
