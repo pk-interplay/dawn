@@ -205,6 +205,95 @@ export async function findEntityIdByEmail(
 }
 
 /**
+ * Hard-delete every claim about one subject. Reset paths only.
+ *
+ * This breaks the append-only invariant on purpose, and it is the single exception:
+ * retiring a fact a user no longer wants asserted is `supersedeClaims`, which keeps the
+ * row and records what replaced it. This is for removing an *account* — the person is
+ * leaving the graph entirely, and leaving their claims behind would keep their address
+ * resolvable to an entity that no longer exists, which is how the split-identity bug in
+ * findOrCreateEntity starts.
+ *
+ * It lives here rather than in the script that needs it because the CI guard means every
+ * `claims` access does, and a delete is exactly the kind of operation that should be
+ * visible next to the invariant it suspends.
+ */
+export async function deleteClaimsForSubject(
+  client: SupabaseClient,
+  subjectId: string,
+): Promise<number> {
+  const { data, error } = await client
+    .from("claims")
+    .delete()
+    .eq("subject_id", subjectId)
+    .select("id");
+  if (error) throw new Error(`deleteClaimsForSubject failed: ${error.message}`);
+  return (data ?? []).length;
+}
+
+/**
+ * Every email → entity mapping currently live in the graph, as one query.
+ *
+ * The bulk form of findEntityIdByEmail, and it exists because the per-email form does
+ * not survive contact with a real mailbox: resolving a thousand correspondents one
+ * round trip at a time is minutes of latency, which is what pushed the onboarding
+ * ingest past its function timeout and left users on a spinner forever.
+ *
+ * It reads the whole index rather than filtering to the emails asked for, because
+ * `value` is jsonb holding a scalar string and PostgREST's `in` operator over that
+ * needs per-value JSON quoting that is easy to get subtly wrong. One paged scan of a
+ * single-workspace table is both simpler and cheaper than a thousand lookups. That
+ * trade stops paying at a much larger graph than this one holds; revisit it with an
+ * RPC over `value #>> '{}'` when the index outgrows a few tens of thousands of rows.
+ */
+export async function loadEmailIndex(client: SupabaseClient): Promise<Map<string, string>> {
+  const index = new Map<string, string>();
+  const PAGE = 1000;
+
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await client
+      .from("claims")
+      .select("subject_id, value")
+      .eq("attribute", "email")
+      .is("superseded_by", null)
+      .order("id", { ascending: true })
+      .range(from, from + PAGE - 1);
+    if (error) throw new Error(`loadEmailIndex failed: ${error.message}`);
+
+    for (const row of data ?? []) {
+      const email = typeof row.value === "string" ? row.value.trim().toLowerCase() : null;
+      if (!email) continue;
+      // First writer wins, matching findEntityIdByEmail's `limit(1)` on ascending id.
+      if (!index.has(email)) index.set(email, row.subject_id as string);
+    }
+
+    if (!data || data.length < PAGE) break;
+  }
+
+  return index;
+}
+
+/**
+ * Create `count` bare person entities and return their ids.
+ *
+ * The caller is responsible for immediately claiming each one's email — an entity with
+ * no email claim is unresolvable, and the next ingest creates a second one for the same
+ * person (the split-identity bug documented in findOrCreateEntity).
+ */
+export async function createPersonEntities(
+  client: SupabaseClient,
+  count: number,
+): Promise<string[]> {
+  if (count <= 0) return [];
+  const { data, error } = await client
+    .from("entities")
+    .insert(Array.from({ length: count }, () => ({ kind: "person" })))
+    .select("id");
+  if (error) throw new Error(`createPersonEntities failed: ${error.message}`);
+  return (data ?? []).map((row) => row.id as string);
+}
+
+/**
  * Resolve a company domain to the organization entity that holds it as a live
  * `domain` claim, or null. The org-side analogue of findEntityIdByEmail: a
  * person is identified automatically by their email, a company by its domain
@@ -332,4 +421,80 @@ export async function projectDisplayName(client: SupabaseClient, entityId: strin
     .eq("id", entityId);
   if (updateError) throw new Error(`projectDisplayName write failed: ${updateError.message}`);
   return displayName;
+}
+
+/**
+ * projectDisplayName for many entities, in a handful of round trips instead of two each.
+ *
+ * Same precedence and same single-writer rule as the singular form. Two things make it
+ * fast enough to run over a whole mailbox: the reads are chunked `in` queries, and rows
+ * whose `display_name` already matches what claims say are skipped entirely — which on a
+ * re-ingest (the common case, since the ingest is idempotent) is nearly all of them.
+ *
+ * Returns the number of rows actually updated.
+ */
+export async function projectDisplayNames(
+  client: SupabaseClient,
+  entityIds: string[],
+): Promise<number> {
+  if (!entityIds.length) return 0;
+  const CHUNK = 500;
+  /** Concurrent single-row updates. PostgREST cannot set a different value per id in
+   *  one statement, and an upsert would have to restate every not-null column. */
+  const UPDATE_CONCURRENCY = 16;
+
+  const desired = new Map<string, string | null>();
+  const current = new Map<string, string | null>();
+
+  for (let i = 0; i < entityIds.length; i += CHUNK) {
+    const chunk = entityIds.slice(i, i + CHUNK);
+
+    const { data: attrs, error: attrError } = await client
+      .from("resolved_attributes")
+      .select("subject_id, attribute, value")
+      .in("subject_id", chunk)
+      .in("attribute", ["name", "email"]);
+    if (attrError) throw new Error(`projectDisplayNames lookup failed: ${attrError.message}`);
+
+    const byEntity = new Map<string, { name?: unknown; email?: unknown }>();
+    for (const row of attrs ?? []) {
+      const id = row.subject_id as string;
+      const entry = byEntity.get(id) ?? {};
+      entry[row.attribute as "name" | "email"] = row.value;
+      byEntity.set(id, entry);
+    }
+    for (const id of chunk) {
+      const entry = byEntity.get(id);
+      desired.set(id, ((entry?.name ?? entry?.email) as string | null) ?? null);
+    }
+
+    const { data: rows, error: rowError } = await client
+      .from("entities")
+      .select("id, display_name")
+      .in("id", chunk);
+    if (rowError) throw new Error(`projectDisplayNames read failed: ${rowError.message}`);
+    for (const row of rows ?? []) {
+      current.set(row.id as string, (row.display_name as string | null) ?? null);
+    }
+  }
+
+  const stale = entityIds.filter((id) => desired.get(id) !== current.get(id));
+
+  let updated = 0;
+  for (let i = 0; i < stale.length; i += UPDATE_CONCURRENCY) {
+    const wave = stale.slice(i, i + UPDATE_CONCURRENCY);
+    const results = await Promise.all(
+      wave.map(async (id) => {
+        const { error } = await client
+          .from("entities")
+          .update({ display_name: desired.get(id) ?? null })
+          .eq("id", id);
+        if (error) throw new Error(`projectDisplayNames write failed: ${error.message}`);
+        return 1;
+      }),
+    );
+    updated += results.length;
+  }
+
+  return updated;
 }

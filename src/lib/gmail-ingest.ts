@@ -46,6 +46,27 @@ const BATCH_SIZE = 15;
 /** Max attempts per request before giving up (1 initial + retries). */
 const MAX_ATTEMPTS = 5;
 
+/**
+ * How long one Google request may take before we give up on it.
+ *
+ * `fetch` has no default timeout, so without this a connection that opens and then
+ * stops delivering hangs until the platform kills the whole function — which, for a
+ * streaming caller, is indistinguishable from the work being slow and takes the
+ * caller's chance to report anything down with it.
+ */
+const REQUEST_TIMEOUT_MS = 20_000;
+
+/**
+ * The longest we will honour a `Retry-After` or wait out a quota penalty.
+ *
+ * Google is free to ask for a five-minute stand-down; we are not free to give it one.
+ * `quota.pause` applies the same interval to every in-flight worker for this mailbox,
+ * so an uncapped value parks the entire run — and the run has a caller waiting on it
+ * with a budget of its own. Past this point, failing the request is the better answer
+ * than blocking on it.
+ */
+const MAX_BACKOFF_MS = 30_000;
+
 /** Gmail's published quota cost per call, in units. */
 const UNITS_MESSAGES_LIST = 5;
 const UNITS_MESSAGES_GET = 5;
@@ -115,6 +136,22 @@ export interface GmailActivity {
   events: CalendarEventAttendees[];
 }
 
+/**
+ * Where the mailbox read has got to, for a caller showing a live status.
+ *
+ * The read is the longest phase of onboarding and it is paced deliberately — the
+ * quota window blocks whole batches for up to a minute at a time — so without a
+ * running count the screen has nothing to say for minutes and looks hung when it is
+ * merely waiting its turn.
+ */
+export interface ReadProgressUpdate {
+  phase: "sent" | "received";
+  fetched: number;
+  total: number;
+}
+
+export type ReadProgress = (update: ReadProgressUpdate) => void;
+
 function lookbackDate(): Date {
   const d = new Date();
   d.setMonth(d.getMonth() - LOOKBACK_MONTHS);
@@ -122,6 +159,23 @@ function lookbackDate(): Date {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * A wall-clock ceiling for the whole read, as an epoch-ms timestamp.
+ *
+ * The quota machinery below bounds how much a run may *spend*; this bounds how long it
+ * may *take*. They are different limits and a run can hit either: pacing 15,000 units at
+ * 12,000/minute takes over a minute on its own, and the caller's own budget may be
+ * shorter than that. Everything that loops checks this so the read ends by returning
+ * less rather than by being killed.
+ */
+export type Deadline = number | undefined;
+
+const expired = (deadline: Deadline): boolean => deadline !== undefined && Date.now() >= deadline;
+
+/** Milliseconds left, or Infinity when the caller set no deadline. */
+const timeLeft = (deadline: Deadline): number =>
+  deadline === undefined ? Infinity : deadline - Date.now();
 
 /** Why a Google call failed, and therefore whether retrying it can help. */
 export type GoogleFailureKind = "quota" | "rate" | "transient" | "terminal";
@@ -261,13 +315,23 @@ function quotaWindowFor(token: string): QuotaWindow {
   return created;
 }
 
-async function googleFetch(token: string, url: string, units: number, budget?: RunBudget) {
+async function googleFetch(
+  token: string,
+  url: string,
+  units: number,
+  budget?: RunBudget,
+  deadline?: Deadline,
+) {
   const quota = quotaWindowFor(token);
 
   for (let attempt = 1; ; attempt++) {
     await quota.spend(units);
     budget?.charge(units);
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      // Bounded so a stalled connection fails this request instead of the whole run.
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
     if (res.ok) return res.json();
 
     const body = await res.text().catch(() => "");
@@ -288,6 +352,18 @@ async function googleFetch(token: string, url: string, units: number, budget?: R
       backoff = QUOTA_PENALTY_MS * attempt;
     } else {
       backoff = 500 * 2 ** (attempt - 1) + Math.floor(Math.random() * 250);
+    }
+    // Google's asks are advisory; the caller's deadline is not. Capping here bounds
+    // both this sleep and the `quota.pause` below it, which would otherwise stand the
+    // whole mailbox down for as long as Google felt like naming.
+    backoff = Math.min(backoff, MAX_BACKOFF_MS);
+
+    // No point sleeping past the deadline only to fail after it: give up now and let the
+    // caller report what it already has.
+    if (backoff >= timeLeft(deadline)) {
+      throw new Error(
+        `Google API request failed (${res.status}) and the retry does not fit in the remaining time budget`,
+      );
     }
 
     if (kind === "quota") {
@@ -315,14 +391,19 @@ async function listMessageIds(
   q: string,
   cap: number,
   label: string,
+  deadline?: Deadline,
 ) {
   const ids: string[] = [];
   let pageToken: string | undefined;
-  let truncatedBy: "cap" | "budget" | null = null;
+  let truncatedBy: "cap" | "budget" | "time" | null = null;
 
   do {
     if (!budget.canAfford(UNITS_MESSAGES_LIST)) {
       truncatedBy = "budget";
+      break;
+    }
+    if (expired(deadline)) {
+      truncatedBy = "time";
       break;
     }
 
@@ -332,7 +413,7 @@ async function listMessageIds(
     url.searchParams.set("maxResults", String(Math.min(500, cap - ids.length)));
     if (pageToken) url.searchParams.set("pageToken", pageToken);
 
-    const page = await googleFetch(token, url.toString(), UNITS_MESSAGES_LIST, budget);
+    const page = await googleFetch(token, url.toString(), UNITS_MESSAGES_LIST, budget, deadline);
     ids.push(...(page.messages ?? []).map((m: { id: string }) => m.id));
     pageToken = page.nextPageToken;
 
@@ -343,10 +424,14 @@ async function listMessageIds(
   } while (pageToken);
 
   if (truncatedBy) {
+    const why =
+      truncatedBy === "cap"
+        ? "direction's share of the run budget"
+        : truncatedBy === "budget"
+          ? "run budget exhausted"
+          : "time budget exhausted";
     console.info(
-      `[gmail-ingest] ${label}: stopped listing at ${ids.length} messages (${
-        truncatedBy === "cap" ? "direction's share of the run budget" : "run budget exhausted"
-      }; more exist in the ${LOOKBACK_MONTHS}-month window)`,
+      `[gmail-ingest] ${label}: stopped listing at ${ids.length} messages (${why}; more exist in the ${LOOKBACK_MONTHS}-month window)`,
     );
   }
   return ids.slice(0, cap);
@@ -363,14 +448,25 @@ async function fetchHeaders(
   ids: string[],
   label: string,
   onBatch?: (batch: GmailHeaderSet[]) => void,
+  deadline?: Deadline,
+  onProgress?: (fetchedInThisDirection: number, totalInThisDirection: number) => void,
 ): Promise<GmailHeaderSet[]> {
   const headers: GmailHeaderSet[] = [];
+  onProgress?.(0, ids.length);
 
   for (let i = 0; i < ids.length; i += BATCH_SIZE) {
     const batch = ids.slice(i, i + BATCH_SIZE);
     if (!budget.canAfford(batch.length * UNITS_MESSAGES_GET)) {
       console.info(
         `[gmail-ingest] ${label}: run budget exhausted after ${headers.length}/${ids.length} messages`,
+      );
+      break;
+    }
+    // A partial read still produces a usable graph, so stopping here is a smaller
+    // result — not a failed run. Overrunning would cost the caller its whole reply.
+    if (expired(deadline)) {
+      console.info(
+        `[gmail-ingest] ${label}: time budget exhausted after ${headers.length}/${ids.length} messages`,
       );
       break;
     }
@@ -384,7 +480,13 @@ async function fetchHeaders(
         msgUrl.searchParams.append("metadataHeaders", "Cc");
         msgUrl.searchParams.append("metadataHeaders", "Date");
         msgUrl.searchParams.append("metadataHeaders", "Subject");
-        const msg = await googleFetch(token, msgUrl.toString(), UNITS_MESSAGES_GET, budget);
+        const msg = await googleFetch(
+          token,
+          msgUrl.toString(),
+          UNITS_MESSAGES_GET,
+          budget,
+          deadline,
+        );
         const get = (name: string) =>
           (msg.payload?.headers ?? []).find(
             (h: { name: string; value: string }) => h.name.toLowerCase() === name.toLowerCase(),
@@ -402,6 +504,7 @@ async function fetchHeaders(
     );
     headers.push(...results);
     onBatch?.(results);
+    onProgress?.(headers.length, ids.length);
   }
 
   return headers;
@@ -422,16 +525,47 @@ export async function fetchRecentGmailHeaders(
   token: string,
   onBatch?: (batch: GmailHeaderSet[]) => void,
   budget: RunBudget = new RunBudget(),
+  deadline?: Deadline,
+  onProgress?: ReadProgress,
 ): Promise<GmailHeaderSet[]> {
   const after = Math.floor(lookbackDate().getTime() / 1000);
   const seen = new Set<string>();
 
+  // Sent is fetched before received is even listed, so the totals arrive in two parts.
+  // Carrying the finished direction forward keeps the count monotonic — a progress
+  // number that resets to zero halfway through reads as a restart, not as progress.
+  let doneBefore = 0;
+  let totalBefore = 0;
+  const report = (direction: "sent" | "received") => (fetched: number, total: number) =>
+    onProgress?.({
+      phase: direction,
+      fetched: doneBefore + fetched,
+      total: totalBefore + total,
+    });
+
   // Sent first, and interleaved list→fetch rather than listing both directions up
   // front: spending the budget in priority order is what makes "sent wins" true.
   const sentCap = Math.floor((budget.remaining() * SENT_UNIT_SHARE) / UNITS_MESSAGES_GET);
-  const sentIds = await listMessageIds(token, budget, `in:sent after:${after}`, sentCap, "sent");
+  const sentIds = await listMessageIds(
+    token,
+    budget,
+    `in:sent after:${after}`,
+    sentCap,
+    "sent",
+    deadline,
+  );
   sentIds.forEach((id) => seen.add(id));
-  const sent = await fetchHeaders(token, budget, sentIds, "sent", onBatch);
+  const sent = await fetchHeaders(
+    token,
+    budget,
+    sentIds,
+    "sent",
+    onBatch,
+    deadline,
+    report("sent"),
+  );
+  doneBefore = sent.length;
+  totalBefore = sentIds.length;
 
   // Whatever survives the sent pass belongs to received mail.
   const receivedCap = Math.floor(budget.remaining() / UNITS_MESSAGES_GET);
@@ -442,9 +576,18 @@ export async function fetchRecentGmailHeaders(
       `${RECEIVED_EXCLUSIONS} after:${after}`,
       receivedCap,
       "received",
+      deadline,
     )
   ).filter((id) => !seen.has(id));
-  const received = await fetchHeaders(token, budget, receivedIds, "received", onBatch);
+  const received = await fetchHeaders(
+    token,
+    budget,
+    receivedIds,
+    "received",
+    onBatch,
+    deadline,
+    report("received"),
+  );
 
   console.info(
     `[gmail-ingest] fetched ${sent.length} sent + ${received.length} received message headers using ${budget.spentUnits()}/${MAX_UNITS_PER_RUN} quota units`,
@@ -454,7 +597,10 @@ export async function fetchRecentGmailHeaders(
 
 /** Lists recent Calendar events on the primary calendar with their attendees.
  * Already metadata-only — no event descriptions are fetched. */
-export async function fetchRecentCalendarEvents(token: string): Promise<CalendarEventAttendees[]> {
+export async function fetchRecentCalendarEvents(
+  token: string,
+  deadline?: Deadline,
+): Promise<CalendarEventAttendees[]> {
   const url = new URL("https://www.googleapis.com/calendar/v3/calendars/primary/events");
   url.searchParams.set("timeMin", lookbackDate().toISOString());
   url.searchParams.set("singleEvents", "true");
@@ -468,7 +614,7 @@ export async function fetchRecentCalendarEvents(token: string): Promise<Calendar
     // Calendar has its own quota, far looser than Gmail's and measured in requests
     // rather than units; the window is shared here only so one mailbox's Calendar
     // paging cannot itself become a burst.
-    const page = await googleFetch(token, url.toString(), 1);
+    const page = await googleFetch(token, url.toString(), 1, undefined, deadline);
     for (const event of page.items ?? []) {
       events.push({
         start: event.start?.dateTime ?? event.start?.date,
@@ -480,7 +626,9 @@ export async function fetchRecentCalendarEvents(token: string): Promise<Calendar
       });
     }
     pageToken = page.nextPageToken;
-  } while (pageToken && events.length < 500);
+    // Calendar paging is cheap but not free, and it runs concurrently with the mailbox
+    // read that owns most of the budget. Stop rather than push the caller over.
+  } while (pageToken && events.length < 500 && !expired(deadline));
 
   return events;
 }
@@ -498,10 +646,12 @@ export async function fetchRecentCalendarEvents(token: string): Promise<Calendar
 export async function fetchGmailActivity(
   token: string,
   onBatch?: (batch: GmailHeaderSet[]) => void,
+  deadline?: Deadline,
+  onProgress?: ReadProgress,
 ): Promise<GmailActivity> {
   const [headers, events] = await Promise.all([
-    fetchRecentGmailHeaders(token, onBatch, new RunBudget()),
-    fetchRecentCalendarEvents(token),
+    fetchRecentGmailHeaders(token, onBatch, new RunBudget(), deadline, onProgress),
+    fetchRecentCalendarEvents(token, deadline),
   ]);
   return { headers, events };
 }

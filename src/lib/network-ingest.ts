@@ -1,6 +1,21 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { fetchGmailActivity, type GmailActivity, type GmailHeaderSet } from "./gmail-ingest";
-import { findOrCreateEntity, projectDisplayName, writeClaim } from "./claims";
+import {
+  fetchGmailActivity,
+  type Deadline,
+  type GmailActivity,
+  type ReadProgress,
+  type GmailHeaderSet,
+} from "./gmail-ingest";
+import {
+  createPersonEntities,
+  findOrCreateEntity,
+  loadEmailIndex,
+  projectDisplayName,
+  projectDisplayNames,
+  writeClaim,
+  writeClaims,
+  type ClaimInput,
+} from "./claims";
 
 /**
  * Nexus v0.2 build step 2 (SPEC.md §2.3, §7). Ported from nexus's
@@ -68,7 +83,13 @@ export interface IngestSummary {
   edgesWritten: number;
   claimsWritten: number;
   failures: string[];
+  /** True when a budget stopped the run early, so the graph is a subset of the mailbox. */
+  truncated: boolean;
 }
+
+/** How many rows to put in one insert/upsert. Big enough to be a handful of round
+ *  trips over a large mailbox, small enough that one failed chunk loses little. */
+const WRITE_CHUNK = 500;
 
 /**
  * Fetches Gmail + Calendar activity for `youEmail` and writes it into the
@@ -89,10 +110,21 @@ export async function ingestGmailNetwork(
      * from here instead of reading the mailbox a second time.
      */
     onActivity?: (activity: GmailActivity) => void;
+    /** Progress through the graph write, for callers showing a live status. */
+    onWriteProgress?: (written: number, total: number) => void;
+    /** Progress through the mailbox read — the longest and most paced phase. */
+    onReadProgress?: ReadProgress;
+    /**
+     * Wall-clock ceiling for the whole ingest, as epoch ms. Past it the run stops and
+     * returns `truncated: true` rather than continuing into a caller that has already
+     * run out of time to report the result.
+     */
+    deadline?: Deadline;
   } = {},
 ): Promise<IngestSummary> {
-  const { onContact, onActivity } = opts;
+  const { onContact, onActivity, onWriteProgress, onReadProgress, deadline } = opts;
   const you = youEmail.toLowerCase();
+  const outOfTime = () => deadline !== undefined && Date.now() >= deadline;
 
   // Surface each real correspondent the moment its header batch arrives, so the
   // onboarding screen can stream names in during the fetch rather than staring at a
@@ -112,7 +144,7 @@ export async function ingestGmailNetwork(
       }
     : undefined;
 
-  const activity = await fetchGmailActivity(accessToken, onBatch);
+  const activity = await fetchGmailActivity(accessToken, onBatch, deadline, onReadProgress);
   const { headers, events } = activity;
   onActivity?.(activity);
 
@@ -159,58 +191,161 @@ export async function ingestGmailNetwork(
   let entitiesTouched = 0;
   let edgesWritten = 0;
   let claimsWritten = 0;
+  let truncated = false;
   const failures: string[] = [];
 
-  for (const [email, c] of contacts.entries()) {
+  const entries = [...contacts.entries()];
+  const total = entries.length;
+  onWriteProgress?.(0, total);
+
+  /**
+   * Everything below is written in bulk, and that is the difference between an ingest
+   * that finishes and one that gets killed.
+   *
+   * It used to be a loop over contacts doing six sequential Supabase round trips each —
+   * resolve, claim email, claim name, project the display name (two more), upsert the
+   * edge. At a wholly ordinary ~50ms per trip that is ~300ms per contact, so a mailbox
+   * with a thousand correspondents spent five minutes here on its own, after a paced
+   * Gmail read that had already taken over a minute. The route's ceiling is 300s. It
+   * never stood a chance, and because the write is incremental the user was left with a
+   * half-built graph and a spinner that never resolved.
+   *
+   * Same rows, same conflict keys, same append-only claim semantics — a few round trips
+   * per five hundred contacts instead of six per contact.
+   */
+
+  // One query for every email already in the graph, instead of one lookup per contact.
+  const emailIndex = await loadEmailIndex(client);
+
+  const known = new Map<string, string>();
+  const missing: string[] = [];
+  for (const [email] of entries) {
+    const existing = emailIndex.get(email);
+    if (existing) known.set(email, existing);
+    else missing.push(email);
+  }
+
+  // Create the entities that do not exist yet, then immediately claim their addresses.
+  // The claim is not optional: an entity with no email claim cannot be resolved, so the
+  // next ingest makes a second one for the same person — the split-identity bug called
+  // out in findOrCreateEntity.
+  for (let i = 0; i < missing.length; i += WRITE_CHUNK) {
+    const chunk = missing.slice(i, i + WRITE_CHUNK);
     try {
-      const entityId = await findOrCreateEntity(client, { kind: "person", matchHint: { email } });
-      await writeClaim(client, {
-        subjectId: entityId,
-        attribute: "email",
-        value: email,
-        source: `gmail:${you}`,
-        method: "inferred",
-        confidence: 0.9,
-        observedAt: new Date(c.lastInteractionAt).toISOString(),
-      });
-      if (c.name && c.name !== email) {
-        await writeClaim(client, {
+      const ids = await createPersonEntities(client, chunk.length);
+      const identityClaims: ClaimInput[] = [];
+      chunk.forEach((email, index) => {
+        const entityId = ids[index];
+        if (!entityId) return;
+        known.set(email, entityId);
+        identityClaims.push({
           subjectId: entityId,
-          attribute: "name",
-          value: c.name,
-          source: `gmail:${you}`,
-          method: "inferred",
-          confidence: 0.7,
-          observedAt: new Date(c.lastInteractionAt).toISOString(),
+          attribute: "email",
+          value: email,
+          source: "identity",
+          method: "self_reported",
+          confidence: 1,
+          observedAt: new Date().toISOString(),
+          evidence: "Address this entity was created from.",
         });
+      });
+      const { failed } = await writeClaims(client, identityClaims);
+      for (const f of failed) {
+        // An unclaimed new entity is worse than no entity: drop it from this run so the
+        // next one resolves the address properly instead of writing to a ghost.
+        const email = f.input.value as string;
+        known.delete(email);
+        failures.push(`${email}: could not claim address — ${f.error}`);
       }
-      await projectDisplayName(client, entityId);
-
-      const rawScore = c.emailCount + c.meetingCount * MEETING_WEIGHT;
-      const strength = Math.min(1, rawScore * recencyWeight(c.lastInteractionAt));
-      const { error: edgeError } = await client.from("edges").upsert(
-        {
-          from_id: yourEntityId,
-          to_id: entityId,
-          kind: "knows",
-          strength,
-          source: `gmail:${you}`,
-          observed_at: new Date(c.lastInteractionAt).toISOString(),
-        },
-        { onConflict: "from_id,to_id,kind,source" },
-      );
-      if (edgeError) throw new Error(edgeError.message);
-
-      entitiesTouched += 1;
-      edgesWritten += 1;
-      claimsWritten += c.name && c.name !== email ? 2 : 1;
     } catch (err) {
-      // One bad contact must not abort the rest of the sync — same posture as
-      // intro-flow.ts's send batch: a malformed header shouldn't cost every
-      // other contact in the same run its claims/edge.
-      failures.push(`${email}: ${err instanceof Error ? err.message : String(err)}`);
+      for (const email of chunk) {
+        failures.push(`${email}: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
 
-  return { entitiesTouched, edgesWritten, claimsWritten, failures };
+  // The observation claims for this run, and the edges. Built in memory, written in
+  // chunks, and counted only for contacts that actually have an entity to hang off.
+  const observationClaims: ClaimInput[] = [];
+  const edgeRows: Record<string, unknown>[] = [];
+
+  for (const [email, c] of entries) {
+    const entityId = known.get(email);
+    if (!entityId) continue;
+    const observedAt = new Date(c.lastInteractionAt).toISOString();
+
+    observationClaims.push({
+      subjectId: entityId,
+      attribute: "email",
+      value: email,
+      source: `gmail:${you}`,
+      method: "inferred",
+      confidence: 0.9,
+      observedAt,
+    });
+    if (c.name && c.name !== email) {
+      observationClaims.push({
+        subjectId: entityId,
+        attribute: "name",
+        value: c.name,
+        source: `gmail:${you}`,
+        method: "inferred",
+        confidence: 0.7,
+        observedAt,
+      });
+    }
+
+    const rawScore = c.emailCount + c.meetingCount * MEETING_WEIGHT;
+    edgeRows.push({
+      from_id: yourEntityId,
+      to_id: entityId,
+      kind: "knows",
+      strength: Math.min(1, rawScore * recencyWeight(c.lastInteractionAt)),
+      source: `gmail:${you}`,
+      observed_at: observedAt,
+    });
+    entitiesTouched += 1;
+  }
+
+  for (let i = 0; i < observationClaims.length; i += WRITE_CHUNK) {
+    // A chunk that fails degrades to per-row inserts inside writeClaims, so one bad
+    // value costs itself and not the other 499 — the posture the serial loop had.
+    const { written, failed } = await writeClaims(
+      client,
+      observationClaims.slice(i, i + WRITE_CHUNK),
+    );
+    claimsWritten += written.length;
+    for (const f of failed) failures.push(`${String(f.input.value)}: ${f.error}`);
+  }
+
+  for (let i = 0; i < edgeRows.length; i += WRITE_CHUNK) {
+    const chunk = edgeRows.slice(i, i + WRITE_CHUNK);
+    const { error } = await client
+      .from("edges")
+      .upsert(chunk, { onConflict: "from_id,to_id,kind,source" });
+    if (error) {
+      failures.push(`edges chunk at ${i}: ${error.message}`);
+    } else {
+      edgesWritten += chunk.length;
+    }
+    onWriteProgress?.(Math.min(i + chunk.length, total), total);
+    if (outOfTime()) {
+      truncated = true;
+      failures.push("stopped early: ran out of time before every edge was written");
+      break;
+    }
+  }
+
+  // Last, and in bulk: the denormalised display name. Skipping the rows that already
+  // agree with their claims makes a re-ingest nearly free here.
+  try {
+    await projectDisplayNames(client, [...known.values()]);
+  } catch (err) {
+    // A stale display_name is cosmetic and rebuildable from claims at any time; it must
+    // not cost the run the graph it just wrote.
+    failures.push(`display names: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  onWriteProgress?.(total, total);
+  return { entitiesTouched, edgesWritten, claimsWritten, failures, truncated };
 }
