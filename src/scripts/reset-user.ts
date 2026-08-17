@@ -28,7 +28,7 @@
  *   npm run reset:user -- --email someone@example.com --yes
  */
 import { supabase } from "../lib/supabase";
-import { findEntityIdByEmail } from "../lib/claims";
+import { deleteClaimsForSubject, findEntityIdByEmail } from "../lib/claims";
 
 function argValue(flag: string): string | undefined {
   const index = process.argv.indexOf(flag);
@@ -103,7 +103,11 @@ async function resetOne(email: string, dryRun: boolean) {
   );
   // Claims before the entity: the FK points this way, and an orphaned claim would keep
   // the address resolvable to a row that no longer exists.
-  fail("claims", (await supabase.from("claims").delete().eq("subject_id", entityId)).error);
+  try {
+    await deleteClaimsForSubject(supabase, entityId);
+  } catch (err) {
+    console.error(`  ! claims: ${err instanceof Error ? err.message : String(err)}`);
+  }
   fail("edges (from)", (await supabase.from("edges").delete().eq("from_id", entityId)).error);
   fail("edges (to)", (await supabase.from("edges").delete().eq("to_id", entityId)).error);
   fail("entities", (await supabase.from("entities").delete().eq("id", entityId)).error);

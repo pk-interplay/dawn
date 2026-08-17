@@ -205,6 +205,33 @@ export async function findEntityIdByEmail(
 }
 
 /**
+ * Hard-delete every claim about one subject. Reset paths only.
+ *
+ * This breaks the append-only invariant on purpose, and it is the single exception:
+ * retiring a fact a user no longer wants asserted is `supersedeClaims`, which keeps the
+ * row and records what replaced it. This is for removing an *account* — the person is
+ * leaving the graph entirely, and leaving their claims behind would keep their address
+ * resolvable to an entity that no longer exists, which is how the split-identity bug in
+ * findOrCreateEntity starts.
+ *
+ * It lives here rather than in the script that needs it because the CI guard means every
+ * `claims` access does, and a delete is exactly the kind of operation that should be
+ * visible next to the invariant it suspends.
+ */
+export async function deleteClaimsForSubject(
+  client: SupabaseClient,
+  subjectId: string,
+): Promise<number> {
+  const { data, error } = await client
+    .from("claims")
+    .delete()
+    .eq("subject_id", subjectId)
+    .select("id");
+  if (error) throw new Error(`deleteClaimsForSubject failed: ${error.message}`);
+  return (data ?? []).length;
+}
+
+/**
  * Every email → entity mapping currently live in the graph, as one query.
  *
  * The bulk form of findEntityIdByEmail, and it exists because the per-email form does
