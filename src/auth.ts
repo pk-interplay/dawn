@@ -68,9 +68,25 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
       authorization: {
         params: {
-          // access_type=offline gets a refresh token back. Deliberately no
-          // `prompt: "consent"` — Google already re-shows consent on its own
-          // when a sign-in requests scopes beyond what was previously granted.
+          // access_type=offline gets a refresh token back, but only on the FIRST
+          // authorization for a given user — after that Google returns an access
+          // token alone unless consent is re-requested explicitly.
+          //
+          // This file used to omit `prompt: "consent"`, reasoning that Google
+          // re-shows consent by itself when a sign-in asks for scopes beyond what
+          // was already granted. True, and beside the point: the case that breaks
+          // is re-auth with *unchanged* scopes — a second device, a cleared cookie
+          // jar, a fresh session. There Google returns no refresh token, the jwt
+          // callback below has none to store, and an hour later the access token
+          // expires with nothing to renew it from. The user is told to sign in
+          // again, does, and lands in exactly the same state: a loop only a manual
+          // revoke in Google account settings escapes, which no user will find.
+          //
+          // prompt=consent makes Google reissue a refresh token on every
+          // authorization. The cost is a consent screen at each sign-in rather than
+          // just the first — the right trade for an app whose whole function is
+          // offline access to the mailbox.
+          prompt: "consent",
           access_type: "offline",
           scope: GOOGLE_SCOPES.join(" "),
         },
@@ -89,7 +105,12 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         // is the stable Google account id (profile.sub) — pin to that.
         if (account.providerAccountId) token.sub = account.providerAccountId;
         token.accessToken = account.access_token;
-        token.refreshToken = account.refresh_token;
+        // Never overwrite a good refresh token with undefined. prompt=consent above
+        // means Google should always send one, but a provider that declines to (or a
+        // future change to those params) would otherwise silently erase the only
+        // credential that can renew access — and the erasure is unrecoverable from
+        // the user's side. Keep whatever we already had.
+        token.refreshToken = account.refresh_token ?? token.refreshToken;
         token.expiresAt = account.expires_at;
 
         // Claim the caller's entity and stamp it with this Google id, so

@@ -2,7 +2,7 @@ import { streamObject } from "ai";
 import { anthropic } from "@ai-sdk/anthropic";
 import { z } from "zod";
 
-import { fetchRecentGmailHeaders, fetchRecentCalendarEvents } from "./gmail-ingest";
+import { fetchGmailActivity, type GmailActivity } from "./gmail-ingest";
 import { parseAddress, splitAddresses } from "./network-ingest";
 import { domainOf, GENERIC_DOMAINS } from "./domains";
 
@@ -113,13 +113,18 @@ export async function synthesizeProfile(opts: {
    * stream the profile in rather than holding a spinner over the whole generation.
    */
   onPartial?: (draft: PartialProfileDraft) => void;
+  /**
+   * An already-performed mailbox read to synthesize from. Pass this whenever the
+   * caller has just ingested the same six months (the onboarding route has): Gmail's
+   * quota is 15,000 units per minute *per user* and one full read is most of it, so
+   * reading twice in one request is what trips the 403. Omitted, we read the mailbox
+   * ourselves — the regenerate path, where nothing was fetched beforehand.
+   */
+  activity?: GmailActivity;
 }): Promise<SynthesisResult> {
   const you = opts.email.trim().toLowerCase();
 
-  const [headers, events] = await Promise.all([
-    fetchRecentGmailHeaders(opts.accessToken),
-    fetchRecentCalendarEvents(opts.accessToken),
-  ]);
+  const { headers, events } = opts.activity ?? (await fetchGmailActivity(opts.accessToken));
 
   // Outbound only. Inbound subject lines describe what other people want, and a
   // profile built from your inbox reads like a profile of everyone who emails you.

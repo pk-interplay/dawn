@@ -5,7 +5,10 @@ import { ingestGmailNetwork } from "../../../../src/lib/network-ingest";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+// Same shape of work as /api/onboarding/ingest, so the same ceiling. Gmail's
+// per-minute quota (see gmail-ingest.ts) paces a six-month read over minutes, not
+// seconds; 60s could not finish a large mailbox even before that pacing existed.
+export const maxDuration = 300;
 
 /**
  * Nexus v0.2 build step 2 (SPEC.md §7 step 2). Adapted from nexus's
