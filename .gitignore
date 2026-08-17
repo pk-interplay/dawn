@@ -11,3 +11,6 @@ supabase/.temp/
 .claude/settings.local.json
 .vercel
 .env*
+
+# macOS Finder metadata.
+.DS_Store
