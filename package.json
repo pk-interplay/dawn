@@ -17,6 +17,7 @@
     "backfill:entities": "tsx src/scripts/backfill-entities-from-people.ts",
     "summarize:entities": "tsx src/scripts/summarize-entities.ts",
     "resync:profiles": "tsx src/scripts/resync-profiles.ts",
+    "reset:graph": "tsx src/scripts/reset-graph.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:eval": "vitest run --mode eval --include 'src/**/*.eval.test.ts'",

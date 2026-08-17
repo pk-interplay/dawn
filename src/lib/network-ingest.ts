@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { fetchRecentCalendarEvents, fetchRecentGmailHeaders, type GmailHeaderSet } from "./gmail-ingest";
+import { fetchGmailActivity, type GmailActivity, type GmailHeaderSet } from "./gmail-ingest";
 import { findOrCreateEntity, projectDisplayName, writeClaim } from "./claims";
 
 /**
@@ -80,8 +80,18 @@ export async function ingestGmailNetwork(
   client: SupabaseClient,
   accessToken: string,
   youEmail: string,
-  onContact?: (contact: { name: string; email: string }) => void,
+  opts: {
+    onContact?: (contact: { name: string; email: string }) => void;
+    /**
+     * Handed the mailbox read this ingest just performed. Gmail's per-minute quota
+     * is per user, and a six-month read is most of that minute — so a caller that
+     * also needs the same headers (profile synthesis, right after this) takes them
+     * from here instead of reading the mailbox a second time.
+     */
+    onActivity?: (activity: GmailActivity) => void;
+  } = {},
 ): Promise<IngestSummary> {
+  const { onContact, onActivity } = opts;
   const you = youEmail.toLowerCase();
 
   // Surface each real correspondent the moment its header batch arrives, so the
@@ -102,10 +112,9 @@ export async function ingestGmailNetwork(
       }
     : undefined;
 
-  const [headers, events] = await Promise.all([
-    fetchRecentGmailHeaders(accessToken, onBatch),
-    fetchRecentCalendarEvents(accessToken),
-  ]);
+  const activity = await fetchGmailActivity(accessToken, onBatch);
+  const { headers, events } = activity;
+  onActivity?.(activity);
 
   const contacts = new Map<string, ContactAccum>();
 

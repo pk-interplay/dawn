@@ -4,6 +4,7 @@ import { auth } from "../../../../src/auth";
 import { supabase } from "../../../../src/lib/supabase";
 import { ensureViewerEntity } from "../../../../src/lib/entity-identity";
 import { ingestGmailNetwork } from "../../../../src/lib/network-ingest";
+import type { GmailActivity } from "../../../../src/lib/gmail-ingest";
 import {
   synthesizeProfile,
   describeEvidence,
@@ -66,12 +67,21 @@ export async function POST() {
       // — and the part with no model call in it. Each unique correspondent is streamed
       // out as it is discovered; the client renders them as they arrive.
       let ingest;
+      // The mailbox read the ingest performs, handed straight to synthesis below.
+      // Gmail's quota is 15,000 units per minute per *user* and one six-month read is
+      // most of that, so reading it twice in one request 403s on the second pass.
+      let activity: GmailActivity | undefined;
       try {
         const seen = new Set<string>();
-        ingest = await ingestGmailNetwork(supabase, accessToken, viewer.email, (contact) => {
-          if (seen.has(contact.email)) return;
-          seen.add(contact.email);
-          send({ type: "contact", name: contact.name, email: contact.email });
+        ingest = await ingestGmailNetwork(supabase, accessToken, viewer.email, {
+          onContact: (contact) => {
+            if (seen.has(contact.email)) return;
+            seen.add(contact.email);
+            send({ type: "contact", name: contact.name, email: contact.email });
+          },
+          onActivity: (fetched) => {
+            activity = fetched;
+          },
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : "Gmail ingest failed";
@@ -91,6 +101,7 @@ export async function POST() {
           accessToken,
           email: viewer.email,
           name,
+          activity,
           // Both of these exist to fill the synthesis wait with the real thing. The
           // evidence counts land the moment they're known; the draft streams in field
           // by field as Sonnet writes it, so the review screen assembles in front of
