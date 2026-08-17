@@ -121,8 +121,16 @@ function Hero() {
       {/* Carried over from the old signed-out home screen. Whatever else the pitch
           says, the visitor is about to hand over Gmail access, so what Dawn reads
           belongs next to the button that asks for it. */}
+      {/* The privacy link belongs on this line rather than only in the footer: it is
+          the sentence that makes the claim the policy has to back up. */}
       <p className="max-w-[80vw] text-[13px] text-muted-foreground">
-        Maps your network from who you email and meet — metadata only, never message content.
+        Maps your network from who you email and meet — metadata only, never message content.{" "}
+        <Link
+          href="/privacy"
+          className="underline underline-offset-4 transition-colors hover:text-dawn-bone"
+        >
+          Privacy Policy
+        </Link>
       </p>
     </section>
   );
@@ -214,6 +222,14 @@ function SiteFooter() {
       <div className="flex items-center gap-1.5 text-muted-foreground">
         <Link href="/" className="transition-colors hover:text-dawn-bone">
           Home
+        </Link>
+        <span aria-hidden>·</span>
+        <Link href="/privacy" className="transition-colors hover:text-dawn-bone">
+          Privacy
+        </Link>
+        <span aria-hidden>·</span>
+        <Link href="/terms" className="transition-colors hover:text-dawn-bone">
+          Terms
         </Link>
         <span aria-hidden>·</span>
         <form action={startGoogleSignIn} className="inline">
