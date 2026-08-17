@@ -1,6 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { QuotaWindow, RunBudget, classifyGoogleFailure } from "./gmail-ingest";
+import {
+  QuotaWindow,
+  RunBudget,
+  classifyGoogleFailure,
+  fetchRecentGmailHeaders,
+} from "./gmail-ingest";
 
 /**
  * These two pieces are why a six-month ingest survives Gmail's per-minute quota, and
@@ -113,5 +118,88 @@ describe("RunBudget", () => {
 
   it("defaults to the documented 15,000-unit ceiling", () => {
     expect(new RunBudget().remaining()).toBe(15_000);
+  });
+});
+
+/**
+ * The retry itself, driven through the public entry point with `fetch` stubbed.
+ *
+ * This is the bug that caused the original outage, and a real run can't be relied
+ * on to reproduce it — the measured ingest spent 2,955 of 15,000 units and never
+ * came close to a rejection. Stubbing the transport is the only way to prove the
+ * quota 403 is retried rather than raised.
+ */
+describe("googleFetch retry behaviour (via fetchRecentGmailHeaders)", () => {
+  const QUOTA_403 = JSON.stringify({
+    error: {
+      code: 403,
+      message: "Quota exceeded for quota metric 'Queries' and limit 'Queries per minute per user'",
+      errors: [{ domain: "usageLimits", reason: "rateLimitExceeded" }],
+      status: "PERMISSION_DENIED",
+    },
+  });
+
+  const SCOPE_403 = JSON.stringify({
+    error: {
+      code: 403,
+      message: "Request had insufficient authentication scopes.",
+      errors: [{ domain: "global", reason: "insufficientPermissions" }],
+      status: "PERMISSION_DENIED",
+    },
+  });
+
+  /** Queues canned responses; each fetch call shifts the next one off the front. */
+  function stubFetch(responses: { status: number; body: string }[]) {
+    const calls: string[] = [];
+    const impl = vi.fn(async (url: string | URL) => {
+      calls.push(String(url));
+      const next = responses.shift() ?? { status: 200, body: JSON.stringify({ messages: [] }) };
+      return {
+        ok: next.status >= 200 && next.status < 300,
+        status: next.status,
+        headers: { get: () => null },
+        text: async () => next.body,
+        json: async () => JSON.parse(next.body),
+      };
+    });
+    vi.stubGlobal("fetch", impl);
+    return { impl, calls };
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("retries a quota 403 and completes the run", async () => {
+    // Fake timers so the deliberate multi-second quota backoff doesn't make the
+    // suite wait it out. QuotaWindow reads Date.now(), which vitest also fakes, so
+    // the pause and the sleep advance together.
+    vi.useFakeTimers();
+    const { impl } = stubFetch([
+      { status: 403, body: QUOTA_403 }, // first list call is rejected on quota
+      { status: 200, body: JSON.stringify({ messages: [] }) }, // retry succeeds
+    ]);
+
+    // A token unique to this test: quota windows are cached per token at module
+    // scope, so sharing one would leak this test's pause into the next.
+    const pending = fetchRecentGmailHeaders("test-token-quota-retry", undefined, new RunBudget());
+    await vi.advanceTimersByTimeAsync(60_000);
+    const headers = await pending;
+
+    expect(headers).toEqual([]);
+    // The rejected call plus its retry, then the received-mail list.
+    expect(impl.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("raises a scope 403 immediately without retrying", async () => {
+    const { impl } = stubFetch([{ status: 403, body: SCOPE_403 }]);
+
+    await expect(
+      fetchRecentGmailHeaders("test-token-scope-403", undefined, new RunBudget()),
+    ).rejects.toThrow(/403/);
+
+    // Terminal means terminal: one attempt, no backoff, no second call.
+    expect(impl).toHaveBeenCalledTimes(1);
   });
 });
