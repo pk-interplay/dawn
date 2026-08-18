@@ -1,6 +1,8 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import Anthropic from "@anthropic-ai/sdk";
+import { z } from "zod";
 import { anthropic, textOf } from "./anthropic";
+import { callClaude, MODELS } from "./llm";
 import type { MatchDirection, Person } from "./types";
 import { MEETING_FORMATS, type MeetingFormat } from "../../lib/onboarding";
 // Every send in this file goes through the gateway, which owns suppression, consent,
@@ -11,7 +13,7 @@ import { MEETING_FORMATS, type MeetingFormat } from "../../lib/onboarding";
 import {
   AGENTMAIL_INBOX_ID,
   send as sendViaGateway,
-  type SendResult,
+  type DeliveryResult,
 } from "./send-gateway";
 
 // Orchestrates the double opt-in introduction lifecycle on top of a `matches`
@@ -20,7 +22,7 @@ import {
 // as a durable `relationship` with proximity signal. Designed to be called from
 // the cron routes (Node) so it reuses the app's Anthropic/Supabase clients.
 
-const MODEL = "claude-opus-4-8";
+const MODEL = MODELS.intro;
 
 // Single-sided testing mode auto-opts-in person B so the flow can reach scheduling
 // with one real inbox. It must be opted INTO: the previous `!== "false"` default
@@ -108,23 +110,36 @@ const DRAFT_EMAIL_TOOL: Anthropic.Messages.Tool = {
   },
 };
 
+// The forced tool's input, validated rather than cast — a missing/empty field
+// here would otherwise become an email with an empty subject or body.
+const DraftedEmailSchema = z.object({ subject: z.string().min(1), body: z.string().min(1) });
+
 async function draftEmail(system: string, user: string): Promise<{ subject: string; body: string } | null> {
   try {
-    const resp = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: 900,
-      system,
-      tools: [DRAFT_EMAIL_TOOL],
-      tool_choice: { type: "tool", name: "draft_email" },
-      messages: [{ role: "user", content: user }],
-    });
-    const tool = resp.content.find(
-      (b): b is Anthropic.Messages.ToolUseBlock => b.type === "tool_use" && b.name === "draft_email",
+    return await callClaude(
+      () =>
+        anthropic.messages.create({
+          model: MODEL,
+          max_tokens: 900,
+          system,
+          tools: [DRAFT_EMAIL_TOOL],
+          tool_choice: { type: "tool", name: "draft_email" },
+          messages: [{ role: "user", content: user }],
+        }),
+      (resp) => {
+        const tool = resp.content.find(
+          (b): b is Anthropic.Messages.ToolUseBlock => b.type === "tool_use" && b.name === "draft_email",
+        );
+        if (!tool) throw new Error("no draft_email tool_use block in response");
+        return DraftedEmailSchema.parse(tool.input);
+      },
+      { label: "[draftEmail]", attempts: 3, retryParse: true },
     );
-    if (!tool) return null;
-    const { subject, body } = tool.input as { subject: string; body: string };
-    return { subject, body };
-  } catch {
+  } catch (err) {
+    // The deterministic template fallback is SAFE here (unlike parseReplyIntent's
+    // old regex): worse copy, not a wrong consent decision. But it must not be
+    // silent — a total model outage otherwise looks like normal operation.
+    console.warn(`[draftEmail] falling back to template:`, err instanceof Error ? err.message : err);
     return null;
   }
 }
@@ -451,7 +466,43 @@ export interface ReplyContext {
   inIntroduction?: boolean;
   /** Who Dawn suggested, so the model can tell "not them" from "not now". */
   suggestedName?: string | null;
+  /** Epoch-ms budget for the classification retries. Defaults to now + 90s,
+   *  which sits inside the inbound route's 120s maxDuration. */
+  deadline?: number;
 }
+
+/**
+ * What the prompt is allowed to carry. Inbound bodies are unbounded — a forwarded
+ * 40-message thread or a newsletter would otherwise become an unbounded Opus
+ * prompt on the product's highest-volume LLM surface. The full text is still
+ * stored (messages/inbound_events); only the prompt is clipped.
+ */
+const MAX_REPLY_CHARS = 8_000;
+
+function clipReply(text: string): string {
+  return text.length <= MAX_REPLY_CHARS ? text : text.slice(0, MAX_REPLY_CHARS) + "\n[truncated]";
+}
+
+/** Runtime validation of the model's JSON — the schema alone doesn't survive
+ *  transport, and unguarded casts are how `undefined` reaches the DB writes. */
+const ReplyIntentSchema = z.object({
+  opted_in: z.enum(["yes", "no", "unclear"]),
+  proposed_times: z.array(z.string()).default([]),
+  chosen_time: z.string().nullable().default(null),
+  summary: z.string().default(""),
+  decline_reason: z.string().nullable().default(null),
+  preference_signals: z
+    .array(
+      z.object({
+        kind: z.enum(PREFERENCE_KINDS),
+        value: z.string(),
+        confidence: z.number(),
+      }),
+    )
+    .default([]),
+  requests_pause: z.boolean().default(false),
+  off_topic: z.boolean().default(false),
+});
 
 /**
  * One model call classifies the whole reply: the state-machine fields the intro
@@ -470,19 +521,24 @@ export async function parseReplyIntent(
       }.`
     : `This reply did NOT arrive inside a live introduction thread.`;
 
+  const clipped = clipReply(replyText);
+  const deadline = context.deadline ?? Date.now() + 90_000;
+
   try {
-    const resp = await anthropic.messages.create(
-      {
-        model: MODEL,
-        max_tokens: 900,
-        output_config: { format: { type: "json_schema", schema: INTENT_SCHEMA } },
-        messages: [
+    return await callClaude(
+      () =>
+        anthropic.messages.create(
           {
-            role: "user",
-            content:
-              `Someone emailed Dawn, a professional-networking agent that proposes introductions. Classify their message.\n\n` +
-              `${contextLine}\n\n` +
-              `Message:\n"""${replyText}"""\n\n` +
+            model: MODEL,
+            max_tokens: 900,
+            output_config: { format: { type: "json_schema", schema: INTENT_SCHEMA } },
+            messages: [
+              {
+                role: "user",
+                content:
+                  `Someone emailed Dawn, a professional-networking agent that proposes introductions. Classify their message.\n\n` +
+                  `${contextLine}\n\n` +
+                  `Message:\n"""${clipped}"""\n\n` +
               `opted_in: "yes" if they're clearly open to the intro/meeting, "no" if declining, "unclear" otherwise.\n` +
               `proposed_times: any specific times THEY suggested. chosen_time: the single time they picked from options offered, else null.\n` +
               `summary: one short sentence.\n` +
@@ -492,40 +548,44 @@ export async function parseReplyIntent(
               `"format" describes how they like to meet; "intro_style" describes how they want Dawn to approach them. ` +
               `Only include something that would still be true next month — a reaction to this one person is not a preference. ` +
               `Set confidence near 1.0 when they stated it outright and near 0.3 when you are inferring it. Return an empty array if nothing durable was said.\n` +
-              `requests_pause: true if they want Dawn to stop emailing them, unsubscribe, or take a break.\n` +
-              `off_topic: true if they are asking Dawn for something outside proposing and coordinating introductions — general questions, research, advice, or an open request to be introduced to someone unspecified.`,
+                  `requests_pause: true if they want Dawn to stop emailing them, unsubscribe, or take a break.\n` +
+                  `off_topic: true if they are asking Dawn for something outside proposing and coordinating introductions — general questions, research, advice, or an open request to be introduced to someone unspecified.`,
+              },
+            ],
           },
-        ],
+          { timeout: 30_000 },
+        ),
+      (resp) => {
+        const parsed = ReplyIntentSchema.parse(JSON.parse(textOf(resp)));
+        // Filter dubious signals even after validation: an empty value is schema-
+        // legal but useless downstream.
+        return {
+          ...parsed,
+          preference_signals: parsed.preference_signals.filter((s) => s.value.trim()),
+        };
       },
-      { timeout: 30_000 },
+      { label: "[parseReplyIntent]", attempts: 3, retryParse: true, deadline },
     );
-    const parsed = JSON.parse(textOf(resp)) as ReplyIntent;
-    // The model can still omit array/boolean fields; normalise so callers and the
-    // DB writes downstream never see undefined.
+  } catch (err) {
+    // Final failure after retries. This used to fall into a regex where any reply
+    // containing "coffee" or "meet" registered as an OPT-IN — during an Anthropic
+    // outage, every inbound message was classified by keyword and a third party
+    // could get emailed off the back of a 529. A rate limit is not consent:
+    // "unclear" flows through advanceOnReply as a noop, the introduction's
+    // next_action_at stays armed, and the nudge sweep revisits it.
+    //
+    // The ONE heuristic kept is the pause detector, because its failure direction
+    // is unsafe the other way — missing an unsubscribe is the harm; a
+    // false-positive pause is recoverable by replying again.
+    console.error(`[parseReplyIntent] LLM classification failed after retries; treating as unclear:`, err);
     return {
-      ...parsed,
-      proposed_times: parsed.proposed_times ?? [],
-      preference_signals: (parsed.preference_signals ?? []).filter(
-        (s) => s && PREFERENCE_KINDS.includes(s.kind) && typeof s.value === "string" && s.value.trim(),
-      ),
-      decline_reason: parsed.decline_reason ?? null,
-      requests_pause: Boolean(parsed.requests_pause),
-      off_topic: Boolean(parsed.off_topic),
-    };
-  } catch {
-    // Heuristic fallback so the flow never dead-ends. It cannot infer preferences,
-    // so it returns none rather than guessing — a wrong belief is worse than none.
-    const yes = /\b(yes|sure|sounds good|love to|happy to|let's|coffee|meet)\b/i.test(replyText);
-    const no = /\b(no|not interested|pass|decline|can't|cannot)\b/i.test(replyText);
-    const pause = /\b(unsubscribe|stop emailing|stop sending|opt out|take me off|pause)\b/i.test(replyText);
-    return {
-      opted_in: no ? "no" : yes ? "yes" : "unclear",
+      opted_in: "unclear",
       proposed_times: [],
       chosen_time: null,
-      summary: "Heuristic classification (LLM parse unavailable).",
+      summary: "Classifier unavailable after retries; leaving this reply unprocessed.",
       decline_reason: null,
       preference_signals: [],
-      requests_pause: pause,
+      requests_pause: /\b(unsubscribe|stop emailing|stop sending|opt out|take me off)\b/i.test(replyText),
       off_topic: false,
     };
   }
@@ -805,7 +865,11 @@ export async function startIntroduction(
   // an email that was never sent — and the unsubscribe footer is the one part you
   // most need to be able to prove you included.
   const outgoing = withUnsubscribe(draft.body);
-  let send: SendResult = { messageId: null, threadId: null, simulated: true };
+  let send: Pick<DeliveryResult, "messageId" | "threadId" | "simulated"> = {
+    messageId: null,
+    threadId: null,
+    simulated: true,
+  };
   let sendError: string | null = null;
   if (helped.email) {
     // The gateway returns rather than throws for ordinary refusals, but it deliberately
@@ -951,26 +1015,51 @@ export async function startIntroduction(
  *
  * Returns whether an email actually went out.
  */
+/**
+ * Ask person B whether they're open to the introduction.
+ *
+ * Returns the gateway's full DeliveryResult (or null when even the conversation
+ * row could not be created) so the CALLER decides what the state machine does —
+ * this function used to collapse everything into one boolean, and the caller
+ * advanced to `b_invited` even when the email never left, which armed the nudge
+ * sweep against a person who had received nothing.
+ */
 async function inviteSecondSide(
   client: SupabaseClient,
   p: { introductionId: string; helped: Party; suggested: Party; rationale: string },
-): Promise<boolean> {
-  const { data: convo, error: cErr } = await client
+): Promise<DeliveryResult | null> {
+  // Reuse B's conversation when one already exists — the sweep retries this call
+  // after a failed send, and every retry minting a fresh conversation would leave
+  // duplicates for the inbound thread-matcher to trip over.
+  const { data: existing } = await client
     .from("conversations")
-    .insert({
-      introduction_id: p.introductionId,
-      inbox_id: AGENTMAIL_INBOX_ID,
-      purpose: "opt_in",
-      participants: [
-        { person_id: p.suggested.id, email: p.suggested.email, role: "suggested" },
-        { person_id: p.helped.id, email: p.helped.email, role: "helped" },
-      ],
-    })
-    .select()
-    .single();
-  if (cErr) {
-    warnOnError("conversations insert (second side)", cErr);
-    return false;
+    .select("id")
+    .eq("introduction_id", p.introductionId)
+    .eq("purpose", "opt_in")
+    .contains("participants", [{ person_id: p.suggested.id }])
+    .limit(1)
+    .maybeSingle();
+
+  let convoId = existing?.id as string | undefined;
+  if (!convoId) {
+    const { data: convo, error: cErr } = await client
+      .from("conversations")
+      .insert({
+        introduction_id: p.introductionId,
+        inbox_id: AGENTMAIL_INBOX_ID,
+        purpose: "opt_in",
+        participants: [
+          { person_id: p.suggested.id, email: p.suggested.email, role: "suggested" },
+          { person_id: p.helped.id, email: p.helped.email, role: "helped" },
+        ],
+      })
+      .select()
+      .single();
+    if (cErr) {
+      warnOnError("conversations insert (second side)", cErr);
+      return null;
+    }
+    convoId = convo.id as string;
   }
 
   const draft = await draftSecondSideOptInEmail(p.helped, p.suggested, p.rationale);
@@ -984,36 +1073,36 @@ async function inviteSecondSide(
     text: outgoing,
   });
 
-  warnOnError(
-    "messages insert (second-side opt-in)",
-    (
-      await client.from("messages").insert({
-        conversation_id: convo.id,
-        agentmail_message_id: send.messageId,
-        direction: "outbound",
-        from_email: AGENTMAIL_INBOX_ID,
-        to_emails: p.suggested.email ? [p.suggested.email] : [],
-        subject: draft.subject,
-        body: outgoing,
-      })
-    ).error,
-  );
-  warnOnError(
-    "conversations update (second-side thread id)",
-    (
-      await client
-        .from("conversations")
-        .update({ thread_id: send.threadId, subject: draft.subject, updated_at: nowIso() })
-        .eq("id", convo.id)
-    ).error,
-  );
+  // Only record a message that exists: sent, drafted (deliberately held), or a
+  // duplicate of one already recorded. A FAILED send producing a messages row is
+  // how the flow used to claim emails went out that never did.
+  if (send.status === "sent" || send.status === "draft") {
+    warnOnError(
+      "messages insert (second-side opt-in)",
+      (
+        await client.from("messages").insert({
+          conversation_id: convoId,
+          agentmail_message_id: send.messageId,
+          direction: "outbound",
+          from_email: AGENTMAIL_INBOX_ID,
+          to_emails: p.suggested.email ? [p.suggested.email] : [],
+          subject: draft.subject,
+          body: outgoing,
+        })
+      ).error,
+    );
+    warnOnError(
+      "conversations update (second-side thread id)",
+      (
+        await client
+          .from("conversations")
+          .update({ thread_id: send.threadId, subject: draft.subject, updated_at: nowIso() })
+          .eq("id", convoId)
+      ).error,
+    );
+  }
 
-  // The caller turns this boolean into a human-readable note whose false branch reads
-  // "…has no reachable email address". So the question being answered is specifically
-  // "did we have somewhere to send it", NOT "did it leave the building" — a drafted
-  // message under a closed delivery gate has a perfectly good address and must not be
-  // reported as an unreachable one.
-  return send.failure !== "no_recipient";
+  return send;
 }
 
 // ---- Advance an introduction when a reply arrives (called by /api/agent/inbound)
@@ -1142,12 +1231,69 @@ export async function advanceOnReply(
       // Previously the flow just parked here waiting for a reply from someone who
       // had never received an email, until expire-intros swept it.
       if (isA && intro.b_response === "pending") {
-        const invited = await inviteSecondSide(client, {
+        const invite = await inviteSecondSide(client, {
           introductionId: intro.id,
           helped,
           suggested,
           rationale: intro.rationale ?? "You have overlapping interests.",
         });
+
+        // B can never be reached: no address, or they've opted out entirely.
+        // Retire the introduction instead of advancing — a `b_invited` row with
+        // no email behind it arms the nudge sweep against a person who was never
+        // asked anything.
+        if (invite?.failure === "no_recipient" || invite?.status === "suppressed") {
+          warnOnError(
+            "introductions update (b unreachable)",
+            (
+              await client
+                .from("introductions")
+                .update({
+                  a_response: "yes",
+                  state: "expired",
+                  awaiting: null,
+                  next_action_at: null,
+                  updated_at: nowIso(),
+                })
+                .eq("id", intro.id)
+            ).error,
+          );
+          await closeIntroductionConversations(client, intro.id);
+          return {
+            state: "expired",
+            action: "noop",
+            note: `${helped.name} is in, but ${suggested.name} ${
+              invite?.status === "suppressed" ? "has opted out of Dawn email" : "has no reachable email address"
+            }; retired.`,
+          };
+        }
+
+        // The send itself failed (provider error, rate limit, missing config).
+        // Record A's yes but do NOT advance: the gateway's failed row is
+        // retryable, and the sweep re-runs this invite when the clock comes due.
+        if (!invite || invite.status === "failed") {
+          warnOnError(
+            "introductions update (opt_in_b failed, retry armed)",
+            (
+              await client
+                .from("introductions")
+                .update({
+                  a_response: "yes",
+                  state: "a_opted_in",
+                  awaiting: "b",
+                  next_action_at: dueInDays(0.5),
+                  updated_at: nowIso(),
+                })
+                .eq("id", intro.id)
+            ).error,
+          );
+          return {
+            state: "a_opted_in",
+            action: "opted_in_waiting",
+            note: `${helped.name} is in, but the ask to ${suggested.name} failed to send (${invite?.failure ?? "no conversation"}); will retry.`,
+          };
+        }
+
         warnOnError(
           "introductions update (b_invited)",
           (
@@ -1168,9 +1314,7 @@ export async function advanceOnReply(
         return {
           state: "b_invited",
           action: "invited_second_side",
-          note: invited
-            ? `${helped.name} is in; asked ${suggested.name} if they're open to it.`
-            : `${helped.name} is in, but ${suggested.name} has no reachable email address.`,
+          note: `${helped.name} is in; asked ${suggested.name} if they're open to it.`,
         };
       }
 
@@ -1201,83 +1345,15 @@ export async function advanceOnReply(
     // terminal happy path: Dawn's job was to find the pair and get consent from each
     // side, and it is now done. (It previously proposed times here and stayed in the
     // thread until a booking; see draftWarmIntroEmail for why that changed.)
-    const draft = await draftWarmIntroEmail(
-      client,
+    return sendWarmIntroduction(client, {
+      intro,
       helped,
       suggested,
-      intro.rationale ?? "You have overlapping interests.",
-    );
-    const introBody = withUnsubscribe(draft.body);
-    const recipients = [helped.email, suggested.email].filter((e): e is string => Boolean(e));
-    const send = await sendViaGateway(client, {
-      introductionId: intro.id,
-      kind: "introduction",
-      // Deliberately NOT threaded. AgentMail's reply() takes no recipient list — it
-      // answers whoever sent the parent — so threading here would deliver the
-      // introduction to one side only. A fresh send is the only way to address both
-      // parties.
-      replyToMessageId: null,
-      to: recipients,
-      subject: draft.subject,
-      text: introBody,
+      aResp,
+      bResp,
+      conversationId: args.conversationId,
+      currentState: intro.state as string,
     });
-    warnOnError(
-      "messages insert (warm intro)",
-      (
-        await client.from("messages").insert({
-          conversation_id: args.conversationId,
-          agentmail_message_id: send.messageId,
-          direction: "outbound",
-          from_email: AGENTMAIL_INBOX_ID,
-          to_emails: recipients,
-          subject: draft.subject,
-          body: introBody,
-        })
-      ).error,
-    );
-    warnOnError(
-      "introductions update (introduced)",
-      (
-        await client
-          .from("introductions")
-          .update({
-            a_response: aResp,
-            b_response: bResp,
-            state: "introduced",
-            // Terminal: nobody owes Dawn a reply, so disarm the clock. Leaving a due
-            // time on a finished row is how a sweep ends up nudging people about an
-            // introduction that already happened.
-            awaiting: null,
-            next_action_at: null,
-            updated_at: nowIso(),
-          })
-          .eq("id", intro.id)
-      ).error,
-    );
-    warnOnError(
-      "conversations update (introduced)",
-      (
-        await client
-          .from("conversations")
-          .update({ purpose: "intro", updated_at: nowIso() })
-          .eq("id", args.conversationId)
-      ).error,
-    );
-    // The success signal for the reranker now fires here rather than on a booked
-    // meeting, because there is no longer a booking for Dawn to observe. It is an
-    // honestly weaker proxy for "this was a good match" — both sides said yes, which
-    // is not the same as them getting on — but losing the feedback loop entirely
-    // would be worse. Inferring an actual meeting would need reply detection on the
-    // handed-off thread, which is a later addition.
-    await recordMatchOutcome(client, {
-      matchId: intro.match_id ?? null,
-      aId: intro.person_a_id,
-      bId: intro.person_b_id,
-      status: "accepted",
-    });
-    await closeIntroductionConversations(client, intro.id);
-
-    return { state: "introduced", action: "introduced", note: "Both opted in; sent the introduction." };
   }
 
   // Already scheduling and they picked a time → lock it in.
@@ -1318,6 +1394,180 @@ export async function advanceOnReply(
   return { state: intro.state, action: "noop", note: "No state change (unclear reply)." };
 }
 
+/**
+ * The terminal happy path, extracted so it has exactly two callers: the reply
+ * handler above (both sides just said yes) and the nudge sweep's retry branch
+ * (both said yes earlier but the send failed).
+ *
+ * The state machine only reaches `introduced` when the gateway reports the email
+ * exists — sent, deliberately drafted, or a duplicate of one already recorded.
+ * A FAILED send used to fall straight through: the row went terminal
+ * `introduced`, the match was recorded accepted, and two people who had both
+ * said yes were never introduced, unrecoverably and invisibly.
+ */
+async function sendWarmIntroduction(
+  client: SupabaseClient,
+  p: {
+    intro: {
+      id: string;
+      person_a_id: string;
+      person_b_id: string;
+      match_id?: string | null;
+      rationale?: string | null;
+    };
+    helped: Party;
+    suggested: Party;
+    aResp: string;
+    bResp: string;
+    /** Where to record the outbound message; null on the sweep's retry path. */
+    conversationId: string | null;
+    /** State to KEEP when the send fails and the retry is armed. */
+    currentState: string;
+  },
+): Promise<AdvanceResult> {
+  const { intro, helped, suggested } = p;
+  const draft = await draftWarmIntroEmail(
+    client,
+    helped,
+    suggested,
+    intro.rationale ?? "You have overlapping interests.",
+  );
+  const introBody = withUnsubscribe(draft.body);
+  const recipients = [helped.email, suggested.email].filter((e): e is string => Boolean(e));
+  const send = await sendViaGateway(client, {
+    introductionId: intro.id,
+    kind: "introduction",
+    // Deliberately NOT threaded. AgentMail's reply() takes no recipient list — it
+    // answers whoever sent the parent — so threading here would deliver the
+    // introduction to one side only. A fresh send is the only way to address both
+    // parties.
+    replyToMessageId: null,
+    to: recipients,
+    subject: draft.subject,
+    text: introBody,
+  });
+
+  // Nobody reachable, or somebody opted out. Terminal, but NOT `introduced` and
+  // NOT an accepted-match signal — no introduction happened.
+  if (send.failure === "no_recipient" || send.status === "suppressed") {
+    warnOnError(
+      "introductions update (warm intro unreachable)",
+      (
+        await client
+          .from("introductions")
+          .update({
+            a_response: p.aResp,
+            b_response: p.bResp,
+            state: "expired",
+            awaiting: null,
+            next_action_at: null,
+            updated_at: nowIso(),
+          })
+          .eq("id", intro.id)
+      ).error,
+    );
+    await closeIntroductionConversations(client, intro.id);
+    return {
+      state: "expired",
+      action: "noop",
+      note:
+        send.status === "suppressed"
+          ? "Both opted in, but a recipient has opted out of Dawn email; retired."
+          : "Both opted in, but neither has a reachable address; retired.",
+    };
+  }
+
+  // Provider failure / rate limit / missing config: both consents stand, so keep
+  // the row live and arm a retry. The gateway's failed ledger row is reclaimable,
+  // and nudgeIntroduction's both-in branch re-runs this function when due.
+  if (send.status === "failed") {
+    warnOnError(
+      "introductions update (warm intro failed, retry armed)",
+      (
+        await client
+          .from("introductions")
+          .update({
+            a_response: p.aResp,
+            b_response: p.bResp,
+            state: p.currentState,
+            awaiting: null,
+            next_action_at: dueInDays(0.5),
+            updated_at: nowIso(),
+          })
+          .eq("id", intro.id)
+      ).error,
+    );
+    return {
+      state: p.currentState,
+      action: "noop",
+      note: `Both opted in, but the introduction failed to send (${send.failure}); will retry.`,
+    };
+  }
+
+  // sent | draft | duplicate — the introduction exists.
+  if (p.conversationId && send.status !== "duplicate") {
+    warnOnError(
+      "messages insert (warm intro)",
+      (
+        await client.from("messages").insert({
+          conversation_id: p.conversationId,
+          agentmail_message_id: send.messageId,
+          direction: "outbound",
+          from_email: AGENTMAIL_INBOX_ID,
+          to_emails: recipients,
+          subject: draft.subject,
+          body: introBody,
+        })
+      ).error,
+    );
+  }
+  warnOnError(
+    "introductions update (introduced)",
+    (
+      await client
+        .from("introductions")
+        .update({
+          a_response: p.aResp,
+          b_response: p.bResp,
+          state: "introduced",
+          // Terminal: nobody owes Dawn a reply, so disarm the clock. Leaving a due
+          // time on a finished row is how a sweep ends up nudging people about an
+          // introduction that already happened.
+          awaiting: null,
+          next_action_at: null,
+          updated_at: nowIso(),
+        })
+        .eq("id", intro.id)
+    ).error,
+  );
+  if (p.conversationId) {
+    warnOnError(
+      "conversations update (introduced)",
+      (
+        await client
+          .from("conversations")
+          .update({ purpose: "intro", updated_at: nowIso() })
+          .eq("id", p.conversationId)
+      ).error,
+    );
+  }
+  // The success signal for the reranker now fires here rather than on a booked
+  // meeting, because there is no longer a booking for Dawn to observe. It is an
+  // honestly weaker proxy for "this was a good match" — both sides said yes, which
+  // is not the same as them getting on — but losing the feedback loop entirely
+  // would be worse. Inferring an actual meeting would need reply detection on the
+  // handed-off thread, which is a later addition.
+  await recordMatchOutcome(client, {
+    matchId: intro.match_id ?? null,
+    aId: intro.person_a_id,
+    bId: intro.person_b_id,
+    status: "accepted",
+  });
+  await closeIntroductionConversations(client, intro.id);
+
+  return { state: "introduced", action: "introduced", note: "Both opted in; sent the introduction." };
+}
+
 // ---- Nudge a stalled introduction (called by /api/cron/nudge-intros) --------
 
 export interface NudgeResult {
@@ -1350,6 +1600,119 @@ export async function nudgeIntroduction(
     .single();
   if (!intro) {
     return { introductionId, action: "skipped", side: null, attempt: 0, note: "introduction not found" };
+  }
+
+  // ---- Recovery: consented work whose SEND failed --------------------------
+  // These two branches exist because the gateway reports failures as values and
+  // the state machine now refuses to advance past a failed send. The sweep is
+  // what picks the work back up when the retry clock comes due.
+
+  // Both said yes but the warm introduction never went out. Not a nudge —
+  // nobody owes a reply — so re-run the terminal send itself. The gateway's
+  // failed ledger row is reclaimable, so this cannot double-deliver.
+  const TERMINAL_STATES = ["introduced", "scheduled", "declined", "expired"];
+  if (
+    intro.a_response === "yes" &&
+    intro.b_response === "yes" &&
+    !TERMINAL_STATES.includes(intro.state)
+  ) {
+    const { data: pair } = await client
+      .from("people")
+      .select("id, name, email, headline, timezone")
+      .in("id", [intro.person_a_id, intro.person_b_id]);
+    const byId = new Map((pair ?? []).map((p) => [p.id, p as Party]));
+    const helped = byId.get(intro.person_a_id);
+    const suggested = byId.get(intro.person_b_id);
+    if (!helped || !suggested) {
+      return { introductionId, action: "skipped", side: null, attempt: 0, note: "participants missing" };
+    }
+    const result = await sendWarmIntroduction(client, {
+      intro,
+      helped,
+      suggested,
+      aResp: "yes",
+      bResp: "yes",
+      conversationId: null,
+      currentState: intro.state as string,
+    });
+    return {
+      introductionId,
+      action: result.action === "introduced" ? "nudged" : "skipped",
+      side: null,
+      attempt: 0,
+      note: `warm-intro retry: ${result.note}`,
+    };
+  }
+
+  // A is in, B was supposed to be asked, and no non-failed opt_in_b send exists —
+  // the ask never left. Re-invite B instead of "following up" on an email they
+  // never received.
+  if (intro.state === "a_opted_in" && intro.awaiting === "b" && intro.b_response === "pending") {
+    const { data: asked } = await client
+      .from("sends")
+      .select("id")
+      .eq("introduction_id", intro.id)
+      .eq("kind", "opt_in_b")
+      .neq("status", "failed")
+      .limit(1);
+    if (!asked?.length) {
+      const { data: pair } = await client
+        .from("people")
+        .select("id, name, email, headline, timezone")
+        .in("id", [intro.person_a_id, intro.person_b_id]);
+      const byId = new Map((pair ?? []).map((p) => [p.id, p as Party]));
+      const helped = byId.get(intro.person_a_id);
+      const suggested = byId.get(intro.person_b_id);
+      if (!helped || !suggested) {
+        return { introductionId, action: "skipped", side: null, attempt: 0, note: "participants missing" };
+      }
+      const invite = await inviteSecondSide(client, {
+        introductionId: intro.id,
+        helped,
+        suggested,
+        rationale: intro.rationale ?? "You have overlapping interests.",
+      });
+      if (invite?.failure === "no_recipient" || invite?.status === "suppressed") {
+        warnOnError(
+          "introductions update (retry: b unreachable)",
+          (
+            await client
+              .from("introductions")
+              .update({ state: "expired", awaiting: null, next_action_at: null, updated_at: nowIso() })
+              .eq("id", intro.id)
+          ).error,
+        );
+        await closeIntroductionConversations(client, intro.id);
+        return { introductionId, action: "expired", side: "b", attempt: 0, note: "opt_in_b retry: B unreachable; retired" };
+      }
+      if (!invite || invite.status === "failed") {
+        warnOnError(
+          "introductions update (retry: opt_in_b failed again)",
+          (
+            await client
+              .from("introductions")
+              .update({ next_action_at: dueInDays(0.5), updated_at: nowIso() })
+              .eq("id", intro.id)
+          ).error,
+        );
+        return { introductionId, action: "skipped", side: "b", attempt: 0, note: `opt_in_b retry failed (${invite?.failure ?? "no conversation"}); re-armed` };
+      }
+      warnOnError(
+        "introductions update (retry: b_invited)",
+        (
+          await client
+            .from("introductions")
+            .update({
+              state: "b_invited",
+              awaiting: "b",
+              next_action_at: dueInDays(NUDGE_FIRST_DELAY_DAYS),
+              updated_at: nowIso(),
+            })
+            .eq("id", intro.id)
+        ).error,
+      );
+      return { introductionId, action: "nudged", side: "b", attempt: 0, note: "opt_in_b retry: ask sent to B" };
+    }
   }
 
   // Re-check state at execution time. The sweep selected this row a moment ago and a
@@ -1471,7 +1834,7 @@ export async function nudgeIntroduction(
   );
   const outgoing = withUnsubscribe(draft.body);
 
-  let send: SendResult = { messageId: null, threadId: null, simulated: true };
+  let send: DeliveryResult;
   try {
     send = await sendViaGateway(client, {
       introductionId: intro.id,
@@ -1501,6 +1864,40 @@ export async function nudgeIntroduction(
       ).error,
     );
     return { introductionId, action: "skipped", side, attempt: sent, note: `send failed: ${message}` };
+  }
+
+  // The gateway reports most refusals as VALUES, not exceptions — the catch above
+  // only covers the two unsafe-gate throws. A failed/rate-limited nudge used to
+  // fall through here anyway: the counter incremented and a messages row was
+  // written for an email that never left, burning one of the two follow-up
+  // attempts on nothing.
+  if (send.status === "failed") {
+    warnOnError(
+      "introductions update (nudge refused)",
+      (
+        await client
+          .from("introductions")
+          .update({ next_action_at: dueInDays(NUDGE_REPEAT_DELAY_DAYS), updated_at: nowIso() })
+          .eq("id", intro.id)
+      ).error,
+    );
+    return { introductionId, action: "skipped", side, attempt: sent, note: `send refused (${send.failure}); re-armed` };
+  }
+
+  // The recipient opted out between the ask and the follow-up. Same treatment as
+  // a paused member above: expire, never chase.
+  if (send.status === "suppressed") {
+    warnOnError(
+      "introductions update (nudge suppressed)",
+      (
+        await client
+          .from("introductions")
+          .update({ state: "expired", awaiting: null, next_action_at: null, updated_at: nowIso() })
+          .eq("id", intro.id)
+      ).error,
+    );
+    await closeIntroductionConversations(client, intro.id);
+    return { introductionId, action: "expired", side, attempt: sent, note: "recipient has opted out; expired without nudging" };
   }
 
   warnOnError(

@@ -1,7 +1,22 @@
+import { z } from "zod";
 import type { Candidate, Person } from "./types";
 
 const SHORTLIST_MIN = 3;
 const SHORTLIST_MAX = 5;
+
+/** Runtime twin of MATCH_SCHEMA below — the json_schema shapes the model's
+ *  output, this validates what actually arrived before anyone casts it. */
+const RawMatchesSchema = z.object({
+  matches: z.array(
+    z.object({
+      candidate_id: z.string(),
+      name: z.string(),
+      score: z.number(),
+      direction: z.enum(["a_offers_b_wants", "b_offers_a_wants", "mutual"]),
+      rationale: z.string(),
+    }),
+  ),
+});
 
 export const MATCH_SCHEMA = {
   type: "object",
@@ -61,8 +76,11 @@ export async function rerank(
   calibration: CalibrationExample[] = [],
   preferences: PreferenceExample[] = [],
   history: HistoryExample[] = [],
+  /** Epoch-ms retry budget; pass the route's deadline when there is one. */
+  deadline?: number,
 ): Promise<RawMatch[]> {
   const { anthropic, textOf } = await import("./anthropic");
+  const { callClaude, MODELS } = await import("./llm");
 
   const calibrationBlock = calibration.length
     ? `\n\nPreviously accepted/rejected examples for this person — calibrate your picks against these revealed preferences:\n${JSON.stringify(calibration)}\n`
@@ -87,15 +105,16 @@ export async function rerank(
   // budget this size risks an SDK HTTP timeout before the request finishes.
   // Streaming also retires the manual 30s timeout — the SDK scales its own
   // default for streamed requests.
-  const stream = anthropic.messages.stream(
+  const run = () => anthropic.messages.stream(
     {
-      model: "claude-opus-5",
-      // Raised from 4000 alongside the model bump, and the order matters: Opus 5
-      // thinks by default when `thinking` is omitted, and max_tokens caps
-      // thinking AND the response together. Bumping the model without the budget
-      // truncates a shortlist mid-rationale, which reads as a quality regression
-      // rather than a configuration error.
-      max_tokens: 16000,
+      model: MODELS.rerank,
+      // Raised from 16000: Opus 5 thinks by default when `thinking` is omitted,
+      // and max_tokens caps thinking AND the response together — at 16000 a long
+      // think could eat the whole budget and truncate the shortlist mid-JSON.
+      // Streaming makes the larger value timeout-safe, and callClaude turns a
+      // response that still stops on max_tokens into a loud, terminal error
+      // instead of "malformed JSON".
+      max_tokens: 32000,
       // Ranking is the product's quality ceiling (spec §7), so thinking stays on.
       // `high` is Opus 5's default, set explicitly because that default has moved
       // between generations. Sweep medium/high/xhigh against the eval fixtures
@@ -130,13 +149,12 @@ export async function rerank(
       ],
     },
   );
-  const resp = await stream.finalMessage();
 
-  const parsed = JSON.parse(textOf(resp));
-  if (!Array.isArray(parsed?.matches)) {
-    throw new Error("Claude returned malformed JSON — expected a `matches` array.");
-  }
-  return parsed.matches as RawMatch[];
+  return callClaude(
+    () => run().finalMessage(),
+    (resp) => RawMatchesSchema.parse(JSON.parse(textOf(resp))).matches as RawMatch[],
+    { label: "[rerank]", retryParse: true, deadline },
+  );
 }
 
 /**

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { db } from "../../../../lib/db";
+import { requireAdmin } from "../../../../lib/admin-auth";
 import type { Person } from "../../../../../src/lib/types";
 import {
   fetchCandidates,
@@ -8,6 +9,10 @@ import {
   fetchRecentHistory,
 } from "../../../../../src/lib/candidates";
 import { rerank, validateMatches } from "../../../../../src/lib/rerank";
+
+// The rerank is a streamed Opus call with thinking enabled — it can legitimately
+// exceed the platform's ~15s default.
+export const maxDuration = 120;
 
 const SHORTLIST_MAX = 5;
 
@@ -47,6 +52,14 @@ async function fetchSaved(id: string) {
 }
 
 export async function GET(_request: Request, { params }: { params: Promise<{ id: string }> }) {
+  // Leaks any member's full profile + candidate list by uuid and burns an Opus
+  // rerank per call. No member UI calls this — operator/debug surface, admin only.
+  // (The `trace` array in responses is acceptable to keep under this gate.)
+  const auth = await requireAdmin();
+  if (!auth.ok) {
+    return NextResponse.json({ error: auth.error }, { status: auth.status });
+  }
+
   const { id } = await params;
   const trace: string[] = [];
   try {
@@ -110,7 +123,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
         (history.length ? ` (with ${history.length} recent repl(ies))` : "") +
         `…`,
     );
-    const ranked = await rerank(person, candidates, calibration, preferences, history);
+    const ranked = await rerank(person, candidates, calibration, preferences, history, Date.now() + 90_000);
     const { valid, notes } = validateMatches(ranked, candidates);
     trace.push(...notes);
     trace.push(
@@ -136,6 +149,12 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
 }
 
 export async function POST(_request: Request, { params }: { params: Promise<{ id: string }> }) {
+  // Writes `matches` rows and spends an Opus rerank — admin only, like GET.
+  const auth = await requireAdmin();
+  if (!auth.ok) {
+    return NextResponse.json({ error: auth.error }, { status: auth.status });
+  }
+
   const { id } = await params;
 
   if (!process.env.ANTHROPIC_API_KEY) {
@@ -164,7 +183,7 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
       fetchPreferences(db, person.id),
       fetchRecentHistory(db, person.id),
     ]);
-    const ranked = await rerank(person, candidates, calibration, preferences, history);
+    const ranked = await rerank(person, candidates, calibration, preferences, history, Date.now() + 90_000);
     const { valid, notes } = validateMatches(ranked, candidates);
     const corrected = notes.filter((n) => n.startsWith("Corrected")).length;
     const dropped = notes.filter((n) => n.startsWith("Dropped")).length;

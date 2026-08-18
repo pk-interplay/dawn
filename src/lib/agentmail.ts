@@ -18,7 +18,12 @@
  * is quarantined: they'd be a send path around the gateway.)
  */
 
-import { AgentMailClient } from "agentmail";
+import { AgentMailClient, AgentMailError } from "agentmail";
+
+// Re-exported so the send gateway can classify provider failures (429 vs 5xx vs
+// terminal 4xx) without importing the SDK itself — CI's "one transport" guard
+// allows the SDK only in this file.
+export { AgentMailError };
 
 /**
  * The inbox Dawn sends from and receives on.

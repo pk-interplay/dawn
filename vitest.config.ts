@@ -14,7 +14,9 @@ import { defineConfig } from "vitest/config";
 //                   via `npm run test:eval` and gated in CI on the key existing.
 export default defineConfig({
   test: {
-    include: ["src/**/*.test.ts"],
+    // app/ carries tests too now (app/lib/authz.test.ts); route handlers
+    // themselves stay untested here, but their pure helpers don't get to hide.
+    include: ["src/**/*.test.ts", "app/**/*.test.ts"],
     // Eval tests are excluded from the default run. A contributor without an
     // API key should still be able to run `npm test` and get a green suite.
     exclude: ["**/node_modules/**", "src/**/*.eval.test.ts"],

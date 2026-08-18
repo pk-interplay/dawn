@@ -76,14 +76,20 @@ export async function loadThreadMessages(
   if (threadError) throw new Error(`loadThreadMessages failed: ${threadError.message}`);
   if (!thread) return null;
 
+  // Newest 200, then re-reversed to chronological. Two reasons for the cap: an
+  // unbounded select was silently clipped at PostgREST's 1000-row default anyway
+  // (from the WRONG end — it kept the oldest rows), and a rendering surface does
+  // not need a thread's full archaeology. The model sees an even tighter window
+  // (see chat/route.ts).
   const { data, error } = await client
     .from("chat_messages")
     .select("id, role, parts")
     .eq("thread_id", threadId)
-    .order("created_at", { ascending: true });
+    .order("created_at", { ascending: false })
+    .limit(200);
   if (error) throw new Error(`loadThreadMessages failed: ${error.message}`);
 
-  return (data ?? []).map((row) => ({
+  return (data ?? []).reverse().map((row) => ({
     id: row.id as string,
     role: row.role as "user" | "assistant",
     parts: (row.parts as unknown[]) ?? [],

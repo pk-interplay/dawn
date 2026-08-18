@@ -66,6 +66,7 @@ async function asksInWindow(
 }
 
 async function run(req: Request) {
+  const startedAt = Date.now();
   if (!isAuthorized(req)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -214,6 +215,10 @@ async function run(req: Request) {
       limit,
       runId,
       isEligiblePair,
+      // maxDuration minus 30s of headroom (the onboarding route's pattern): the
+      // agent loop aborts in time to report a partial outcome instead of being
+      // platform-killed mid-step with nothing returned.
+      deadline: startedAt + 270_000,
     });
 
     return NextResponse.json({

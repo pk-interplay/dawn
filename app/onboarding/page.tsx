@@ -4,6 +4,7 @@ import { redirect } from "next/navigation";
 import { auth } from "../../src/auth";
 import { supabase } from "../../src/lib/supabase";
 import { resolveViewerEntity } from "../../src/lib/entity-identity";
+import { getGoogleAccessToken } from "../../src/lib/google-account";
 import { ProfileDraftSchema } from "../../src/lib/synthesize-profile";
 import { OnboardingFlow } from "./OnboardingFlow";
 
@@ -34,12 +35,16 @@ export default async function Onboarding() {
   const session = await auth();
   if (!session?.user?.id) redirect("/");
 
-  // No access token means the Google grant could not be refreshed. Send them home
-  // rather than to /api/auth/signin, which — because pages.signIn is "/" — only
-  // redirects to home anyway (a GET there cannot start the POST+CSRF Google flow).
-  // Full recovery from a tokenless session still needs a fresh Google grant; that
-  // gap is unchanged, this just drops a pointless hop through a looping endpoint.
-  if (!session.accessToken) redirect("/");
+  // Gmail access check: the server-side store (google_accounts) first — it can
+  // mint a fresh token even when the cookie's has expired — then the cookie
+  // token for sessions that predate the store. Neither means the Google grant
+  // could not be refreshed; send them home rather than to /api/auth/signin,
+  // which — because pages.signIn is "/" — only redirects to home anyway (a GET
+  // there cannot start the POST+CSRF Google flow).
+  if (!session.accessToken) {
+    const stored = await getGoogleAccessToken(supabase, session.user.id);
+    if (!stored.ok) redirect("/");
+  }
 
   const viewer = await resolveViewerEntity(supabase, session);
   if (viewer?.onboardedAt) redirect("/chat");

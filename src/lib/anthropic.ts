@@ -8,7 +8,11 @@ import "./env";
 // preserves the existing `anthropic.messages.create(...)` call shape.
 let _anthropic: Anthropic | null = null;
 function client(): Anthropic {
-  return (_anthropic ??= new Anthropic());
+  // maxRetries: 0 — retry behavior lives in ONE place, src/lib/llm.ts's
+  // callClaude (classified, deadline-aware, logged). The SDK default of 2
+  // layered under that would multiply attempts: 2×4 = 8 provider calls in a
+  // 529 storm.
+  return (_anthropic ??= new Anthropic({ maxRetries: 0 }));
 }
 
 export const anthropic = new Proxy({} as Anthropic, {

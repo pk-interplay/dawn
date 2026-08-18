@@ -26,13 +26,22 @@ import { DawnMark } from "./components/DawnMark";
 import { HomeComposer } from "./components/HomeComposer";
 import { DawnShell } from "./components/DawnSidebar";
 
-export default async function Home() {
+export default async function Home({
+  searchParams,
+}: {
+  searchParams: Promise<{ error?: string }>;
+}) {
   const session = await auth();
   const signedIn = Boolean(session?.user?.id);
 
   // Unauthenticated landing experience: the pitch, in full. AboutPage reads the
-  // session and renders its own rail, so there is nothing to thread through.
-  if (!signedIn) return <AboutPage />;
+  // session and renders its own rail, so there is nothing to thread through —
+  // except whether Auth.js just bounced this visitor off the allowlist
+  // (signIn callback returned false → redirect to /?error=AccessDenied).
+  if (!signedIn) {
+    const { error } = await searchParams;
+    return <AboutPage denied={error === "AccessDenied"} />;
+  }
 
   // Gates the Admin rail item (see DawnSidebar).
   const admin = await isAdmin();

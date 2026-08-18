@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { db } from "../../lib/db";
+import { requireUser } from "../../lib/session-user";
+import { rerankForQuery } from "../../../src/lib/query-rerank";
 
 // Agent-facing "find people" endpoint.
 //
@@ -9,6 +11,10 @@ import { db } from "../../lib/db";
 //
 // The query describes what the caller is *looking for*, so we embed it and
 // search against everyone's `embedding_offering` (people who OFFER that).
+
+// Embed + vector search is fast, but rerank=true adds an Opus call with a 30s
+// SDK timeout and retries; the platform default (~15s) killed it mid-flight.
+export const maxDuration = 60;
 
 const NIL_UUID = "00000000-0000-0000-0000-000000000000";
 const DEFAULT_LIMIT = 10;
@@ -21,6 +27,15 @@ interface FindBody {
 }
 
 export async function POST(request: Request) {
+  // Every call embeds caller text (OpenAI spend) and can trigger a Claude rerank —
+  // signed-in members only. Note: src/agent/findTool.ts's unauthenticated HTTP demo
+  // no longer works against this route; the MCP server is unaffected (it queries
+  // via the service-role client directly).
+  const auth = await requireUser();
+  if (!auth.ok) {
+    return NextResponse.json({ error: auth.error }, { status: auth.status });
+  }
+
   let body: FindBody;
   try {
     body = (await request.json()) as FindBody;
@@ -95,53 +110,3 @@ export async function POST(request: Request) {
   }
 }
 
-const QUERY_RERANK_SCHEMA = {
-  type: "object",
-  properties: {
-    people: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          id: { type: "string" },
-          name: { type: "string" },
-          score: { type: "number" },
-          rationale: { type: "string" },
-        },
-        required: ["id", "name", "score", "rationale"],
-        additionalProperties: false,
-      },
-    },
-  },
-  required: ["people"],
-  additionalProperties: false,
-} as const;
-
-async function rerankForQuery(
-  query: string,
-  candidates: Array<{ id: string; name: string; headline: string | null; offering: string | null; looking_for: string | null; tags: string[]; similarity: number }>,
-) {
-  const { anthropic, textOf } = await import("../../../src/lib/anthropic");
-  const resp = await anthropic.messages.create(
-    {
-      model: "claude-opus-4-8",
-      max_tokens: 4000,
-      output_config: { format: { type: "json_schema", schema: QUERY_RERANK_SCHEMA } },
-      messages: [
-        {
-          role: "user",
-          content:
-            `A caller is looking for people matching this ask: "${query}"\n\n` +
-            `Candidates (with preliminary vector-similarity scores): ${JSON.stringify(candidates)}\n\n` +
-            `Rank the candidates who genuinely fit the ask, best first. For each, write a 1-3 sentence rationale that is specific about what this person offers that satisfies the ask — not just topical overlap. Assign a 0-1 score for strength of fit. Use the id and name values exactly as given. Omit candidates that don't actually fit.`,
-        },
-      ],
-    },
-    { timeout: 30_000 },
-  );
-  const parsed = JSON.parse(textOf(resp));
-  if (!Array.isArray(parsed?.people)) {
-    throw new Error("Claude returned malformed JSON — expected a `people` array.");
-  }
-  return parsed.people as Array<{ id: string; name: string; score: number; rationale: string }>;
-}

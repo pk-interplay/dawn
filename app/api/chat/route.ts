@@ -20,15 +20,11 @@ import type { DawnScope } from "../../../src/lib/network-tools";
 /**
  * The chat endpoint.
  *
- * Uses `db` (the publishable/anon key) rather than the service-role client, unlike the
- * ingest and onboarding routes. Three reasons: chat only reads; keeping service-role for
- * the routes that WRITE preserves a distinction that would otherwise erode; and both SQL
- * functions the tools call are `stable` and not `security definer`, so the workspace RLS
- * policies from 0026 stay live on every read. Authorization itself is here in the
- * handler, as it is everywhere else in this app.
- *
- * The one exception is thread persistence (0034), which writes and therefore uses the
- * service-role client — with the entity check done here, before anything streams.
+ * `db` and `supabase` are both service-role clients now. The reads-on-anon-key split
+ * this route used to keep died with migration 0041: RLS is enabled with zero policies
+ * everywhere and the anon role's grants are revoked, so the publishable key can read
+ * nothing. Authorization lives here in the handler — session, then thread ownership,
+ * before anything streams — as it does everywhere else in this app.
  */
 
 export const runtime = "nodejs";
@@ -72,7 +68,14 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "No such conversation" }, { status: 404 });
   }
 
-  const uiMessages: StoredMessage[] = body?.messages ?? [];
+  // What the MODEL sees is capped to the last 30 turns. The client sends the
+  // whole thread, and every turn re-sends everything it's given — tool results
+  // included — so an unwindowed thread gets monotonically more expensive forever
+  // (Sonnet's context fits it; the bill is the problem). Thirty turns is far
+  // more than any introduction-finding conversation actually refers back to.
+  const MAX_MODEL_MESSAGES = 30;
+  const allMessages: StoredMessage[] = body?.messages ?? [];
+  const uiMessages = allMessages.slice(-MAX_MODEL_MESSAGES);
 
   // Persist the user's turn up front rather than in onEnd. If the model call fails or
   // the user navigates away mid-stream, the question they asked is still there when
@@ -80,7 +83,8 @@ export async function POST(req: Request) {
   const lastUser = [...uiMessages].reverse().find((message) => message.role === "user");
   if (lastUser) {
     await saveMessage(supabase, threadId, lastUser);
-    await setThreadTitleIfUnset(supabase, threadId, textOf(uiMessages[0]));
+    // Title from the thread's FIRST message — allMessages, not the model window.
+    await setThreadTitleIfUnset(supabase, threadId, textOf(allMessages[0]));
   }
 
   const agent = await createDawnAgent({
@@ -99,6 +103,10 @@ export async function POST(req: Request) {
     // Persistence mode: with the originals in hand the SDK gives the response message a
     // stable id, which is what makes `saveMessage` idempotent on retry.
     originalMessages: uiMessages as never,
+    // Abort inside our own budget (maxDuration 60 − 5s headroom) so onEnd still
+    // fires and the assistant turn persists as far as it got — a platform kill
+    // skips onEnd and loses the answer entirely.
+    abortSignal: AbortSignal.timeout(55_000),
     onEnd: async ({ responseMessage }) => {
       // A failed write must not take down a response the user has already read, so this
       // logs rather than throws; the thread simply misses that turn.

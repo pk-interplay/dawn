@@ -23,7 +23,9 @@ import { loadEditableProfile } from "./profile-edit";
  * offline in a cron; chat is interactive.
  */
 
-export const DAWN_CHAT_MODEL = "claude-sonnet-5";
+import { MODELS } from "./llm";
+
+export const DAWN_CHAT_MODEL = MODELS.chat;
 
 /** Enough for search → maybe a warm-path lookup → answer, without letting it wander. */
 const MAX_STEPS = 8;
@@ -135,7 +137,20 @@ export async function createDawnAgent(ctx: DawnToolContext) {
 
   return new ToolLoopAgent({
     model: anthropic(DAWN_CHAT_MODEL),
-    instructions,
+    // Cache breakpoint on the system message: in Anthropic's prompt order the
+    // tools render BEFORE system, so this one marker caches tools + system +
+    // the per-user context for every subsequent step and turn in this
+    // conversation (5-minute TTL). Requires the tool set to stay deterministic —
+    // reordering or renaming tools invalidates the prefix.
+    instructions: {
+      role: "system",
+      content: instructions,
+      providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+    },
+    // Interactive prose + tool calls; without this the provider default is the
+    // model's 128k ceiling, which is not a budget at all.
+    maxOutputTokens: 4_096,
+    maxRetries: 3,
     // Graph tools read through the caller's client (RLS stays live); the profile tools
     // write, and only ever to the viewer's own claims. See profile-tools.ts.
     tools: {

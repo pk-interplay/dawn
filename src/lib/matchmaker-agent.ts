@@ -34,6 +34,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Person } from "./types";
 import { fetchCandidates, fetchCalibration, fetchPreferences, fetchRecentHistory } from "./candidates";
 import { startIntroduction } from "./intro-flow";
+import { MODELS } from "./llm";
 
 /**
  * `claude-opus-5`, matching rerank.ts rather than the chat agent's Sonnet.
@@ -42,7 +43,7 @@ import { startIntroduction } from "./intro-flow";
  * this runs offline in a cron where latency is nearly free. The chat agent is
  * interactive and pays for its own speed.
  */
-export const MATCHMAKER_MODEL = "claude-opus-5";
+export const MATCHMAKER_MODEL = MODELS.rerank;
 
 /**
  * Enough for: read notes → for a few members, pull candidates and context, maybe check
@@ -67,6 +68,10 @@ export interface MatchmakerContext {
   runId: string;
   /** Re-checked inside proposeIntro; mirrors the route's own gate. */
   isEligiblePair: (aId: string, bId: string) => Promise<{ ok: boolean; reason?: string }>;
+  /** Epoch-ms wall-clock ceiling for the run — the route's maxDuration minus
+   *  headroom. The loop is aborted rather than platform-killed, so the outcome
+   *  still gets reported. */
+  deadline?: number;
 }
 
 export interface MatchmakerOutcome {
@@ -403,7 +408,24 @@ export function createMatchmakerTools(ctx: MatchmakerContext, outcome: Matchmake
 export function createMatchmakerAgent(ctx: MatchmakerContext, outcome: MatchmakerOutcome) {
   return new ToolLoopAgent({
     model: anthropic(MATCHMAKER_MODEL),
-    instructions: SYSTEM,
+    // Cache breakpoint on the system message. Anthropic renders tools BEFORE
+    // system, so this single marker caches the tool definitions + SYSTEM for all
+    // of the run's up-to-40 steps — the largest recurring share of this run's
+    // input spend. Requires createMatchmakerTools to stay deterministic:
+    // reordering or renaming tools invalidates the cached prefix.
+    instructions: {
+      role: "system",
+      content: SYSTEM,
+      providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+    },
+    // Explicit for two reasons: the provider default is the model's 128k
+    // ceiling, and a NON-STREAMING generate() with an implicit 128k max_tokens
+    // is a request shape Anthropic rejects (long outputs require streaming).
+    // 16k is comfortably enough for a step's thinking + tool call and keeps the
+    // non-streaming call inside the timeout-safe range. generate() stays
+    // non-streaming on purpose — a cron has no reader.
+    maxOutputTokens: 16_000,
+    maxRetries: 3,
     tools: createMatchmakerTools(ctx, outcome),
     stopWhen: stepCountIs(MAX_STEPS),
   });
@@ -431,13 +453,30 @@ export async function runMatchmaker(ctx: MatchmakerContext): Promise<MatchmakerO
 
   const agent = createMatchmakerAgent(ctx, outcome);
 
+  const startedAt = Date.now();
   try {
     const result = await agent.generate({
       prompt:
         `Run ${ctx.runId}. ${ctx.eligible.length} member(s) are due an introduction and you may open up to ${ctx.limit}. ` +
         `Start by reading your notes, then decide. Opening none is a valid outcome.`,
+      // Aborting at our own deadline (instead of being SIGKILLed at the route's
+      // maxDuration) is what lets the catch below report a partial run.
+      abortSignal:
+        ctx.deadline !== undefined
+          ? AbortSignal.timeout(Math.max(1, ctx.deadline - Date.now()))
+          : undefined,
     });
     outcome.summary = result.text?.trim() || "(the run produced no summary)";
+    // totalUsage sums every step of the tool loop — the "what did this hourly
+    // run cost" number, and (via cache_read) proof the prompt cache engaged.
+    const { logLLMUsage, usageFromAISDK } = await import("./llm");
+    await logLLMUsage(ctx.client, {
+      site: "matchmaker",
+      model: MATCHMAKER_MODEL,
+      runId: ctx.runId,
+      usage: usageFromAISDK(result.totalUsage ?? {}),
+      durationMs: Date.now() - startedAt,
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[matchmaker] run ${ctx.runId} failed: ${message}`);

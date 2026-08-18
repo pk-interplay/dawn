@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { db } from "../../../lib/db";
-import { isAuthorized } from "../../../lib/authz";
+import { isInboundAuthorized } from "../../../lib/authz";
 import { triage, type InboundDecision, type TriageResult } from "../../../../src/lib/triage";
 import {
   advanceOnReply,
@@ -13,9 +13,16 @@ import { send as sendViaGateway, suppress, type ReplyKind } from "../../../../sr
 export const runtime = "nodejs";
 export const maxDuration = 120;
 
-// Receives an inbound AgentMail message (forwarded by the agentmail-webhook Edge
-// Function), decides what — if anything — Dawn should do with it, and records the
+// Receives an inbound AgentMail message (delivered by the AgentMail webhook, which
+// is configured with a custom `Authorization: Bearer <INBOUND_WEBHOOK_SECRET>`
+// header), decides what — if anything — Dawn should do with it, and records the
 // decision.
+//
+// Authenticity today rests on that shared header, which AgentMail stores write-only
+// server-side. If this app is ever exposed beyond the pilot, upgrade to verifying
+// AgentMail's svix-style signature (HMAC-SHA256 over `${svix-id}.${svix-timestamp}.
+// ${rawBody}` with the webhook secret, plus a timestamp freshness window) instead of
+// a static header.
 //
 // All the judgement lives in src/lib/triage.ts; this route is the dispatcher. The
 // important invariant: EVERY inbound message produces exactly one `inbound_events`
@@ -47,8 +54,6 @@ interface InboundBody {
   event_type?: string;
   type?: string;
   message?: InboundMessage;
-  /** Set by the Edge Function from the event type; see UNAUTH_EVENT. */
-  authenticated?: boolean;
 }
 
 /** AgentMail's event for mail whose sending domain published no passing SPF/DKIM. */
@@ -210,31 +215,27 @@ async function captureLead(t: TriageResult, text: string, inboundMessageId: stri
 }
 
 export async function POST(req: Request) {
-  if (!isAuthorized(req)) {
+  if (!isInboundAuthorized(req)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   try {
     const body = (await req.json()) as InboundBody;
     const eventType = body.event_type ?? body.type;
-    // The Edge Function already filters message.sent; guard here too. Both received
-    // variants are accepted — AgentMail routes mail from domains without passing
-    // SPF/DKIM to `message.received.unauthenticated`, and refusing those here would
-    // drop real replies from any member whose domain isn't set up (see triage's
-    // `authenticated` handling for how that mail is then constrained).
+    // Only the received variants dispatch. Both are accepted — AgentMail routes mail
+    // from domains without passing SPF/DKIM to `message.received.unauthenticated`,
+    // and refusing those here would drop real replies from any member whose domain
+    // isn't set up (see triage's `authenticated` handling for how that mail is then
+    // constrained).
     if (eventType && eventType !== "message.received" && eventType !== UNAUTH_EVENT) {
       return NextResponse.json({ ok: true, ignored: eventType });
     }
 
-    // Trust the Edge Function's explicit flag when present; otherwise infer from the
-    // event name. Undefined stays undefined — triage treats "unknown" as
-    // authenticated, so the CLI scripts and older payloads keep working.
-    const authenticated =
-      typeof body.authenticated === "boolean"
-        ? body.authenticated
-        : eventType === UNAUTH_EVENT
-          ? false
-          : undefined;
+    // Authenticity is inferred from the event name AgentMail chose — a body field
+    // would be forgeable by anyone holding the webhook secret. Undefined stays
+    // undefined — triage treats "unknown" as authenticated, so the CLI scripts and
+    // older payloads keep working.
+    const authenticated = eventType === UNAUTH_EVENT ? false : undefined;
 
     const msg = body.message;
     if (!msg) return NextResponse.json({ error: "No message in payload" }, { status: 400 });
@@ -243,7 +244,10 @@ export async function POST(req: Request) {
     const threadId = firstDefined(msg.thread_id, msg.threadId);
     const fromRaw = firstDefined(msg.from_, msg.from);
     const subject = msg.subject ?? null;
-    const text = firstDefined(msg.extractedText, msg.extracted_text, msg.text) ?? "";
+    // Bounded for storage sanity — a pathological payload should not become a
+    // multi-megabyte messages/inbound_events row. The LLM prompt is clipped much
+    // tighter inside parseReplyIntent (8k chars); this cap only guards the writes.
+    const text = (firstDefined(msg.extractedText, msg.extracted_text, msg.text) ?? "").slice(0, 100_000);
 
     const t = await triage(db, {
       agentmailMessageId: messageId,
@@ -258,7 +262,24 @@ export async function POST(req: Request) {
     // replay protection still holds — otherwise a message that failed halfway
     // through (after its DB writes committed) would be reprocessed on the webhook's
     // retry, repeating those side effects. `replied` is patched in afterwards.
-    const eventId = await logEvent(t, messageId, threadId, subject, text);
+    //
+    // The insert is also the authoritative replay guard. Triage's SELECT-based
+    // duplicate check is only the cheap fast path (it saves the LLM call): two
+    // simultaneous deliveries of one message both pass that SELECT, and only the
+    // unique index on agentmail_message_id decides who dispatches.
+    const logged = await logEvent(t, messageId, threadId, subject, text);
+    if (logged.outcome === "conflict") {
+      // A concurrent (or earlier) delivery already claimed this message id.
+      // Dispatching anyway would double-advance the state machine.
+      return NextResponse.json({ ok: true, decision: "duplicate", note: "replay guard: event row already exists" });
+    }
+    if (logged.outcome === "error") {
+      // Without the row there is no replay guard, no rate-limit counter, and no
+      // audit trail — dispatching in that state is how failures stay invisible.
+      // 500 so the webhook retries once the insert can succeed.
+      return NextResponse.json({ error: "failed to record inbound event" }, { status: 500 });
+    }
+    const eventId = logged.id;
 
     let replied = false;
     let action: string = t.decision;
@@ -389,13 +410,18 @@ export async function POST(req: Request) {
   }
 }
 
+type LogEventResult =
+  | { outcome: "ok"; id: string | null }
+  | { outcome: "conflict" } // unique index says another delivery already owns this message id
+  | { outcome: "error" };
+
 async function logEvent(
   t: TriageResult,
   messageId: string | null,
   threadId: string | null,
   subject: string | null,
   text: string,
-): Promise<string | null> {
+): Promise<LogEventResult> {
   const decision: InboundDecision = t.decision;
   const { data, error } = await db
     .from("inbound_events")
@@ -413,7 +439,12 @@ async function logEvent(
     })
     .select("id")
     .single();
-  // A failure here breaks replay protection and the rate limiter, so it must be loud.
-  if (error) console.error(`[inbound] FAILED to log inbound_event: ${error.message}`);
-  return (data?.id as string) ?? null;
+  if (!error) return { outcome: "ok", id: (data?.id as string) ?? null };
+  // 23505 on inbound_events_message_idx: the concurrent-replay case the SELECT
+  // fast path can't catch. The caller must not dispatch.
+  if (error.code === "23505") return { outcome: "conflict" };
+  // A failure here breaks replay protection and the rate limiter, so it must be loud
+  // — and it must stop the dispatch, not just log.
+  console.error(`[inbound] FAILED to log inbound_event: ${error.message}`);
+  return { outcome: "error" };
 }

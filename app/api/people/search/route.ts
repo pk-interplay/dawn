@@ -1,7 +1,14 @@
 import { NextResponse } from "next/server";
 import { db } from "../../../lib/db";
+import { requireUser } from "../../../lib/session-user";
 
 export async function GET(request: Request) {
+  // Same member data as GET /api/people, just filtered — same gate.
+  const auth = await requireUser();
+  if (!auth.ok) {
+    return NextResponse.json({ error: auth.error }, { status: auth.status });
+  }
+
   const { searchParams } = new URL(request.url);
   const q = searchParams.get("q")?.trim();
 

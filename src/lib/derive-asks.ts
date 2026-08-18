@@ -1,4 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { z } from "zod";
 
 import { DERIVED_LIST_FIELDS } from "./profile-fields";
 import { listLiveClaims, supersedeClaims, writeClaim } from "./claims";
@@ -39,6 +40,12 @@ const ASKS_SCHEMA = {
   additionalProperties: false,
 } as const;
 
+// Runtime twin of ASKS_SCHEMA, validated before cleanItems shapes the values.
+const AsksResponseSchema = z.object({
+  must_haves: z.array(z.string()),
+  nice_to_haves: z.array(z.string()),
+});
+
 export interface DeriveAsksResult {
   /** Why nothing happened, when nothing happened — surfaced in logs, not to the user. */
   skipped: "member-stated" | "no-ask" | "unchanged" | null;
@@ -73,32 +80,37 @@ export async function deriveAsks(
   }
 
   const { anthropic, textOf } = await import("./anthropic");
-  const resp = await anthropic.messages.create({
-    model: "claude-haiku-4-5-20251001",
-    max_tokens: 512,
-    output_config: { format: { type: "json_schema", schema: ASKS_SCHEMA } },
-    messages: [
-      {
-        role: "user",
-        content:
-          `A member of an introduction network wrote this about who they want to meet:\n\n` +
-          `"${lookingFor}"\n\n` +
-          (input.goals.length ? `They are currently working on:\n- ${input.goals.join("\n- ")}\n\n` : "") +
-          `Decompose their ask into the specific parts an introduction would have to satisfy.\n` +
-          `- "must_haves": 1-3 short phrases naming the NON-NEGOTIABLE parts. A candidate ` +
-          `failing any one of these is not a match.\n` +
-          `- "nice_to_haves": 0-2 short phrases for parts that would improve a match but ` +
-          `would not rule one out.\n\n` +
-          `Decompose only what they actually said — do not add requirements they did not ` +
-          `state, and do not restate the whole sentence as a single must-have. If the ask ` +
-          `is too vague to decompose ("I want to meet interesting people"), return empty ` +
-          `arrays rather than inventing criteria.`,
-      },
-    ],
-  });
-
-  const parsed = JSON.parse(textOf(resp)) as { must_haves: unknown; nice_to_haves: unknown };
+  const { callClaude, MODELS } = await import("./llm");
+  const parsed = await callClaude(
+    () =>
+      anthropic.messages.create({
+        model: MODELS.cheap,
+        max_tokens: 512,
+        output_config: { format: { type: "json_schema", schema: ASKS_SCHEMA } },
+        messages: [
+          {
+            role: "user",
+            content:
+              `A member of an introduction network wrote this about who they want to meet:\n\n` +
+              `"${lookingFor}"\n\n` +
+              (input.goals.length ? `They are currently working on:\n- ${input.goals.join("\n- ")}\n\n` : "") +
+              `Decompose their ask into the specific parts an introduction would have to satisfy.\n` +
+              `- "must_haves": 1-3 short phrases naming the NON-NEGOTIABLE parts. A candidate ` +
+              `failing any one of these is not a match.\n` +
+              `- "nice_to_haves": 0-2 short phrases for parts that would improve a match but ` +
+              `would not rule one out.\n\n` +
+              `Decompose only what they actually said — do not add requirements they did not ` +
+              `state, and do not restate the whole sentence as a single must-have. If the ask ` +
+              `is too vague to decompose ("I want to meet interesting people"), return empty ` +
+              `arrays rather than inventing criteria.`,
+          },
+        ],
+      }),
+    (resp) => AsksResponseSchema.parse(JSON.parse(textOf(resp))),
+    { label: "[deriveAsks]", retryParse: true },
+  );
   const next: Record<string, string[]> = {
+    // cleanItems still runs after validation — it dedupes, trims and caps.
     ask_must_haves: cleanItems(parsed.must_haves, 3),
     ask_nice_to_haves: cleanItems(parsed.nice_to_haves, 2),
   };

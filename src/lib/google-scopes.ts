@@ -8,10 +8,9 @@
  * unused scope grant doesn't change anyway. Re-add compose/send when step 5's
  * send gateway needs them.
  *
- * Sign-in does NOT force `prompt: "consent"` (src/auth.ts), so adding a scope
- * here later does not automatically re-prompt existing users — Google only
- * re-shows consent when a sign-in requests scopes beyond what was previously
- * granted.
+ * Sign-in DOES force `prompt: "consent"` (src/auth.ts, since 2c38160), so every
+ * authorization re-shows the consent screen and reissues a refresh token —
+ * adding a scope here re-prompts existing users on their next sign-in.
  */
 export const GOOGLE_SCOPES = [
   "openid",

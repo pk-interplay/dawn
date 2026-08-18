@@ -3,6 +3,11 @@ import Google from "next-auth/providers/google";
 import { GOOGLE_SCOPES } from "./lib/google-scopes";
 import { supabase } from "./lib/supabase";
 import { findOrCreateEntity } from "./lib/claims";
+import { isAllowedSignIn } from "./lib/allowlist";
+import {
+  refreshGoogleAccessToken,
+  upsertGoogleAccount,
+} from "./lib/google-account";
 
 /**
  * THE auth system. Google only.
@@ -15,51 +20,30 @@ import { findOrCreateEntity } from "./lib/claims";
  * Supabase Auth is gone; a Google account is now the only way in, and the Google
  * `sub` is the single identity everything keys on.
  *
- * ## Any Gmail account, deliberately
+ * ## Invite-only, at the door
  *
- * There used to be a `signIn` callback here rejecting any account whose ID token
- * carried no `hd` (Workspace hosted-domain) claim — which is every personal
- * @gmail.com account. It cited SPEC §3.3: internal-use apps are exempt from
- * Google verification and CASA, and CASA triggers on storing restricted-scope
- * data, which Gmail ingest does.
+ * The `signIn` callback gates every sign-in on the allowlist in
+ * src/lib/allowlist.ts (ALLOWED_EMAILS / ALLOWED_EMAIL_DOMAINS, deny-by-default;
+ * domains admit only via Google's Workspace-asserted `hd` claim). This replaced a
+ * period where any Google account on earth could sign in and ingest its mailbox
+ * into the shared workspace — an internal pilot has no business accepting
+ * strangers, and SPEC §3.3's compliance argument (internal-use apps are exempt
+ * from Google verification and CASA) only holds while membership is controlled.
  *
- * That reasoning still holds and the constraint has NOT gone away — it has moved.
- * Access is now gated per surface rather than at the door:
- *
- *   - `requireAdmin` (app/lib/admin-auth.ts) still allowlists on ADMIN_EMAILS /
- *     ADMIN_EMAIL_DOMAINS, deny-by-default, so the operator surfaces are unchanged.
- *   - Anyone signing in gets an entity in the single Interplay workspace and can
- *     ingest their own mailbox and query the graph.
+ * The per-surface gates are unchanged and still matter:
+ *   - `requireAdmin` (app/lib/admin-auth.ts) allowlists the operator surfaces on
+ *     ADMIN_EMAILS / ADMIN_EMAIL_DOMAINS — admins are a subset of members.
+ *   - A denied sign-in redirects to `/?error=AccessDenied`, which the landing page
+ *     renders as an invite-only notice.
  *
  * **Before this app is offered to anyone outside Interplay's Workspace, re-read
- * SPEC §3.3.** Restricted-scope data leaving an internal-use app is what puts a
- * third-party security assessment on the critical path, and that is a launch
- * dependency, not a compliance footnote. Nothing in the code will stop you.
+ * SPEC §3.3.** Adding a personal-gmail member via ALLOWED_EMAILS forces the OAuth
+ * client to "External", which puts restricted-scope verification back in view.
  */
 
-/** Refreshes an expired Google access token using the stored refresh token. */
-async function refreshGoogleAccessToken(refreshToken: string) {
-  const res = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: process.env.GOOGLE_CLIENT_ID!,
-      client_secret: process.env.GOOGLE_CLIENT_SECRET!,
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-    }),
-  });
-  if (!res.ok) {
-    throw new Error(`Failed to refresh Google access token: ${res.status}`);
-  }
-  const data = await res.json();
-  return {
-    accessToken: data.access_token as string,
-    expiresAt: Math.floor(Date.now() / 1000) + (data.expires_in as number),
-    // Google only returns a new refresh_token occasionally; keep the old one otherwise.
-    refreshToken: (data.refresh_token as string | undefined) ?? refreshToken,
-  };
-}
+// Token refresh lives in src/lib/google-account.ts now — ONE implementation for
+// the cookie path (here) and the server-side store (crons, onboarding routes),
+// with invalid_grant distinguished from transient token-endpoint failures.
 
 export const { handlers, signIn, signOut, auth } = NextAuth({
   providers: [
@@ -95,6 +79,15 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
   ],
   secret: process.env.AUTH_SECRET,
   callbacks: {
+    async signIn({ profile }) {
+      // Invite-only. Returning false sends the visitor to `/?error=AccessDenied`
+      // (pages.signIn is "/"), which the landing page renders as a quiet notice.
+      return isAllowedSignIn({
+        email: profile?.email,
+        emailVerified: profile?.email_verified as boolean | undefined,
+        hd: (profile as { hd?: string } | null)?.hd,
+      });
+    },
     async jwt({ token, account, profile }) {
       if (account) {
         // Auth.js deliberately assigns `user.id` a random UUID on every sign-in
@@ -112,6 +105,26 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         // the user's side. Keep whatever we already had.
         token.refreshToken = account.refresh_token ?? token.refreshToken;
         token.expiresAt = account.expires_at;
+
+        // Persist the credentials server-side (google_accounts) so background
+        // work — the Gmail sync cron, the onboarding routes — can act for this
+        // user without the browser cookie. prompt=consent above means every
+        // sign-in carries a fresh refresh token, so this also heals a revoked
+        // row. Best-effort: sign-in must never block on Supabase.
+        if (token.sub && profile?.email) {
+          try {
+            await upsertGoogleAccount(supabase, {
+              googleSub: token.sub,
+              email: profile.email,
+              refreshToken: account.refresh_token ?? null,
+              accessToken: account.access_token ?? null,
+              expiresAt: account.expires_at ?? null,
+              scopes: (account.scope as string | undefined) ?? GOOGLE_SCOPES.join(" "),
+            });
+          } catch (err) {
+            console.error("[auth] Failed to persist Google credentials:", err);
+          }
+        }
 
         // Claim the caller's entity and stamp it with this Google id, so
         // "which entity is the signed-in user" is answerable from the session
@@ -154,6 +167,17 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
           token.accessToken = refreshed.accessToken;
           token.expiresAt = refreshed.expiresAt;
           token.refreshToken = refreshed.refreshToken;
+          // Best-effort: keep the server-side store current too, so the cookie
+          // path and the cron path never diverge on which token is live.
+          if (token.sub && token.email) {
+            void upsertGoogleAccount(supabase, {
+              googleSub: token.sub,
+              email: token.email,
+              refreshToken: refreshed.refreshToken,
+              accessToken: refreshed.accessToken,
+              expiresAt: refreshed.expiresAt,
+            }).catch((err) => console.error("[auth] Failed to persist rotated token:", err));
+          }
         } catch (err) {
           console.error("[auth] Failed to refresh Google access token:", err);
           token.accessToken = undefined; // Force re-auth on next Google API call.

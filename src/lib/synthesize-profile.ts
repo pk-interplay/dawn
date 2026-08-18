@@ -2,9 +2,10 @@ import { streamObject } from "ai";
 import { anthropic } from "@ai-sdk/anthropic";
 import { z } from "zod";
 
-import { fetchGmailActivity, type GmailActivity } from "./gmail-ingest";
+import { fetchGmailActivity, RunBudget, type GmailActivity } from "./gmail-ingest";
 import { parseAddress, splitAddresses } from "./network-ingest";
 import { domainOf, GENERIC_DOMAINS } from "./domains";
+import { MODELS } from "./llm";
 
 /**
  * Draft a public profile for a user from their own mailbox activity.
@@ -63,7 +64,7 @@ export const ProfileDraftSchema = z.object({
 
 export type ProfileDraft = z.infer<typeof ProfileDraftSchema>;
 
-export const SYNTHESIS_MODEL = "claude-sonnet-5";
+export const SYNTHESIS_MODEL = MODELS.chat;
 
 /** Below this many outbound messages there is nothing worth synthesising from. */
 const MIN_OUTBOUND = 3;
@@ -79,6 +80,71 @@ export interface SynthesisResult {
   /** Why nothing was generated, for copy the user can act on. */
   reason: "ok" | "not_enough_activity" | "no_api_key";
   evidence: { subjects: number; domains: number; events: number };
+}
+
+/**
+ * Everything the model actually reads, distilled from a mailbox read — small
+ * enough to store. The onboarding ingest stamps this onto profile_drafts
+ * (`evidence` column, 0043) so Regenerate makes ZERO Google calls: the old path
+ * re-read the entire six-month mailbox (a full quota-minute) inside a 120s
+ * function just to reword a headline, and usually died trying.
+ */
+export interface DistilledEvidence {
+  outboundSubjects: string[];
+  topDomains: string[];
+  eventTitles: string[];
+}
+
+/** Validates evidence read back from the DB — the column is jsonb, not a type. */
+export const DistilledEvidenceSchema = z.object({
+  outboundSubjects: z.array(z.string()),
+  topDomains: z.array(z.string()),
+  eventTitles: z.array(z.string()),
+});
+
+export function distillEvidence(activity: GmailActivity, email: string): DistilledEvidence {
+  const you = email.trim().toLowerCase();
+  const { headers, events } = activity;
+
+  // Outbound only. Inbound subject lines describe what other people want, and a
+  // profile built from your inbox reads like a profile of everyone who emails you.
+  const outboundSubjects: string[] = [];
+  const domainCounts = new Map<string, number>();
+
+  for (const h of headers) {
+    const from = h.from ? parseAddress(h.from) : null;
+    const isOutbound = from?.email?.toLowerCase() === you;
+    if (isOutbound && h.subject?.trim()) outboundSubjects.push(h.subject.trim());
+
+    // Counterparties from both directions — who is in the network is symmetric,
+    // even though what you write about is not.
+    const counterparties = [
+      ...(isOutbound ? [] : from ? [from] : []),
+      ...splitAddresses(h.to),
+      ...splitAddresses(h.cc),
+    ];
+    for (const c of counterparties) {
+      const addr = c.email?.toLowerCase();
+      if (!addr || addr === you) continue;
+      const domain = domainOf(addr);
+      if (!domain || GENERIC_DOMAINS.has(domain)) continue;
+      domainCounts.set(domain, (domainCounts.get(domain) ?? 0) + 1);
+    }
+  }
+
+  const topDomains = [...domainCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, MAX_DOMAINS)
+    .map(([domain, count]) => `${domain} (${count})`);
+
+  const eventTitles = [...new Set(events.map((e) => e.summary?.trim()).filter((s): s is string => Boolean(s)))]
+    .slice(0, MAX_EVENTS);
+
+  return {
+    outboundSubjects: outboundSubjects.slice(0, MAX_SUBJECTS),
+    topDomains,
+    eventTitles,
+  };
 }
 
 /**
@@ -122,48 +188,44 @@ export async function synthesizeProfile(opts: {
    */
   activity?: GmailActivity;
   /**
+   * Pre-distilled evidence (from profile_drafts.evidence). The preferred input
+   * on the Regenerate path: no Google call at all. Takes precedence over
+   * `activity`, which takes precedence over reading the mailbox ourselves.
+   */
+  distilled?: DistilledEvidence;
+  /**
    * Wall-clock ceiling for this synthesis, as epoch ms. Only bounds the mailbox read on
-   * the regenerate path (where we do the reading) — the model call itself is left to
-   * finish, because a half-streamed draft is worth less than the seconds it would save
-   * and the caller keeps enough headroom to report either outcome.
+   * the last-resort re-read path (where we do the reading) — the model call itself is
+   * left to finish, because a half-streamed draft is worth less than the seconds it
+   * would save and the caller keeps enough headroom to report either outcome.
    */
   deadline?: number;
 }): Promise<SynthesisResult> {
   const you = opts.email.trim().toLowerCase();
 
-  const { headers, events } =
-    opts.activity ?? (await fetchGmailActivity(opts.accessToken, undefined, opts.deadline));
-
-  // Outbound only. Inbound subject lines describe what other people want, and a
-  // profile built from your inbox reads like a profile of everyone who emails you.
-  const outboundSubjects: string[] = [];
-  const domainCounts = new Map<string, number>();
-
-  for (const h of headers) {
-    const from = h.from ? parseAddress(h.from) : null;
-    const isOutbound = from?.email?.toLowerCase() === you;
-    if (isOutbound && h.subject?.trim()) outboundSubjects.push(h.subject.trim());
-
-    // Counterparties from both directions — who is in the network is symmetric,
-    // even though what you write about is not.
-    const counterparties = [
-      ...(isOutbound ? [] : from ? [from] : []),
-      ...splitAddresses(h.to),
-      ...splitAddresses(h.cc),
-    ];
-    for (const c of counterparties) {
-      const email = c.email?.toLowerCase();
-      if (!email || email === you) continue;
-      const domain = domainOf(email);
-      if (!domain || GENERIC_DOMAINS.has(domain)) continue;
-      domainCounts.set(domain, (domainCounts.get(domain) ?? 0) + 1);
-    }
+  let distilled: DistilledEvidence;
+  if (opts.distilled) {
+    distilled = opts.distilled;
+  } else if (opts.activity) {
+    distilled = distillEvidence(opts.activity, you);
+  } else {
+    // Last resort (rows that predate the evidence column): a bounded re-read.
+    // Small budget + hard deadline — this path lives inside a 120s function and
+    // used to attempt a FULL six-month read there, which rarely survived.
+    const deadline = opts.deadline ?? Date.now() + 100_000;
+    const activity = await fetchGmailActivity(opts.accessToken, {
+      deadline,
+      quotaKey: you,
+      budget: new RunBudget(5_000),
+    });
+    distilled = distillEvidence(activity, you);
   }
 
+  const { outboundSubjects, topDomains, eventTitles } = distilled;
   const evidence = {
     subjects: outboundSubjects.length,
-    domains: domainCounts.size,
-    events: events.length,
+    domains: topDomains.length,
+    events: eventTitles.length,
   };
 
   opts.onEvidence?.(evidence);
@@ -174,16 +236,6 @@ export async function synthesizeProfile(opts: {
   if (!process.env.ANTHROPIC_API_KEY) {
     return { draft: null, generated: false, reason: "no_api_key", evidence };
   }
-
-  const topDomains = [...domainCounts.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, MAX_DOMAINS)
-    .map(([domain, count]) => `${domain} (${count})`);
-
-  const eventTitles = [...new Set(events.map((e) => e.summary?.trim()).filter(Boolean))].slice(
-    0,
-    MAX_EVENTS,
-  );
 
   const guidance = opts.guidance?.trim();
 
@@ -206,6 +258,10 @@ export async function synthesizeProfile(opts: {
   // is drained, so the loop below is required, not optional.
   const { partialObjectStream, object: finalObject } = streamObject({
     model: anthropic(SYNTHESIS_MODEL),
+    // The draft object is small; without this the provider default is the
+    // model's 128k ceiling.
+    maxOutputTokens: 4_096,
+    maxRetries: 3,
     schema: ProfileDraftSchema,
     prompt:
       `Synthesize a public profile for someone, to show to other people in a shared ` +

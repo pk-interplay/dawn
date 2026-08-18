@@ -25,7 +25,10 @@
     "typecheck": "tsc --noEmit",
     "mcp": "tsx src/mcp/server.ts",
     "auth:config": "tsx src/scripts/configure-auth.ts",
-    "verify:gateway": "tsx src/scripts/verify-gateway.ts"
+    "sync:gmail": "tsx src/scripts/sync-gmail.ts",
+    "backfill:gmail": "tsx src/scripts/backfill-gmail.ts",
+    "verify:gateway": "tsx src/scripts/verify-gateway.ts",
+    "verify:lockdown": "tsx src/scripts/verify-lockdown.ts"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^4.0.33",

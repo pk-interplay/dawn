@@ -105,7 +105,7 @@ const SENT_UNIT_SHARE = 0.4;
  * query (rather than fetching and discarding) is the cheapest quota win available
  * — on a busy mailbox it is most of the volume.
  */
-const RECEIVED_EXCLUSIONS =
+export const RECEIVED_EXCLUSIONS =
   "-in:sent -in:chats -in:draft -category:promotions -category:social -category:forums";
 
 export interface GmailHeaderSet {
@@ -117,6 +117,14 @@ export interface GmailHeaderSet {
   /** Gmail's own message id. */
   gmailMessageId?: string;
   gmailThreadId?: string;
+  /** Gmail's internalDate (epoch ms) — the timestamp Gmail's own `after:`/`before:`
+   *  operators compare against, so it is the only safe key for a windowed cursor.
+   *  The RFC-2822 Date header above is sender-supplied and can lie. */
+  internalDateMs?: number;
+  /** Gmail labels — free in format=metadata. The incremental sync filters on
+   *  these because history.list has no category exclusions the way the initial
+   *  ingest's `q=` query does. */
+  labelIds?: string[];
 }
 
 export interface CalendarEventAttendees {
@@ -152,8 +160,13 @@ export interface ReadProgressUpdate {
 
 export type ReadProgress = (update: ReadProgressUpdate) => void;
 
-function lookbackDate(): Date {
-  const d = new Date();
+/**
+ * The default start of the ingest window: LOOKBACK_MONTHS before `from`.
+ * Exported so the onboarding route can pin the backfill's total window to the
+ * moment onboarding ran, rather than to whenever a backfill pass happens to fire.
+ */
+export function defaultLookbackDate(from: Date = new Date()): Date {
+  const d = new Date(from);
   d.setMonth(d.getMonth() - LOOKBACK_MONTHS);
   return d;
 }
@@ -194,6 +207,26 @@ export function classifyGoogleFailure(status: number, body: string): GoogleFailu
   if (status === 403 && QUOTA_BODY_PATTERN.test(body)) return "quota";
   if (status >= 500) return "transient";
   return "terminal";
+}
+
+/**
+ * A user-safe rendering of a failed Google call.
+ *
+ * googleFetch's own errors embed the request URL and Google's raw response body —
+ * exactly right for the server log, wrong for a UI. Routes log the full error and
+ * send this instead. The only cases worth distinguishing for the user are the two
+ * they can act on: an expired/revoked grant (sign in again) and a quota pause
+ * (wait). Everything else is "try again".
+ */
+export function publicGoogleErrorMessage(err: unknown): string {
+  const message = err instanceof Error ? err.message : "";
+  if (/\((401|403)\)/.test(message) && !QUOTA_BODY_PATTERN.test(message)) {
+    return "Your Google access expired. Sign out and back in to reconnect Gmail.";
+  }
+  if (/\(429\)/.test(message) || QUOTA_BODY_PATTERN.test(message)) {
+    return "Gmail is rate-limiting the sync right now. Wait a minute and try again.";
+  }
+  return "Gmail sync failed. Try again, or sign out and back in if it keeps happening.";
 }
 
 /**
@@ -290,24 +323,26 @@ export class RunBudget {
 }
 
 /**
- * One window per mailbox, keyed by access token. The quota is per user, so a
- * shared window would throttle unrelated users against each other. Tokens rotate
- * on refresh (a rotated token starts with a fresh window — absorbed by the 20%
- * headroom), so the map is capped and evicted oldest-first rather than grown.
+ * One window per mailbox. The quota is per USER, so callers pass the user's
+ * email as `quotaKey` — a stable identity that survives token rotation. (This
+ * was previously keyed by the access token itself, which reset the window to
+ * zero on every refresh and let one user's rotated tokens hold several full
+ * windows at once.) The access token remains the fallback key for callers that
+ * haven't been threaded yet. The map is capped and evicted oldest-first.
  */
 const QUOTA_WINDOW_LIMIT = 32;
 const quotaWindows = new Map<string, QuotaWindow>();
 
-function quotaWindowFor(token: string): QuotaWindow {
-  const existing = quotaWindows.get(token);
+function quotaWindowFor(key: string): QuotaWindow {
+  const existing = quotaWindows.get(key);
   if (existing) {
     // Re-insert so iteration order tracks recency for the eviction below.
-    quotaWindows.delete(token);
-    quotaWindows.set(token, existing);
+    quotaWindows.delete(key);
+    quotaWindows.set(key, existing);
     return existing;
   }
   const created = new QuotaWindow();
-  quotaWindows.set(token, created);
+  quotaWindows.set(key, created);
   if (quotaWindows.size > QUOTA_WINDOW_LIMIT) {
     const oldest = quotaWindows.keys().next();
     if (!oldest.done) quotaWindows.delete(oldest.value);
@@ -321,8 +356,15 @@ async function googleFetch(
   units: number,
   budget?: RunBudget,
   deadline?: Deadline,
+  quotaKey?: string,
+  fetchOpts?: {
+    /** "return" makes a 404 yield null instead of a terminal throw — for
+     *  history.list, where 404 means "historyId expired", an expected state
+     *  with its own recovery path, not a failure. */
+    on404?: "return" | "throw";
+  },
 ) {
-  const quota = quotaWindowFor(token);
+  const quota = quotaWindowFor(quotaKey ?? token);
 
   for (let attempt = 1; ; attempt++) {
     await quota.spend(units);
@@ -333,6 +375,7 @@ async function googleFetch(
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     if (res.ok) return res.json();
+    if (res.status === 404 && fetchOpts?.on404 === "return") return null;
 
     const body = await res.text().catch(() => "");
     const kind = classifyGoogleFailure(res.status, body);
@@ -381,18 +424,22 @@ async function googleFetch(
 
 /**
  * Pages users.messages.list for one query and returns up to `cap` message ids,
- * newest first (Gmail's own ordering). Stops early if the run budget cannot afford
- * another page. Logs when either limit truncates the result — a silently truncated
- * ingest reads as a complete one.
+ * newest first (Gmail's own ordering), plus what — if anything — cut the listing
+ * short. `truncated: null` means the query drained: there is nothing older left
+ * in the window, which is how the backfill knows it is finished. Stops early if
+ * the run budget cannot afford another page. Logs when a limit truncates the
+ * result — a silently truncated ingest reads as a complete one. Exported for
+ * gmail-sync.ts's stale-history fallback and the backfill.
  */
-async function listMessageIds(
+export async function listMessageIds(
   token: string,
   budget: RunBudget,
   q: string,
   cap: number,
   label: string,
   deadline?: Deadline,
-) {
+  quotaKey?: string,
+): Promise<{ ids: string[]; truncated: "cap" | "budget" | "time" | null }> {
   const ids: string[] = [];
   let pageToken: string | undefined;
   let truncatedBy: "cap" | "budget" | "time" | null = null;
@@ -413,7 +460,7 @@ async function listMessageIds(
     url.searchParams.set("maxResults", String(Math.min(500, cap - ids.length)));
     if (pageToken) url.searchParams.set("pageToken", pageToken);
 
-    const page = await googleFetch(token, url.toString(), UNITS_MESSAGES_LIST, budget, deadline);
+    const page = await googleFetch(token, url.toString(), UNITS_MESSAGES_LIST, budget, deadline, quotaKey);
     ids.push(...(page.messages ?? []).map((m: { id: string }) => m.id));
     pageToken = page.nextPageToken;
 
@@ -431,18 +478,19 @@ async function listMessageIds(
           ? "run budget exhausted"
           : "time budget exhausted";
     console.info(
-      `[gmail-ingest] ${label}: stopped listing at ${ids.length} messages (${why}; more exist in the ${LOOKBACK_MONTHS}-month window)`,
+      `[gmail-ingest] ${label}: stopped listing at ${ids.length} messages (${why}; more exist in the window)`,
     );
   }
-  return ids.slice(0, cap);
+  return { ids: ids.slice(0, cap), truncated: truncatedBy };
 }
 
 /**
  * Fetches header metadata for a list of message ids, BATCH_SIZE at a time, and
  * stops as soon as the run budget can no longer afford a batch. Returns what it
  * managed to fetch — a short run is a smaller graph, not a failed one.
+ * Exported for the incremental sync (gmail-sync.ts), which brings its own ids.
  */
-async function fetchHeaders(
+export async function fetchHeaders(
   token: string,
   budget: RunBudget,
   ids: string[],
@@ -450,6 +498,7 @@ async function fetchHeaders(
   onBatch?: (batch: GmailHeaderSet[]) => void,
   deadline?: Deadline,
   onProgress?: (fetchedInThisDirection: number, totalInThisDirection: number) => void,
+  quotaKey?: string,
 ): Promise<GmailHeaderSet[]> {
   const headers: GmailHeaderSet[] = [];
   onProgress?.(0, ids.length);
@@ -486,6 +535,7 @@ async function fetchHeaders(
           UNITS_MESSAGES_GET,
           budget,
           deadline,
+          quotaKey,
         );
         const get = (name: string) =>
           (msg.payload?.headers ?? []).find(
@@ -499,6 +549,8 @@ async function fetchHeaders(
           subject: get("Subject"),
           gmailMessageId: msg.id as string | undefined,
           gmailThreadId: msg.threadId as string | undefined,
+          labelIds: (msg.labelIds as string[] | undefined) ?? undefined,
+          internalDateMs: msg.internalDate ? Number(msg.internalDate) : undefined,
         };
       }),
     );
@@ -520,15 +572,23 @@ async function fetchHeaders(
  *
  * `onBatch` (optional) is called with each batch of headers as it comes back from
  * Gmail, so a caller can surface ingest progress live (e.g. the onboarding ticker)
- * instead of waiting for the whole lookback window to page in. */
+ * instead of waiting for the whole lookback window to page in.
+ *
+ * `window` (optional) overrides the default LOOKBACK_MONTHS lookback — the shallow
+ * onboarding ingest passes the last 30 days and leaves the rest to the backfill. */
 export async function fetchRecentGmailHeaders(
   token: string,
   onBatch?: (batch: GmailHeaderSet[]) => void,
   budget: RunBudget = new RunBudget(),
   deadline?: Deadline,
   onProgress?: ReadProgress,
+  quotaKey?: string,
+  window?: { after: Date; before?: Date },
 ): Promise<GmailHeaderSet[]> {
-  const after = Math.floor(lookbackDate().getTime() / 1000);
+  const after = Math.floor((window?.after ?? defaultLookbackDate()).getTime() / 1000);
+  // Gmail's before: is a strict less-than on internal date, so [after, before)
+  // windows tile without overlap.
+  const beforeClause = window?.before ? ` before:${Math.floor(window.before.getTime() / 1000)}` : "";
   const seen = new Set<string>();
 
   // Sent is fetched before received is even listed, so the totals arrive in two parts.
@@ -546,13 +606,14 @@ export async function fetchRecentGmailHeaders(
   // Sent first, and interleaved list→fetch rather than listing both directions up
   // front: spending the budget in priority order is what makes "sent wins" true.
   const sentCap = Math.floor((budget.remaining() * SENT_UNIT_SHARE) / UNITS_MESSAGES_GET);
-  const sentIds = await listMessageIds(
+  const { ids: sentIds } = await listMessageIds(
     token,
     budget,
-    `in:sent after:${after}`,
+    `in:sent after:${after}${beforeClause}`,
     sentCap,
     "sent",
     deadline,
+    quotaKey,
   );
   sentIds.forEach((id) => seen.add(id));
   const sent = await fetchHeaders(
@@ -563,6 +624,7 @@ export async function fetchRecentGmailHeaders(
     onBatch,
     deadline,
     report("sent"),
+    quotaKey,
   );
   doneBefore = sent.length;
   totalBefore = sentIds.length;
@@ -573,12 +635,13 @@ export async function fetchRecentGmailHeaders(
     await listMessageIds(
       token,
       budget,
-      `${RECEIVED_EXCLUSIONS} after:${after}`,
+      `${RECEIVED_EXCLUSIONS} after:${after}${beforeClause}`,
       receivedCap,
       "received",
       deadline,
+      quotaKey,
     )
-  ).filter((id) => !seen.has(id));
+  ).ids.filter((id) => !seen.has(id));
   const received = await fetchHeaders(
     token,
     budget,
@@ -587,6 +650,7 @@ export async function fetchRecentGmailHeaders(
     onBatch,
     deadline,
     report("received"),
+    quotaKey,
   );
 
   console.info(
@@ -595,41 +659,168 @@ export async function fetchRecentGmailHeaders(
   return [...sent, ...received];
 }
 
-/** Lists recent Calendar events on the primary calendar with their attendees.
- * Already metadata-only — no event descriptions are fetched. */
+/** Quota cost of one users.history.list page. */
+const UNITS_HISTORY_LIST = 2;
+
+/**
+ * The mailbox's current historyId (users.getProfile, 1 unit). Captured at the
+ * START of a full ingest and persisted after the graph write succeeds, so the
+ * first incremental sync replays anything that arrived mid-ingest — safe,
+ * because every graph write is an idempotent upsert.
+ */
+export async function fetchGmailHistoryId(token: string, quotaKey?: string): Promise<string> {
+  const profile = await googleFetch(
+    token,
+    "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+    1,
+    undefined,
+    undefined,
+    quotaKey,
+  );
+  return String(profile.historyId);
+}
+
+/**
+ * Message ids added since `startHistoryId` (users.history.list, messageAdded
+ * only). `stale: true` means Gmail no longer holds that baseline (~a week of
+ * retention → 404) and the caller must fall back to a bounded re-list plus a
+ * fresh baseline. Ids are deduped — one message can appear in several history
+ * records.
+ */
+export async function listHistoryMessageIds(
+  token: string,
+  budget: RunBudget,
+  startHistoryId: string,
+  deadline?: Deadline,
+  quotaKey?: string,
+): Promise<{ ids: string[]; historyId: string; stale: boolean }> {
+  const ids = new Set<string>();
+  let latestHistoryId = startHistoryId;
+  let pageToken: string | undefined;
+
+  do {
+    if (!budget.canAfford(UNITS_HISTORY_LIST) || expired(deadline)) break;
+
+    const url = new URL("https://gmail.googleapis.com/gmail/v1/users/me/history");
+    url.searchParams.set("startHistoryId", startHistoryId);
+    url.searchParams.set("historyTypes", "messageAdded");
+    url.searchParams.set("maxResults", "500");
+    if (pageToken) url.searchParams.set("pageToken", pageToken);
+
+    const page = await googleFetch(
+      token,
+      url.toString(),
+      UNITS_HISTORY_LIST,
+      budget,
+      deadline,
+      quotaKey,
+      { on404: "return" },
+    );
+    if (page === null) return { ids: [], historyId: startHistoryId, stale: true };
+
+    for (const record of page.history ?? []) {
+      for (const added of record.messagesAdded ?? []) {
+        if (added.message?.id) ids.add(added.message.id as string);
+      }
+    }
+    if (page.historyId) latestHistoryId = String(page.historyId);
+    pageToken = page.nextPageToken;
+  } while (pageToken);
+
+  return { ids: [...ids], historyId: latestHistoryId, stale: false };
+}
+
+/** Labels the incremental sync must drop — the equivalent of the initial
+ *  ingest's RECEIVED_EXCLUSIONS, which history.list cannot express in a query. */
+const EXCLUDED_LABELS = new Set([
+  "DRAFT",
+  "CHAT",
+  "SPAM",
+  "TRASH",
+  "CATEGORY_PROMOTIONS",
+  "CATEGORY_SOCIAL",
+  "CATEGORY_FORUMS",
+]);
+
+export function isNetworkSignal(header: GmailHeaderSet): boolean {
+  return !(header.labelIds ?? []).some((label) => EXCLUDED_LABELS.has(label));
+}
+
+/** Global ceiling on events fetched per read, across all windows. */
+const CALENDAR_EVENT_CAP = 500;
+
+/**
+ * Lists Calendar events on the primary calendar with their attendees.
+ * Already metadata-only — no event descriptions are fetched.
+ *
+ * Fetched in MONTHLY windows, NEWEST FIRST. The Calendar API only orders
+ * ascending, and the old single 6-month ascending query walked forward from six
+ * months ago and hit the 500-event cap on the OLDEST events — so a busy
+ * calendar (>~4 events/working day) silently lost its most recent months, and
+ * meetings carry 3× an email's weight in edge strength. Windowing newest-first
+ * means whatever the cap cuts is the oldest, least-signal end.
+ *
+ * `window` overrides the default 6-month lookback — the incremental sync passes
+ * `[last_synced_at − 30d, now + 60d]` (upcoming meetings are signal too).
+ */
 export async function fetchRecentCalendarEvents(
   token: string,
   deadline?: Deadline,
+  quotaKey?: string,
+  window?: { timeMin: Date; timeMax: Date; cap?: number },
 ): Promise<CalendarEventAttendees[]> {
-  const url = new URL("https://www.googleapis.com/calendar/v3/calendars/primary/events");
-  url.searchParams.set("timeMin", lookbackDate().toISOString());
-  url.searchParams.set("singleEvents", "true");
-  url.searchParams.set("maxResults", "250");
-  url.searchParams.set("orderBy", "startTime");
+  const cap = window?.cap ?? CALENDAR_EVENT_CAP;
+
+  // Build the month slices, newest first. A custom window becomes slices too —
+  // same code path, and a >1-month incremental window still degrades gracefully.
+  const rangeMin = window?.timeMin ?? defaultLookbackDate();
+  const rangeMax = window?.timeMax ?? new Date();
+  const slices: { timeMin: Date; timeMax: Date }[] = [];
+  for (let end = rangeMax; end > rangeMin; ) {
+    const start = new Date(end);
+    start.setMonth(start.getMonth() - 1);
+    slices.push({ timeMin: start > rangeMin ? start : rangeMin, timeMax: end });
+    end = start;
+  }
 
   const events: CalendarEventAttendees[] = [];
-  let pageToken: string | undefined;
-  do {
-    if (pageToken) url.searchParams.set("pageToken", pageToken);
-    // Calendar has its own quota, far looser than Gmail's and measured in requests
-    // rather than units; the window is shared here only so one mailbox's Calendar
-    // paging cannot itself become a burst.
-    const page = await googleFetch(token, url.toString(), 1, undefined, deadline);
-    for (const event of page.items ?? []) {
-      events.push({
-        start: event.start?.dateTime ?? event.start?.date,
-        summary: event.summary,
-        attendees: (event.attendees ?? []).map((a: { email: string; displayName?: string }) => ({
-          email: a.email,
-          displayName: a.displayName,
-        })),
-      });
-    }
-    pageToken = page.nextPageToken;
-    // Calendar paging is cheap but not free, and it runs concurrently with the mailbox
-    // read that owns most of the budget. Stop rather than push the caller over.
-  } while (pageToken && events.length < 500 && !expired(deadline));
+  for (const slice of slices) {
+    if (events.length >= cap || expired(deadline)) break;
 
+    const url = new URL("https://www.googleapis.com/calendar/v3/calendars/primary/events");
+    url.searchParams.set("timeMin", slice.timeMin.toISOString());
+    url.searchParams.set("timeMax", slice.timeMax.toISOString());
+    url.searchParams.set("singleEvents", "true");
+    url.searchParams.set("maxResults", "250");
+    url.searchParams.set("orderBy", "startTime");
+
+    let pageToken: string | undefined;
+    do {
+      if (pageToken) url.searchParams.set("pageToken", pageToken);
+      else url.searchParams.delete("pageToken");
+      // Calendar has its own quota, far looser than Gmail's and measured in requests
+      // rather than units; the window is shared here only so one mailbox's Calendar
+      // paging cannot itself become a burst.
+      const page = await googleFetch(token, url.toString(), 1, undefined, deadline, quotaKey);
+      for (const event of page.items ?? []) {
+        events.push({
+          start: event.start?.dateTime ?? event.start?.date,
+          summary: event.summary,
+          attendees: (event.attendees ?? []).map((a: { email: string; displayName?: string }) => ({
+            email: a.email,
+            displayName: a.displayName,
+          })),
+        });
+      }
+      pageToken = page.nextPageToken;
+    } while (pageToken && events.length < cap && !expired(deadline));
+  }
+
+  if (events.length >= cap) {
+    console.info(
+      `[gmail-ingest] calendar read stopped at the ${cap}-event cap; oldest months were dropped`,
+    );
+  }
   return events;
 }
 
@@ -641,17 +832,37 @@ export async function fetchRecentCalendarEvents(
  * The two run concurrently. Calendar is a different service with its own, far
  * looser quota (measured in requests, not Gmail units), so it is neither charged
  * against the Gmail run budget nor worth serialising behind a mailbox read that
- * takes orders of magnitude longer.
+ * takes orders of magnitude longer. `window` narrows only the Gmail leg — the
+ * calendar read is cheap enough to always cover the full default lookback.
+ * `onCalendarDone` fires when the calendar leg resolves, which the Promise.all
+ * otherwise makes invisible to callers showing per-leg progress.
  */
 export async function fetchGmailActivity(
   token: string,
-  onBatch?: (batch: GmailHeaderSet[]) => void,
-  deadline?: Deadline,
-  onProgress?: ReadProgress,
+  opts: {
+    onBatch?: (batch: GmailHeaderSet[]) => void;
+    deadline?: Deadline;
+    onProgress?: ReadProgress;
+    quotaKey?: string;
+    budget?: RunBudget;
+    window?: { after: Date; before?: Date };
+    onCalendarDone?: (events: CalendarEventAttendees[]) => void;
+  } = {},
 ): Promise<GmailActivity> {
   const [headers, events] = await Promise.all([
-    fetchRecentGmailHeaders(token, onBatch, new RunBudget(), deadline, onProgress),
-    fetchRecentCalendarEvents(token, deadline),
+    fetchRecentGmailHeaders(
+      token,
+      opts.onBatch,
+      opts.budget ?? new RunBudget(),
+      opts.deadline,
+      opts.onProgress,
+      opts.quotaKey,
+      opts.window,
+    ),
+    fetchRecentCalendarEvents(token, opts.deadline, opts.quotaKey).then((events) => {
+      opts.onCalendarDone?.(events);
+      return events;
+    }),
   ]);
   return { headers, events };
 }

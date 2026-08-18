@@ -1,4 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import pLimit from "p-limit";
 import {
   findOrCreateOrgByDomain,
   projectDisplayName,
@@ -29,6 +30,19 @@ export const COMPANY_MIN_PEOPLE = 6;
 /** Don't re-pay Exa for a company enriched within this window. */
 const ENRICH_TTL_DAYS = 30;
 
+/**
+ * At most this many Exa+Haiku+embedding enrichments per run. The daily cron plus
+ * the 30-day TTL means the backlog drains over subsequent runs; without a cap,
+ * one run tried to enrich EVERY qualifying domain sequentially and was killed by
+ * the platform partway, every day, forever — company reconciliation had likely
+ * never completed a pass.
+ */
+const MAX_ENRICHMENTS_PER_RUN = 10;
+
+/** Concurrent domains in flight. Per-domain internals stay sequential (claim →
+ *  edges → enrich ordering matters); this only overlaps separate domains. */
+const DOMAIN_CONCURRENCY = 3;
+
 export interface ReconcileSummary {
   domainsConsidered: number;
   companiesCreated: number;
@@ -36,6 +50,8 @@ export interface ReconcileSummary {
   edgesWritten: number;
   skippedEnrichment: number;
   failures: string[];
+  /** True when the deadline or the enrichment cap left work for the next run. */
+  truncated: boolean;
 }
 
 /**
@@ -86,14 +102,32 @@ async function isFreshlyEnriched(client: SupabaseClient, orgId: string): Promise
   );
 }
 
-export async function reconcileCompanies(client: SupabaseClient): Promise<ReconcileSummary> {
-  const { data: emailRows, error } = await client
-    .from("resolved_attributes")
-    .select("subject_id, value")
-    .eq("attribute", "email");
-  if (error) throw new Error(`reconcileCompanies email lookup failed: ${error.message}`);
+export async function reconcileCompanies(
+  client: SupabaseClient,
+  opts: { deadline?: number; maxEnrichments?: number } = {},
+): Promise<ReconcileSummary> {
+  const maxEnrichments = opts.maxEnrichments ?? MAX_ENRICHMENTS_PER_RUN;
+  const outOfTime = () => opts.deadline !== undefined && Date.now() >= opts.deadline;
 
-  const byDomain = bucketPeopleByDomain(emailRows ?? []);
+  // Paged, like claims.ts loadEmailIndex. An unpaged select is silently capped at
+  // PostgREST's 1000-row default, which meant reconciliation only ever SAW the
+  // first thousand addresses in the graph — real companies past that point were
+  // never promoted, with no error anywhere.
+  const emailRows: { subject_id: string; value: unknown }[] = [];
+  const PAGE = 1000;
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await client
+      .from("resolved_attributes")
+      .select("subject_id, value")
+      .eq("attribute", "email")
+      .order("subject_id")
+      .range(from, from + PAGE - 1);
+    if (error) throw new Error(`reconcileCompanies email lookup failed: ${error.message}`);
+    emailRows.push(...(data ?? []));
+    if (!data || data.length < PAGE) break;
+  }
+
+  const byDomain = bucketPeopleByDomain(emailRows);
 
   const summary: ReconcileSummary = {
     domainsConsidered: byDomain.size,
@@ -102,10 +136,19 @@ export async function reconcileCompanies(client: SupabaseClient): Promise<Reconc
     edgesWritten: 0,
     skippedEnrichment: 0,
     failures: [],
+    truncated: false,
   };
 
-  for (const [domain, people] of byDomain.entries()) {
-    if (people.size < COMPANY_MIN_PEOPLE) continue;
+  // Synchronous check-and-increment (single-threaded between awaits), so the cap
+  // holds even with domains in flight concurrently.
+  let enrichmentsStarted = 0;
+
+  const limit = pLimit(DOMAIN_CONCURRENCY);
+  const processDomain = async (domain: string, people: Set<string>) => {
+    if (outOfTime()) {
+      summary.truncated = true;
+      return;
+    }
 
     try {
       const { id: orgId, created } = await findOrCreateOrgByDomain(client, domain);
@@ -158,7 +201,13 @@ export async function reconcileCompanies(client: SupabaseClient): Promise<Reconc
       // Enrich at most once per TTL — Exa costs money and a daily cron must not re-pay.
       if (await isFreshlyEnriched(client, orgId)) {
         summary.skippedEnrichment += 1;
+      } else if (enrichmentsStarted >= maxEnrichments) {
+        // Cap reached: the org and its edges still stand; enrichment waits for a
+        // later run. Reported, never silent.
+        summary.skippedEnrichment += 1;
+        summary.truncated = true;
       } else {
+        enrichmentsStarted += 1;
         const result = await enrichCompany(client, { entityId: orgId, domain });
         if (result.enriched) summary.companiesEnriched += 1;
         else summary.skippedEnrichment += 1; // no_api_key — org + edges still stand
@@ -168,7 +217,18 @@ export async function reconcileCompanies(client: SupabaseClient): Promise<Reconc
       // network-ingest: a single domain's failure is logged, the rest proceed.
       summary.failures.push(`${domain}: ${err instanceof Error ? err.message : String(err)}`);
     }
-  }
+  };
 
+  await Promise.all(
+    [...byDomain.entries()]
+      .filter(([, people]) => people.size >= COMPANY_MIN_PEOPLE)
+      .map(([domain, people]) => limit(() => processDomain(domain, people))),
+  );
+
+  if (summary.truncated) {
+    console.info(
+      `[reconcile-companies] run truncated (deadline or enrichment cap); remaining domains complete on later runs`,
+    );
+  }
   return summary;
 }

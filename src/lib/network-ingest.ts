@@ -1,6 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import {
   fetchGmailActivity,
+  type CalendarEventAttendees,
   type Deadline,
   type GmailActivity,
   type ReadProgress,
@@ -120,11 +121,21 @@ export async function ingestGmailNetwork(
      * run out of time to report the result.
      */
     deadline?: Deadline;
+    /**
+     * Narrows the Gmail read. The shallow onboarding ingest passes the last 30
+     * days; the 6-month remainder is the backfill cron's job. Calendar always
+     * reads its full default window — it is cheap and not the latency problem.
+     */
+    window?: { after: Date; before?: Date };
+    /** Fires when the calendar leg finishes — the two legs run concurrently, so
+     *  this is the only way a caller can tick "calendar" off before the Gmail
+     *  read completes. */
+    onCalendarDone?: (events: CalendarEventAttendees[]) => void;
   } = {},
 ): Promise<IngestSummary> {
-  const { onContact, onActivity, onWriteProgress, onReadProgress, deadline } = opts;
+  const { onContact, onActivity, onWriteProgress, onReadProgress, deadline, window, onCalendarDone } =
+    opts;
   const you = youEmail.toLowerCase();
-  const outOfTime = () => deadline !== undefined && Date.now() >= deadline;
 
   // Surface each real correspondent the moment its header batch arrives, so the
   // onboarding screen can stream names in during the fetch rather than staring at a
@@ -144,9 +155,51 @@ export async function ingestGmailNetwork(
       }
     : undefined;
 
-  const activity = await fetchGmailActivity(accessToken, onBatch, deadline, onReadProgress);
-  const { headers, events } = activity;
+  // Quota window keyed by the user, not the token — see quotaWindowFor().
+  const activity = await fetchGmailActivity(accessToken, {
+    onBatch,
+    deadline,
+    onProgress: onReadProgress,
+    quotaKey: you,
+    window,
+    onCalendarDone,
+  });
   onActivity?.(activity);
+
+  return writeActivityToGraph(client, youEmail, activity, {
+    mode: "snapshot",
+    deadline,
+    onWriteProgress,
+  });
+}
+
+/**
+ * The aggregate-and-write half of the ingest, split from the mailbox read so
+ * the incremental sync (gmail-sync.ts) can feed it a history DELTA instead of a
+ * full six-month snapshot.
+ *
+ * `mode` decides what an edge write means:
+ *  - "snapshot": the activity IS the full lookback window, so the computed
+ *    strength simply replaces whatever the edge had (the original behavior).
+ *  - "incremental": the activity is only what changed since the last sync, so
+ *    the new strength is the prior strength decayed to now PLUS the delta —
+ *    letting a raw delta overwrite the edge would clobber six months of signal
+ *    with one afternoon's email.
+ */
+export async function writeActivityToGraph(
+  client: SupabaseClient,
+  youEmail: string,
+  activity: GmailActivity,
+  opts: {
+    mode: "snapshot" | "incremental";
+    deadline?: Deadline;
+    onWriteProgress?: (written: number, total: number) => void;
+  },
+): Promise<IngestSummary> {
+  const { mode, deadline, onWriteProgress } = opts;
+  const you = youEmail.toLowerCase();
+  const outOfTime = () => deadline !== undefined && Date.now() >= deadline;
+  const { headers, events } = activity;
 
   const contacts = new Map<string, ContactAccum>();
 
@@ -264,6 +317,33 @@ export async function ingestGmailNetwork(
     }
   }
 
+  // Incremental mode folds new activity into the existing edge instead of
+  // replacing it: read the prior strength for every touched contact (the delta
+  // set is small), decay it to now, and add the delta's contribution.
+  const priorEdges = new Map<string, { strength: number | null; observed_at: string | null }>();
+  if (mode === "incremental" && known.size) {
+    const ids = [...known.values()];
+    for (let i = 0; i < ids.length; i += WRITE_CHUNK) {
+      const { data, error } = await client
+        .from("edges")
+        .select("to_id, strength, observed_at")
+        .eq("from_id", yourEntityId)
+        .eq("kind", "knows")
+        .eq("source", `gmail:${you}`)
+        .in("to_id", ids.slice(i, i + WRITE_CHUNK));
+      if (error) {
+        failures.push(`prior edges read at ${i}: ${error.message}`);
+        break;
+      }
+      for (const row of data ?? []) {
+        priorEdges.set(row.to_id as string, {
+          strength: row.strength as number | null,
+          observed_at: row.observed_at as string | null,
+        });
+      }
+    }
+  }
+
   // The observation claims for this run, and the edges. Built in memory, written in
   // chunks, and counted only for contacts that actually have an entity to hang off.
   const observationClaims: ClaimInput[] = [];
@@ -296,13 +376,30 @@ export async function ingestGmailNetwork(
     }
 
     const rawScore = c.emailCount + c.meetingCount * MEETING_WEIGHT;
+    const deltaStrength = rawScore * recencyWeight(c.lastInteractionAt);
+    // Snapshot: the delta IS the whole window; carried is zero and this reduces
+    // to the original formula. Incremental: decay the prior to now, then add.
+    const prior = priorEdges.get(entityId);
+    const carried =
+      prior?.strength != null && prior.observed_at
+        ? prior.strength * recencyWeight(Date.parse(prior.observed_at))
+        : 0;
+    // An incremental delta can be OLDER than the edge (the backfill feeds
+    // months-old mail). The edge's observed_at must never regress: it is the
+    // decay anchor, and letting old mail rewind it would make the next pass
+    // decay the combined strength as if the recent signal were months stale.
+    const priorMs = prior?.observed_at ? Date.parse(prior.observed_at) : 0;
+    const edgeObservedAt =
+      mode === "incremental" && priorMs > c.lastInteractionAt
+        ? (prior!.observed_at as string)
+        : observedAt;
     edgeRows.push({
       from_id: yourEntityId,
       to_id: entityId,
       kind: "knows",
-      strength: Math.min(1, rawScore * recencyWeight(c.lastInteractionAt)),
+      strength: Math.min(1, carried + deltaStrength),
       source: `gmail:${you}`,
-      observed_at: observedAt,
+      observed_at: edgeObservedAt,
     });
     entitiesTouched += 1;
   }

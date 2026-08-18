@@ -4,7 +4,9 @@ import {
   QuotaWindow,
   RunBudget,
   classifyGoogleFailure,
+  fetchHeaders,
   fetchRecentGmailHeaders,
+  listMessageIds,
 } from "./gmail-ingest";
 
 /**
@@ -201,5 +203,139 @@ describe("googleFetch retry behaviour (via fetchRecentGmailHeaders)", () => {
 
     // Terminal means terminal: one attempt, no backoff, no second call.
     expect(impl).toHaveBeenCalledTimes(1);
+  });
+
+  it("puts a window's after: and before: into both directions' queries", async () => {
+    const { calls } = stubFetch([]);
+
+    const after = new Date("2026-07-19T00:00:00Z");
+    const before = new Date("2026-08-18T00:00:00Z");
+    await fetchRecentGmailHeaders(
+      "test-token-window",
+      undefined,
+      new RunBudget(),
+      undefined,
+      undefined,
+      undefined,
+      { after, before },
+    );
+
+    const afterEpoch = Math.floor(after.getTime() / 1000);
+    const beforeEpoch = Math.floor(before.getTime() / 1000);
+    const queries = calls.map((url) => new URL(url).searchParams.get("q"));
+    expect(queries).toHaveLength(2); // sent list + received list; nothing to fetch
+    for (const q of queries) {
+      expect(q).toContain(`after:${afterEpoch}`);
+      expect(q).toContain(`before:${beforeEpoch}`);
+    }
+  });
+
+  it("defaults to the six-month lookback with no before: when no window is given", async () => {
+    const { calls } = stubFetch([]);
+
+    await fetchRecentGmailHeaders("test-token-default-window", undefined, new RunBudget());
+
+    const q = new URL(calls[0]).searchParams.get("q")!;
+    expect(q).not.toContain("before:");
+    const after = Number(q.match(/after:(\d+)/)?.[1]);
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+    // Within a day of six months back — locks the default without pinning the clock.
+    expect(Math.abs(after * 1000 - sixMonthsAgo.getTime())).toBeLessThan(86_400_000);
+  });
+});
+
+/**
+ * The listing's truncation report is what tells the backfill "the window is
+ * drained" apart from "a limit stopped us" — the difference between clearing
+ * the cursor forever and advancing it. Driven with fetch stubbed, same harness
+ * as above.
+ */
+describe("listMessageIds truncation reporting", () => {
+  function stubPages(pages: { ids: string[]; nextPageToken?: string }[]) {
+    const impl = vi.fn(async () => {
+      const next = pages.shift() ?? { ids: [] };
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        text: async () => "",
+        json: async () => ({
+          messages: next.ids.map((id) => ({ id })),
+          nextPageToken: next.nextPageToken,
+        }),
+      };
+    });
+    vi.stubGlobal("fetch", impl);
+    return impl;
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("reports truncated: null when the listing drains", async () => {
+    stubPages([{ ids: ["a", "b"] }]);
+    const result = await listMessageIds("t-drain", new RunBudget(), "q", 100, "test");
+    expect(result.ids).toEqual(["a", "b"]);
+    expect(result.truncated).toBeNull();
+  });
+
+  it("reports truncated: 'cap' when pages remain past the cap", async () => {
+    stubPages([{ ids: ["a", "b"], nextPageToken: "more" }]);
+    const result = await listMessageIds("t-cap", new RunBudget(), "q", 2, "test");
+    expect(result.ids).toEqual(["a", "b"]);
+    expect(result.truncated).toBe("cap");
+  });
+
+  it("reports truncated: 'budget' when the run budget cannot afford a page", async () => {
+    stubPages([{ ids: ["a"], nextPageToken: "more" }]);
+    // Exactly one list call's worth: the second page is unaffordable.
+    const result = await listMessageIds("t-budget", new RunBudget(5), "q", 100, "test");
+    expect(result.ids).toEqual(["a"]);
+    expect(result.truncated).toBe("budget");
+  });
+
+  it("reports truncated: 'time' when the deadline has passed", async () => {
+    stubPages([]);
+    const result = await listMessageIds(
+      "t-time",
+      new RunBudget(),
+      "q",
+      100,
+      "test",
+      Date.now() - 1,
+    );
+    expect(result.ids).toEqual([]);
+    expect(result.truncated).toBe("time");
+  });
+});
+
+/** internalDate is the backfill cursor's key — see GmailHeaderSet. */
+describe("fetchHeaders internalDate mapping", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("maps Gmail's internalDate (epoch-ms string) onto internalDateMs", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        text: async () => "",
+        json: async () => ({
+          id: "m1",
+          threadId: "t1",
+          internalDate: "1755500000000",
+          payload: { headers: [{ name: "From", value: "Ava <ava@example.com>" }] },
+        }),
+      })),
+    );
+
+    const [header] = await fetchHeaders("t-internal", new RunBudget(), ["m1"], "test");
+    expect(header.internalDateMs).toBe(1_755_500_000_000);
+    expect(header.from).toBe("Ava <ava@example.com>");
   });
 });

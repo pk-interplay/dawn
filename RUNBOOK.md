@@ -58,13 +58,14 @@ Set these on the deployment (see `.env.example` for the full annotated list):
 | Variable | Value for the pilot |
 |---|---|
 | `APP_URL` | the deployed HTTPS URL — **not** localhost |
-| `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `NEXT_PUBLIC_*` | as usual |
+| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | **both required by the app** — every route reads the DB through the service-role client (`app/lib/db.ts`); the publishable key is dead since migration 0041 and is not set anywhere |
 | `OPENAI_API_KEY` | **required** — no embeddings means no member is ever matched |
 | `ANTHROPIC_API_KEY` | required by `run-matches` |
-| `CRON_SECRET` | long random string; gates `/api/cron/*` |
+| `CRON_SECRET` | long random string; gates `/api/cron/*`. Also lives in Vault (`dawn_cron_secret`) — rotate both, then re-run `select schedule_dawn_jobs();` |
+| `INBOUND_WEBHOOK_SECRET` | long random string, **different from CRON_SECRET**; gates `/api/agent/inbound` (the AgentMail webhook sends it) |
+| `ALLOWED_EMAIL_DOMAINS` / `ALLOWED_EMAILS` | the sign-in allowlist — nobody signs in while both are unset |
 | `ADMIN_EMAILS` / `ADMIN_EMAIL_DOMAINS` | your address / your domain, for `/admin/monitor` |
-| `RESEND_API_KEY`, `AUTH_SENDER_EMAIL` | required for password reset — see step 2b |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `AUTH_SECRET` | Gmail ingest sign-in (`src/auth.ts`) |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `AUTH_SECRET` | Google sign-in + Gmail ingest (`src/auth.ts`) |
 
 ### Email variables
 
@@ -157,9 +158,13 @@ the judgement is in `triage.ts`, and the invariant is that **every inbound messa
 exactly one `inbound_events` row, including the ones Dawn refuses** — that row is
 simultaneously the replay guard, the rate-limit counter, and the audit trail.
 
-Register the `agentmail-webhook` Edge Function to POST at
-`${APP_URL}/api/agent/inbound` with `Authorization: Bearer $CRON_SECRET`. Nothing will
-arrive until delivery is on and someone replies, but the route is safe to enable now.
+Point the AgentMail webhook **directly** at `${APP_URL}/api/agent/inbound` (dashboard or
+SDK), with a custom header `Authorization: Bearer <INBOUND_WEBHOOK_SECRET>` — AgentMail
+stores custom webhook headers write-only server-side. Subscribe to both
+`message.received` and `message.received.unauthenticated`; the route infers SPF/DKIM
+status from the event name. The old `agentmail-webhook` Edge Function is retired —
+delete any webhook still pointing at it. Nothing will arrive until delivery is on and
+someone replies, but the route is safe to enable now.
 
 To forward replies by hand while `APP_URL` points somewhere you can't reach:
 
@@ -179,9 +184,10 @@ had no mechanism behind it for anyone who wasn't a member.
 
 ## 5. Onboard the team (day 0)
 
-Send them the `/join` link. They sign up, talk to Dawn (or upload a LinkedIn PDF), and
-land on a screen that tells them they're in, what's coming, and that the counterparts
-are simulated.
+Add their address or domain to the sign-in allowlist (`ALLOWED_EMAILS` /
+`ALLOWED_EMAIL_DOMAINS`), then send them the app URL. They sign in with Google at `/`
+(there is no `/join` any more — Google sign-in IS onboarding) and land in the Gmail
+ingest flow.
 
 Then confirm each of them actually landed:
 
@@ -264,9 +270,9 @@ What to check:
   agent explains its reasoning there, including when it declined to open anything.
 - `agent_notes` — has it written anything, and is it specific enough to be useful?
 
-The Intros tab shows the same runs by state, and `/admin/console` → Network runs matching
-for one person and records a Pass, which is the same rejection signal the calibration
-loop reads.
+The Intros tab shows the same runs by state. (`/admin/console` is gone — trigger a
+one-person run with `curl -X POST "$APP_URL/api/cron/run-matches?person_id=<uuid>" -H
+"Authorization: Bearer $CRON_SECRET"` instead.)
 
 ## 9. Play the other side (daily) — needs delivery on
 
@@ -300,7 +306,9 @@ delete from sends where status = 'draft';
 ```
 
 (Deleting the drafts also frees the idempotency key, so those pairs can be re-opened
-properly on the next run rather than colliding.)
+properly on the next run rather than colliding. Sends that TRIED and failed carry
+`status = 'failed'` since migration 0042, so this cleanup no longer destroys the
+evidence of failures — leave those rows alone; the gateway retries them itself.)
 
 Then:
 

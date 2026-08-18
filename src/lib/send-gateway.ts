@@ -23,10 +23,12 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import {
   AGENTMAIL_INBOX_ID,
+  AgentMailError,
   agentMailConfigured,
   replyToMessage,
   sendEmail,
 } from "./agentmail";
+import { withRetry, type Classified } from "./retry";
 
 export { AGENTMAIL_INBOX_ID };
 
@@ -69,6 +71,27 @@ function deliveryEnabled(): boolean {
 const RATE_WINDOW_MINUTES = 60;
 const MAX_PER_IDENTITY_PER_WINDOW = 60;
 const MAX_PER_DOMAIN_PER_WINDOW = 10;
+
+/**
+ * Provider-failure classification for the transmit step. A transient AgentMail
+ * 429 or 5xx used to be treated exactly like a permanent rejection — one blip
+ * expired an opt-in or burned a nudge attempt. The idempotencyKey the transmit
+ * already carries is what makes these retries safe: the provider dedupes a
+ * request that actually landed.
+ */
+function classifyAgentMailFailure(err: unknown): Classified {
+  if (err instanceof AgentMailError) {
+    const status = err.statusCode;
+    if (status === 429) return { kind: "rate", retryable: true, baseMs: 2000 };
+    if (status !== undefined && status >= 500) return { kind: "transient", retryable: true, baseMs: 1000 };
+    if (status === undefined) return { kind: "transient", retryable: true, baseMs: 1000 }; // network/timeout
+    return { kind: "terminal", retryable: false }; // 400/401/403/404/422
+  }
+  if (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError")) {
+    return { kind: "transient", retryable: true, baseMs: 1000 };
+  }
+  return { kind: "terminal", retryable: false };
+}
 
 /** Outreach kinds — the four messages an introduction produces. */
 export type OutreachKind = "opt_in_a" | "opt_in_b" | "introduction" | "nudge";
@@ -320,26 +343,69 @@ export async function send(client: SupabaseClient, p: SendParams): Promise<Deliv
     .select("id")
     .single();
 
-  if (insErr) {
-    // 23505 = unique violation on (introduction_id, kind, attempt). This is the gate
-    // WORKING: something already sent this exact message. A duplicate is a no-op, not a
-    // failure, so it returns rather than throwing — the caller's state machine has
-    // already done whatever this send was meant to accompany.
-    if (insErr.code === "23505") {
-      console.warn(
-        `[send-gateway] duplicate suppressed → ${p.kind}#${attempt} for introduction ${p.introductionId}`,
-      );
-      return notDelivered("duplicate", "duplicate");
-    }
-    // Anything else — RLS, FK violation, connection loss — is the failure mode that
-    // caused the incident this gate exists for. Fail closed, loudly.
-    throw new Error(
-      `Refusing to send: could not write the send ledger (${insErr.message}). ` +
-        `Nothing was transmitted.`,
-    );
-  }
+  let sendId: number;
+  let retriedFailedRow = false;
 
-  const sendId = row.id as number;
+  if (insErr) {
+    // 23505 = unique violation on (introduction_id, kind, attempt). Usually this is
+    // the gate WORKING: something already sent this exact message, and a duplicate is
+    // a no-op, not a failure. The exception is a prior row that TRIED and FAILED —
+    // without this branch a failed send permanently claims its idempotency slot and
+    // can never be retried, which is how a transient provider error became a
+    // permanently unsent warm introduction.
+    if (insErr.code === "23505") {
+      const { data: prior } = await client
+        .from("sends")
+        .select("id, status")
+        .eq("introduction_id", p.introductionId!)
+        .eq("kind", p.kind)
+        .eq("attempt", attempt)
+        .maybeSingle();
+
+      if (prior?.status !== "failed") {
+        console.warn(
+          `[send-gateway] duplicate suppressed → ${p.kind}#${attempt} for introduction ${p.introductionId}`,
+        );
+        return notDelivered("duplicate", "duplicate");
+      }
+
+      // Reclaim the failed row. The `.eq("status", "failed")` makes this a
+      // conditional take: of two concurrent retries, exactly one flips the row back
+      // to draft and proceeds; the other matches zero rows and reports duplicate.
+      const { data: reclaimed, error: reclaimErr } = await client
+        .from("sends")
+        .update({
+          status: "draft",
+          failure_reason: null,
+          to_emails: recipients,
+          subject: p.subject,
+          body_sent: p.text,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", prior.id)
+        .eq("status", "failed")
+        .select("id");
+      if (reclaimErr) {
+        throw new Error(
+          `Refusing to send: could not reclaim failed sends#${prior.id} (${reclaimErr.message}).`,
+        );
+      }
+      if (!reclaimed?.length) return notDelivered("duplicate", "duplicate");
+
+      console.log(`[send-gateway] retrying previously failed sends#${prior.id} (${p.kind}#${attempt})`);
+      sendId = prior.id as number;
+      retriedFailedRow = true;
+    } else {
+      // Anything else — RLS, FK violation, connection loss — is the failure mode that
+      // caused the incident this gate exists for. Fail closed, loudly.
+      throw new Error(
+        `Refusing to send: could not write the send ledger (${insErr.message}). ` +
+          `Nothing was transmitted.`,
+      );
+    }
+  } else {
+    sendId = row.id as number;
+  }
 
   // ---- Gate 5: the delivery switch ----------------------------------------
   if (!deliveryEnabled()) {
@@ -362,21 +428,37 @@ export async function send(client: SupabaseClient, p: SendParams): Promise<Deliv
 
   // ---- Gate 6: transmit ---------------------------------------------------
   try {
-    const idempotencyKey = `sends-${sendId}`;
+    // A reclaimed row gets a fresh key: some providers dedupe against the FAILED
+    // attempt's key. Within one call the key is stable, so withRetry's own
+    // attempts are still provider-deduped.
+    const idempotencyKey = retriedFailedRow ? `sends-${sendId}-r${Date.now()}` : `sends-${sendId}`;
+    const transmitPolicy = {
+      classify: classifyAgentMailFailure,
+      attempts: 3,
+      label: `[send-gateway] sends#${sendId}`,
+    };
     const res = p.replyToMessageId
-      ? await replyToMessage({
-          messageId: p.replyToMessageId,
-          text: p.text,
-          inboxId: p.inboxId,
-          idempotencyKey,
-        })
-      : await sendEmail({
-          to: recipients,
-          subject: p.subject,
-          text: p.text,
-          inboxId: p.inboxId,
-          idempotencyKey,
-        });
+      ? await withRetry(
+          () =>
+            replyToMessage({
+              messageId: p.replyToMessageId!,
+              text: p.text,
+              inboxId: p.inboxId,
+              idempotencyKey,
+            }),
+          transmitPolicy,
+        )
+      : await withRetry(
+          () =>
+            sendEmail({
+              to: recipients,
+              subject: p.subject,
+              text: p.text,
+              inboxId: p.inboxId,
+              idempotencyKey,
+            }),
+          transmitPolicy,
+        );
 
     const { error: updErr } = await client
       .from("sends")
@@ -448,9 +530,13 @@ export async function send(client: SupabaseClient, p: SendParams): Promise<Deliv
 }
 
 async function markFailed(client: SupabaseClient, sendId: number, reason: string): Promise<void> {
+  // status: 'failed' (0042), not a failure_reason smeared onto a 'draft' — a
+  // failed send must be distinguishable from a deliberately-held draft in the
+  // Outbox, must not be deleted by draft cleanup, and (via the reclaim branch in
+  // send()) is what makes the send retryable at all.
   const { error } = await client
     .from("sends")
-    .update({ failure_reason: reason, updated_at: new Date().toISOString() })
+    .update({ status: "failed", failure_reason: reason, updated_at: new Date().toISOString() })
     .eq("id", sendId);
   if (error) console.error(`[send-gateway] could not record failure on sends#${sendId}: ${error.message}`);
 }

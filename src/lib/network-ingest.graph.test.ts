@@ -28,14 +28,17 @@ vi.mock("./gmail-ingest", async (importOriginal) => ({
   // Hands the headers to `onBatch` the way a real paged read does, so the contact
   // streaming the onboarding ticker depends on is exercised rather than assumed.
   fetchGmailActivity: vi.fn(
-    async (_token: string, onBatch?: (batch: GmailActivity["headers"]) => void) => {
-      onBatch?.(activity.current.headers);
+    async (
+      _token: string,
+      opts: { onBatch?: (batch: GmailActivity["headers"]) => void } = {},
+    ) => {
+      opts.onBatch?.(activity.current.headers);
       return activity.current;
     },
   ),
 }));
 
-const { ingestGmailNetwork } = await import("./network-ingest");
+const { ingestGmailNetwork, writeActivityToGraph } = await import("./network-ingest");
 
 // ---------------------------------------------------------------------------
 // A minimal in-memory PostgREST. Enough of the builder to serve the exact chains
@@ -61,6 +64,7 @@ interface EdgeRow {
   kind: string;
   source: string;
   strength: number;
+  observed_at?: string;
 }
 
 class FakeDb {
@@ -239,6 +243,18 @@ class Query {
   }
 
   private runEdges(): Result {
+    if (this.op === "select") {
+      // Incremental mode's prior-edges read: eq on from_id/kind/source, in on to_id.
+      const ids = this.filters.to_id;
+      const rows = this.db.edges.filter(
+        (e) =>
+          (this.filters.from_id === undefined || e.from_id === this.filters.from_id) &&
+          (this.filters.kind === undefined || e.kind === this.filters.kind) &&
+          (this.filters.source === undefined || e.source === this.filters.source) &&
+          (ids === undefined || (Array.isArray(ids) ? ids.includes(e.to_id) : e.to_id === ids)),
+      );
+      return { data: rows, error: null };
+    }
     const rows = (Array.isArray(this.payload) ? this.payload : [this.payload]) as Record<
       string,
       unknown
@@ -444,5 +460,101 @@ describe("ingestGmailNetwork — the batched graph write", () => {
     // itself must collapse them into one entity either way.
     expect(new Set(streamed)).toEqual(new Set(["ava@example.com", "ben@example.com"]));
     expect(db.edges).toHaveLength(2);
+  });
+});
+
+describe("writeActivityToGraph — incremental mode over a backfill delta", () => {
+  let db: FakeDb;
+
+  const DAY_MS = 86_400_000;
+
+  /** Seed the viewer, Ava, and an existing gmail edge between them. */
+  function seedPriorEdge(strength: number, observedAt: string): { you: string; ava: string } {
+    const you = db.newEntityId();
+    db.entities.push({ id: you, kind: "person", display_name: "You" });
+    db.claims.push({
+      id: db.newClaimId(),
+      subject_id: you,
+      attribute: "email",
+      value: YOU,
+      source: "identity",
+      superseded_by: null,
+    });
+    const ava = db.newEntityId();
+    db.entities.push({ id: ava, kind: "person", display_name: "Ava Chen" });
+    db.claims.push({
+      id: db.newClaimId(),
+      subject_id: ava,
+      attribute: "email",
+      value: "ava@example.com",
+      source: "identity",
+      superseded_by: null,
+    });
+    db.edges.push({
+      from_id: you,
+      to_id: ava,
+      kind: "knows",
+      source: `gmail:${YOU}`,
+      strength,
+      observed_at: observedAt,
+    });
+    return { you, ava };
+  }
+
+  function activityDated(dateMs: number): GmailActivity {
+    return {
+      headers: [
+        {
+          from: `You <${YOU}>`,
+          to: "Ava Chen <ava@example.com>",
+          date: new Date(dateMs).toUTCString(),
+          subject: "Hello from the past",
+        },
+      ],
+      events: [],
+    };
+  }
+
+  beforeEach(() => {
+    db = new FakeDb();
+  });
+
+  it("adds an older window's delta without regressing the edge's observed_at", async () => {
+    // The backfill's shape: the edge already encodes recent mail, and the delta
+    // is strictly older. The prior must decay by ~nothing (it is fresh), the old
+    // mail must add its own decayed weight, and — the bug this locks out — the
+    // edge's decay anchor must stay at the recent timestamp, or the next pass
+    // would decay the combined strength as if it were months stale.
+    const priorObservedAt = new Date().toISOString();
+    const { you, ava } = seedPriorEdge(0.4, priorObservedAt);
+
+    const oldMailMs = Date.now() - 120 * DAY_MS;
+    const summary = await writeActivityToGraph(fakeClient(db), YOU, activityDated(oldMailMs), {
+      mode: "incremental",
+    });
+    expect(summary.failures).toEqual([]);
+
+    const edge = db.edges.find((e) => e.from_id === you && e.to_id === ava);
+    expect(edge).toBeDefined();
+    // 0.4 carried (fresh prior, negligible decay) + one 120-day-old email at
+    // 0.5^(120/90) ≈ 0.397 — grew, and did not replace recent signal with old.
+    expect(edge!.strength).toBeGreaterThan(0.4);
+    expect(edge!.strength).toBeCloseTo(0.4 + Math.pow(0.5, 120 / 90), 1);
+    expect(edge!.observed_at).toBe(priorObservedAt);
+  });
+
+  it("advances observed_at when the delta is newer than the edge", async () => {
+    // The hourly sync's shape: fresh mail lands on a stale edge. The anchor moves
+    // forward — the clamp is a floor, not a freeze.
+    const priorObservedAt = new Date(Date.now() - 100 * DAY_MS).toISOString();
+    const { you, ava } = seedPriorEdge(0.4, priorObservedAt);
+
+    const freshMailMs = Date.now() - 60_000;
+    await writeActivityToGraph(fakeClient(db), YOU, activityDated(freshMailMs), {
+      mode: "incremental",
+    });
+
+    const edge = db.edges.find((e) => e.from_id === you && e.to_id === ava);
+    expect(Date.parse(edge!.observed_at!)).toBeGreaterThan(Date.parse(priorObservedAt));
   });
 });

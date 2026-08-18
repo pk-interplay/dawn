@@ -20,9 +20,10 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowRight, Loader2, Pencil, RefreshCw, X } from "lucide-react";
+import { ArrowRight, Check, Loader2, Pencil, RefreshCw, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import { DawnMark } from "../components/DawnMark";
 
 interface ProfileDraft {
@@ -51,65 +52,6 @@ type Stage =
   // visibility, and saying only "you're in the network" would be the wrong half.
   | { name: "partial"; message: string }
   | { name: "error"; message: string };
-
-const INGEST_LINES = [
-  "Reading who you email and meet — metadata only, never message content.",
-  "Six months of Gmail and Calendar takes a moment.",
-  "Working out what you're known for.",
-];
-
-/** Past this with no counter movement, say why rather than showing a frozen number. */
-const PACING_HINT_MS = 12_000;
-
-interface StreamedContact {
-  name: string;
-  email: string;
-}
-
-/** What the synthesis is working from, streamed the moment it's counted. */
-interface Evidence {
-  subjects: number;
-  domains: number;
-  events: number;
-}
-
-/** The route's heartbeat: which phase it's in, and how far through it is. */
-interface Progress {
-  phase: string;
-  done: number;
-  total: number;
-  /** How long the counters have been still. Long stalls are the quota window, not a fault. */
-  stalledMs: number;
-}
-
-/** Phase → what to tell the user it's doing. Anything unrecognised falls back to copy. */
-const PHASE_LABEL: Record<string, string> = {
-  reading: "Opening your mailbox…",
-  reading_sent: "Reading the mail you've sent…",
-  reading_received: "Reading who's been writing to you…",
-  writing: "Saving your network…",
-  synthesizing: "Working out what you're known for…",
-};
-
-/** The ordered steps shown as a checklist, and which phases satisfy each. */
-const STEPS: { key: string; label: string; phases: string[] }[] = [
-  { key: "sent", label: "Your sent mail", phases: ["reading", "reading_sent"] },
-  { key: "received", label: "Your correspondents", phases: ["reading_received"] },
-  { key: "graph", label: "Your network", phases: ["writing"] },
-  { key: "profile", label: "Your profile", phases: ["synthesizing"] },
-];
-
-/** The draft mid-write: any field may be missing or half-finished. */
-type PartialDraft = Partial<Omit<ProfileDraft, "expertise" | "interests" | "goals" | "suggestedIntros">> & {
-  expertise?: (string | undefined)[];
-  interests?: (string | undefined)[];
-  goals?: (string | undefined)[];
-  suggestedIntros?: (string | undefined)[];
-};
-
-/** Drop the holes a streaming array has while an item is still being written. */
-const settled = (items?: (string | undefined)[]) =>
-  (items ?? []).filter((s): s is string => typeof s === "string" && s.trim().length > 0);
 
 const THIN_REASON: Record<string, string> = {
   not_enough_activity: "There isn't enough recent sent mail yet to say anything real about you.",
@@ -148,20 +90,14 @@ export function OnboardingFlow({
   const [stage, setStage] = useState<Stage>(
     initialDraft ? { name: "review", draft: initialDraft, ingest: null } : { name: "ingesting" },
   );
-  const [line, setLine] = useState(0);
   const [busy, setBusy] = useState(false);
   // The optional steer on the review screen: an expander plus its free text.
   const [showGuidance, setShowGuidance] = useState(false);
   const [guidance, setGuidance] = useState("");
-  // Correspondents streamed back from the ingest, newest last. Feeds the live ticker.
-  const [contacts, setContacts] = useState<StreamedContact[]>([]);
-  // What the synthesis is reading, and the draft as it's written. Both arrive during
-  // the wait that used to be a bare spinner.
-  const [evidence, setEvidence] = useState<Evidence | null>(null);
-  const [partial, setPartial] = useState<PartialDraft | null>(null);
-  // The heartbeat from the route. Doubles as the "still alive" signal for the watchdog
-  // and as the only thing to show during the graph write, which streams no contacts.
-  const [progress, setProgress] = useState<Progress | null>(null);
+  // Which setup steps have finished. Email and Calendar run concurrently
+  // server-side and may complete in either order; display order is fixed in
+  // SetupChecklist below.
+  const [stepDone, setStepDone] = useState({ email: false, calendar: false });
   // Expertise/interests/goals the user dismissed, lowercased. Never written as claims.
   const [hidden, setHidden] = useState<Set<string>>(new Set());
   // The asks box. Seeded from the model's suggestions, then it's the user's text.
@@ -173,8 +109,8 @@ export function OnboardingFlow({
     setHidden((prev) => new Set(prev).add(item.toLowerCase()));
   }, []);
   const unhideAll = useCallback(() => setHidden(new Set()), []);
-  // StrictMode mounts effects twice in dev. Without this guard the ingest — six months
-  // of Gmail and a Sonnet call — runs twice on every local load.
+  // StrictMode mounts effects twice in dev. Without this guard the ingest — a
+  // Gmail read and a Sonnet call — runs twice on every local load.
   const started = useRef(false);
 
   useEffect(() => {
@@ -215,30 +151,30 @@ export function OnboardingFlow({
           throw new Error(body.error ?? `Sync failed (${res.status})`);
         }
 
-        // The route streams newline-delimited JSON: a "contact" per correspondent as
-        // it's found, "progress" heartbeats throughout, then a terminal "result" or
-        // "error". Read incrementally and hold a buffer for the partial trailing line
-        // each chunk leaves behind.
+        // The route streams newline-delimited JSON: "progress" heartbeats throughout,
+        // a "step" when the calendar leg lands, then a terminal "result" or "error".
+        // It also still emits "contact"/"evidence"/"draft_partial" for older clients;
+        // those fall through `handle` unrendered — the checklist is the whole show.
+        // Read incrementally and hold a buffer for the partial trailing line each
+        // chunk leaves behind.
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
 
         const handle = (event: Record<string, unknown>) => {
-          if (event.type === "contact") {
-            const name = String(event.name ?? "");
-            const email = String(event.email ?? "");
-            setContacts((prev) => [...prev, { name, email }]);
-          } else if (event.type === "progress") {
-            setProgress({
-              phase: String(event.phase ?? ""),
-              done: Number(event.done ?? 0),
-              total: Number(event.total ?? 0),
-              stalledMs: Number(event.stalledMs ?? 0),
-            });
-          } else if (event.type === "evidence") {
-            setEvidence(event.evidence as Evidence);
-          } else if (event.type === "draft_partial") {
-            setPartial(event.draft as PartialDraft);
+          if (event.type === "progress") {
+            const phase = String(event.phase ?? "");
+            // The route's Promise.all guarantees ordering the events alone can't:
+            // reaching "writing" proves the calendar leg finished, and reaching
+            // "synthesizing" proves the whole Email leg (read + graph write) did.
+            // So the checklist works even if the `step` event never arrives.
+            if (phase === "writing")
+              setStepDone((s) => (s.calendar ? s : { ...s, calendar: true }));
+            if (phase === "synthesizing") setStepDone({ email: true, calendar: true });
+          } else if (event.type === "step") {
+            const step = String(event.step ?? "");
+            if (step === "email" || step === "calendar")
+              setStepDone((s) => ({ ...s, [step]: true }));
           } else if (event.type === "error") {
             terminal = true;
             setStage({ name: "error", message: String(event.error ?? "Something went wrong") });
@@ -312,9 +248,6 @@ export function OnboardingFlow({
     };
   }, [initialDraft]);
 
-  // The model has started producing something worth showing.
-  const writing = Boolean(partial && (partial.headline || partial.bio));
-
   // Seed the asks box from the model's guesses, once per draft. Keyed on the draft's
   // own suggestions so a regenerate reseeds, while a re-render never clobbers typing.
   useEffect(() => {
@@ -324,13 +257,6 @@ export function OnboardingFlow({
     seededFor.current = key;
     setAsks(stage.draft.suggestedIntros.join("\n"));
   }, [stage]);
-
-  // Rotate the waiting copy so a long ingest doesn't look stalled.
-  useEffect(() => {
-    if (stage.name !== "ingesting") return;
-    const id = setInterval(() => setLine((n) => (n + 1) % INGEST_LINES.length), 4500);
-    return () => clearInterval(id);
-  }, [stage.name]);
 
   const regenerate = useCallback(async (steer?: string) => {
     const guidanceText = steer?.trim() ?? "";
@@ -421,42 +347,7 @@ export function OnboardingFlow({
             {firstName ? `One moment, ${firstName}.` : "One moment."}
           </h1>
           <p className="text-muted-foreground mt-3 text-sm">This only happens once.</p>
-          <p className="text-dawn-bone mt-6 flex items-center gap-2 text-sm">
-            <Loader2 className="size-4 shrink-0 animate-spin" />
-            {writing
-              ? "Writing your profile…"
-              : ((progress && PHASE_LABEL[progress.phase]) ?? INGEST_LINES[line])}
-          </p>
-
-          {/* A running count, because the phases that take longest — the paced mailbox
-              read and the graph write — stream nothing else. A number that moves is the
-              difference between "working" and "hung". */}
-          {!writing && progress && progress.total > 0 && (
-            <p className="text-muted-foreground mt-2 text-xs tabular-nums">
-              {progress.done.toLocaleString()} of {progress.total.toLocaleString()}
-              {progress.phase === "writing" ? " saved" : " messages"}
-              {progress.stalledMs > PACING_HINT_MS && (
-                <span className="ml-2 opacity-70">
-                  · paused for Gmail&rsquo;s rate limit, this is normal
-                </span>
-              )}
-            </p>
-          )}
-
-          {!writing && <StepList phase={progress?.phase} />}
-
-          {/* The ticker is the ingest's progress. Once synthesis starts it has nothing
-              left to say, so it yields to the draft rather than competing with it. */}
-          {!writing && <ContactTicker contacts={contacts} />}
-
-          {evidence && (
-            <p className="text-muted-foreground mt-4 text-xs">
-              Reading {evidence.subjects} subject lines you wrote, {evidence.domains}{" "}
-              organisations you correspond with, and {evidence.events} meetings.
-            </p>
-          )}
-
-          {writing && <DraftInProgress draft={partial} />}
+          <SetupChecklist email={stepDone.email} calendar={stepDone.calendar} />
         </div>
       )}
 
@@ -662,80 +553,6 @@ export function OnboardingFlow({
   );
 }
 
-/**
- * A ~4-line window of correspondents streaming in from the ingest, newest at the
- * bottom, older ones scrolling up under a fade. Purely presentational — it renders
- * whatever the stream has handed us so far. Shows only the tail so a 2,000-contact
- * mailbox doesn't mount 2,000 rows; the running count carries the sense of scale.
- */
-const TICKER_WINDOW = 4;
-
-function ContactTicker({ contacts }: { contacts: StreamedContact[] }) {
-  if (contacts.length === 0) return null;
-  const tail = contacts.slice(-TICKER_WINDOW);
-
-  return (
-    <div className="mt-6">
-      <div
-        className="relative h-[5.5rem] overflow-hidden"
-        // Fade the top edge so rows dissolve upward as new ones arrive.
-        style={{
-          maskImage: "linear-gradient(to bottom, transparent, black 38%)",
-          WebkitMaskImage: "linear-gradient(to bottom, transparent, black 38%)",
-        }}
-      >
-        <ul className="absolute inset-x-0 bottom-0 flex flex-col justify-end gap-1">
-          {tail.map((c, i) => (
-            // Key by position in the stream so each newly-arrived row remounts and
-            // replays its fade-in, while the rows above it stay put.
-            <li
-              key={`${contacts.length - tail.length + i}-${c.email}`}
-              className="dawn-enter flex items-baseline gap-2 text-sm"
-            >
-              <span className="text-dawn-bone truncate">{c.name || c.email}</span>
-              {c.name && c.name !== c.email && (
-                <span className="text-muted-foreground truncate text-xs">{c.email}</span>
-              )}
-            </li>
-          ))}
-        </ul>
-      </div>
-      <p className="text-dawn-head mt-2 text-[11px] font-medium tracking-[2.4px] uppercase">
-        {contacts.length} {contacts.length === 1 ? "person" : "people"} so far
-      </p>
-    </div>
-  );
-}
-
-/**
- * The draft as it's being written — same card as the review screen, minus the
- * controls, because acting on a half-written profile makes no sense. Fields appear
- * as the model reaches them, so the wait shows the actual work.
- */
-function DraftInProgress({ draft }: { draft: PartialDraft | null }) {
-  if (!draft) return null;
-
-  return (
-    <div className="border-dawn-btn bg-card dawn-enter mt-6 space-y-5 rounded-[--radius] border p-6">
-      {draft.headline && (
-        <p className="font-serif text-xl leading-snug tracking-[0.2px] text-dawn-bone">
-          {draft.headline}
-        </p>
-      )}
-      {draft.bio && (
-        <p className="text-sm leading-relaxed text-foreground">
-          {draft.bio}
-          {/* A cursor while the sentence is still arriving. */}
-          <span className="bg-dawn-bone ml-0.5 inline-block h-[1em] w-[2px] animate-pulse align-text-bottom" />
-        </p>
-      )}
-      <PillList label="Expertise" items={settled(draft.expertise)} />
-      <PillList label="Interests" items={settled(draft.interests)} />
-      <PillList label="Working toward" items={settled(draft.goals)} />
-    </div>
-  );
-}
-
 function Kicker({ children }: { children: React.ReactNode }) {
   return (
     <p className="text-dawn-head text-[11px] font-medium tracking-[2.4px] uppercase">{children}</p>
@@ -743,44 +560,42 @@ function Kicker({ children }: { children: React.ReactNode }) {
 }
 
 /**
- * The four things onboarding does, with the current one lit.
- *
- * A single spinner cannot distinguish "two seconds in" from "ninety seconds in", which
- * is most of why the wait felt broken. A list that fills in left to right answers "how
- * much of this is left" without promising a duration nobody can predict — the mailbox
- * read is paced against a quota and genuinely does not know when it will finish.
+ * The three things setup does. Email and Calendar tick independently — they run
+ * concurrently server-side and can finish in either order — and Profile setup
+ * starts once both are in. A checkmark answers "how much of this is left"
+ * without promising a duration nobody can predict: the mailbox read is paced
+ * against a quota and genuinely does not know when it will finish.
  */
-function StepList({ phase }: { phase?: string }) {
-  const current = phase ? STEPS.findIndex((s) => s.phases.includes(phase)) : 0;
-  if (current < 0) return null;
+function SetupChecklist({ email, calendar }: { email: boolean; calendar: boolean }) {
+  const items = [
+    { label: "Email", state: email ? "done" : "active" },
+    { label: "Calendar", state: calendar ? "done" : "active" },
+    { label: "Profile setup", state: email && calendar ? "active" : "todo" },
+  ] as const;
 
   return (
-    <ol className="mt-6 space-y-1.5">
-      {STEPS.map((step, i) => {
-        const state = i < current ? "done" : i === current ? "active" : "todo";
-        return (
-          <li
-            key={step.key}
-            className={`flex items-center gap-2.5 text-sm transition-opacity duration-500 ${
-              state === "todo" ? "opacity-35" : "opacity-100"
-            }`}
-          >
-            <span
-              aria-hidden
-              className={`size-1.5 shrink-0 rounded-full ${
-                state === "done"
-                  ? "bg-dawn-head"
-                  : state === "active"
-                    ? "bg-dawn-bone animate-pulse"
-                    : "bg-muted-foreground"
-              }`}
-            />
-            <span className={state === "active" ? "text-dawn-bone" : "text-muted-foreground"}>
-              {step.label}
-            </span>
-          </li>
-        );
-      })}
+    <ol className="mt-6 space-y-2">
+      {items.map(({ label, state }) => (
+        <li
+          key={label}
+          className={cn(
+            "text-muted-foreground flex items-center gap-2.5 text-sm transition-opacity duration-500",
+            state === "todo" && "opacity-35",
+          )}
+        >
+          {state === "done" ? (
+            <Check className="size-3.5 shrink-0 opacity-60" strokeWidth={2.5} />
+          ) : state === "active" ? (
+            <Loader2 className="size-3.5 shrink-0 animate-spin opacity-70" strokeWidth={2.5} />
+          ) : (
+            <span aria-hidden className="bg-muted-foreground size-1.5 shrink-0 rounded-full" />
+          )}
+          <span className={cn(state === "active" && "dawn-working text-dawn-bone")}>
+            {label}
+            {state === "active" && "…"}
+          </span>
+        </li>
+      ))}
     </ol>
   );
 }

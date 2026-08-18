@@ -10,7 +10,7 @@
 //   npx tsx src/scripts/replay-inbound.ts              # list what's replayable
 //   npx tsx src/scripts/replay-inbound.ts --send       # actually forward them
 //
-// Env: AGENTMAIL_API_KEY, AGENTMAIL_INBOX_ID, CRON_SECRET, LOCAL_APP_URL.
+// Env: AGENTMAIL_API_KEY, AGENTMAIL_INBOX_ID, INBOUND_WEBHOOK_SECRET, LOCAL_APP_URL.
 //
 // Safe to re-run: the route writes one `inbound_events` row per message_id and uses
 // it as a replay guard, so a message forwarded twice is recorded and ignored the
@@ -22,12 +22,12 @@ import "../lib/env";
 import { AGENTMAIL_INBOX_ID, listInboxMessages } from "../lib/agentmail";
 
 const APP = (process.env.LOCAL_APP_URL ?? "http://localhost:3000").replace(/\/$/, "");
-const SECRET = process.env.CRON_SECRET;
+const SECRET = process.env.INBOUND_WEBHOOK_SECRET;
 const SEND = process.argv.includes("--send");
 const LIMIT = Number(process.env.REPLAY_LIMIT ?? 20);
 
 if (!process.env.AGENTMAIL_API_KEY) throw new Error("AGENTMAIL_API_KEY is required.");
-if (!SECRET) throw new Error("CRON_SECRET is required — /api/agent/inbound would 401.");
+if (!SECRET) throw new Error("INBOUND_WEBHOOK_SECRET is required — /api/agent/inbound would 401.");
 
 /** The inbox's own address, so Dawn's own sends aren't replayed back at it. */
 const SELF = AGENTMAIL_INBOX_ID.toLowerCase();

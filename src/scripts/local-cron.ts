@@ -75,6 +75,14 @@ async function call(path: string): Promise<void> {
 async function tick(): Promise<void> {
   await call(`/api/cron/run-matches?synthetic=${SYNTHETIC}&limit=${BATCH}`);
 
+  // Mirrors the hourly dawn-sync-gmail job (0044). Cheap when nothing changed:
+  // history.list returns an empty delta and the pass no-ops.
+  await call(`/api/cron/sync-gmail`);
+
+  // Mirrors the hourly dawn-backfill-gmail job (0045). Cheap once drained: the
+  // selector finds no live cursor and the pass no-ops.
+  await call(`/api/cron/backfill-gmail`);
+
   // decay-proximity and expire-intros used to be folded in here so a local run
   // matched a scheduled deployment. Migration 0031 unschedules both — with the email
   // layer gone, `relationships` has no writer and `introductions` no longer grows, so

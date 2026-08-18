@@ -2,11 +2,23 @@ import { NextResponse } from "next/server";
 
 import { auth } from "../../../../src/auth";
 import { supabase } from "../../../../src/lib/supabase";
+import { getGoogleAccessToken } from "../../../../src/lib/google-account";
 import { ensureViewerEntity } from "../../../../src/lib/entity-identity";
 import { ingestGmailNetwork } from "../../../../src/lib/network-ingest";
-import type { GmailActivity } from "../../../../src/lib/gmail-ingest";
+import {
+  defaultLookbackDate,
+  fetchGmailHistoryId,
+  publicGoogleErrorMessage,
+  type GmailActivity,
+} from "../../../../src/lib/gmail-ingest";
+import {
+  claimSyncRow,
+  releaseSyncRow,
+  NoAccountRowError,
+} from "../../../../src/lib/gmail-sync";
 import {
   synthesizeProfile,
+  distillEvidence,
   describeEvidence,
   SYNTHESIS_MODEL,
 } from "../../../../src/lib/synthesize-profile";
@@ -27,9 +39,18 @@ import {
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-// Gmail ingest pages through six months of metadata, then synthesis is a Sonnet call.
-// nexus used 60s for the same shape of work and occasionally grazed it.
+// Gmail ingest pages through the shallow window's metadata, then synthesis is a
+// Sonnet call. The ceiling stays generous: an outlier-busy 30 days plus a slow
+// model call must still end with a reported result, not a platform kill.
 export const maxDuration = 300;
+
+/**
+ * How much mailbox the interactive ingest reads. 30 days is enough to saturate
+ * profile synthesis (MAX_SUBJECTS caps at 120 outbound subjects) and keeps the
+ * wait ~10–15s; everything older, back to defaultLookbackDate(), is drained by
+ * the backfill cron (dawn-backfill-gmail) after the user is already in.
+ */
+const SHALLOW_WINDOW_DAYS = 30;
 
 /**
  * How long this route gives itself, against the maxDuration above.
@@ -50,6 +71,8 @@ const HEARTBEAT_MS = 2_000;
  * in live rather than a spinner. Event shapes on the wire:
  *   {"type":"contact","name":"…","email":"…"}   — one per unique correspondent, as found
  *   {"type":"progress","phase":…,"done":…,"total":…} — heartbeat; also proves liveness
+ *   {"type":"step","step":"calendar"}           — the calendar leg finished (it runs
+ *                                                 concurrently with the Gmail read)
  *   {"type":"evidence","evidence":…}            — what synthesis is reading
  *   {"type":"draft_partial","draft":…}          — the draft as it is written
  *   {"type":"error","error":"…"}                — ingest failed; nothing usable
@@ -66,18 +89,48 @@ export async function POST() {
   if (!session?.user?.id || !session.user.email) {
     return NextResponse.json({ error: "Not signed in" }, { status: 401 });
   }
-  if (!session.accessToken) {
-    // The refresh path in src/auth.ts clears accessToken when it cannot renew, which
-    // is a real state, not a bug: the Google grant was revoked or expired past repair.
+
+  // Server-side token first (google_accounts): it refreshes mid-run-capable
+  // tokens on demand and persists rotation, where the cookie token was
+  // snapshotted once and could die partway through a 270s run. The cookie is
+  // the fallback for sessions that predate the store.
+  const tokenResult = await getGoogleAccessToken(supabase, session.user.id);
+  const accessToken = tokenResult.ok ? tokenResult.accessToken : session.accessToken;
+  if (!accessToken) {
     return NextResponse.json(
-      { error: "Your Google access expired. Sign in again to reconnect Gmail." },
+      {
+        error:
+          !tokenResult.ok && tokenResult.reason === "revoked"
+            ? "Google access was revoked. Sign in again to reconnect Gmail."
+            : "Your Google access expired. Sign in again to reconnect Gmail.",
+      },
       { status: 401 },
     );
   }
-  const accessToken = session.accessToken;
   const name = session.user.name ?? null;
 
   const viewer = await ensureViewerEntity(supabase, session);
+
+  // Mailbox mutex (gmail_sync_state claim): a double-click, an impatient
+  // refresh, or the hourly sync must not read this mailbox concurrently — two
+  // paced reads burn double the per-minute quota and 429 each other. Sessions
+  // that predate the credential store have no row to claim; they proceed
+  // unguarded, as before.
+  let guarded = false;
+  try {
+    if (!(await claimSyncRow(supabase, session.user.id))) {
+      return NextResponse.json(
+        { error: "An import is already running for this account. Give it a minute." },
+        { status: 409 },
+      );
+    }
+    guarded = true;
+  } catch (err) {
+    if (!(err instanceof NoAccountRowError)) {
+      console.error("[onboarding] sync claim failed; proceeding unguarded:", err);
+    }
+  }
+  const googleSub = session.user.id;
 
   const startedAt = Date.now();
   const deadline = startedAt + RUN_BUDGET_MS;
@@ -142,11 +195,26 @@ export async function POST() {
       // most of that, so reading it twice in one request 403s on the second pass.
       let activity: GmailActivity | undefined;
 
+      // Baseline for the incremental sync, captured BEFORE the read so anything
+      // arriving mid-ingest gets replayed by the first sync pass (the graph
+      // writes are idempotent upserts, so the overlap is free). Best-effort —
+      // a missing baseline costs one stale-history fallback later, not the run.
+      let historyId: string | null = null;
+      try {
+        historyId = await fetchGmailHistoryId(accessToken, viewer.email);
+      } catch (err) {
+        console.warn("[onboarding] could not capture history baseline:", err);
+      }
+
       try {
         try {
           const seen = new Set<string>();
           ingest = await ingestGmailNetwork(supabase, accessToken, viewer.email, {
             deadline,
+            // Shallow window: the last SHALLOW_WINDOW_DAYS only. No `before` —
+            // it runs right up to now, and the backfill takes everything older.
+            window: { after: new Date(startedAt - SHALLOW_WINDOW_DAYS * 86_400_000) },
+            onCalendarDone: () => send({ type: "step", step: "calendar" }),
             onContact: (contact) => {
               if (seen.has(contact.email)) return;
               seen.add(contact.email);
@@ -170,10 +238,28 @@ export async function POST() {
             failures: ingest.failures.length,
             truncated: ingest.truncated,
           });
+
+          // Stash the distilled evidence so Regenerate never re-reads the
+          // mailbox (see synthesize-profile.ts DistilledEvidence). Written even
+          // when synthesis below fails — that failure is exactly when the user
+          // will press Regenerate.
+          if (activity) {
+            const { error: evErr } = await supabase.from("profile_drafts").upsert(
+              {
+                entity_id: viewer.entityId,
+                evidence: distillEvidence(activity, viewer.email),
+                model: SYNTHESIS_MODEL,
+              },
+              { onConflict: "entity_id" },
+            );
+            if (evErr) console.error("[onboarding] failed to stash evidence:", evErr.message);
+          }
         } catch (err) {
-          const message = err instanceof Error ? err.message : "Gmail ingest failed";
-          console.error("[onboarding] ingest failed:", message);
-          send({ type: "error", error: message });
+          // Full detail (URL, Google's response body) belongs in the log; the client
+          // gets a sanitized line — googleFetch errors would otherwise put raw Google
+          // error payloads on the onboarding screen.
+          console.error("[onboarding] ingest failed:", err);
+          send({ type: "error", error: publicGoogleErrorMessage(err) });
           return;
         }
 
@@ -255,16 +341,40 @@ export async function POST() {
           evidenceNote: describeEvidence(synthesis.evidence),
         });
       } catch (err) {
-        // Anything unforeseen. Better a reported error than a stream that stops.
+        // Anything unforeseen. Better a reported error than a stream that stops —
+        // but sanitized: raw messages here can carry request URLs and response bodies.
         console.error("[onboarding] unexpected ingest failure:", err);
         if (!terminal) {
-          send({
-            type: "error",
-            error: err instanceof Error ? err.message : "Something went wrong during setup",
-          });
+          send({ type: "error", error: "Something went wrong during setup. Please try again." });
         }
       } finally {
         clearInterval(heartbeat);
+        // Hand the mailbox back, and — on success — record the sync baseline so
+        // the hourly dawn-sync-gmail job takes over from exactly this point,
+        // plus the backfill window so dawn-backfill-gmail drains everything
+        // older than the shallow read. Seeded even when the ingest truncated:
+        // the backfill covers strictly older mail either way, and
+        // last_full_ingest_at is now the backfill's to set, when it drains.
+        if (guarded) {
+          try {
+            await releaseSyncRow(
+              supabase,
+              googleSub,
+              ingest
+                ? {
+                    ok: true,
+                    historyId: historyId ?? undefined,
+                    backfillBefore: new Date(
+                      startedAt - SHALLOW_WINDOW_DAYS * 86_400_000,
+                    ).toISOString(),
+                    backfillUntil: defaultLookbackDate(new Date(startedAt)).toISOString(),
+                  }
+                : { ok: false, error: "onboarding ingest did not complete" },
+            );
+          } catch (err) {
+            console.error("[onboarding] failed to release sync claim:", err);
+          }
+        }
         // The contract: never close without saying how it went. If we get here with no
         // terminal event something returned by a path that forgot to send one, and a
         // reported error is strictly better than the silent close that leaves the

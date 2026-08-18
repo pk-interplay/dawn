@@ -1,4 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { z } from "zod";
 import { embed } from "./openai";
 
 /**
@@ -21,6 +22,11 @@ const SUMMARY_SCHEMA = {
   additionalProperties: false,
 } as const;
 
+// Runtime twin of SUMMARY_SCHEMA. min(1) matters: this runs on every profile
+// save, and an absent/empty summary used to flow straight into embed(undefined)
+// — an OpenAI 400 with a stack trace pointing nowhere near the actual bug.
+const SummarySchema = z.object({ summary: z.string().min(1) });
+
 export async function summarizeEntity(client: SupabaseClient, entityId: string): Promise<{ summary: string; embedding: number[] }> {
   const { data: attrs, error } = await client
     .from("resolved_attributes")
@@ -29,24 +35,27 @@ export async function summarizeEntity(client: SupabaseClient, entityId: string):
   if (error) throw new Error(`summarizeEntity lookup failed: ${error.message}`);
 
   const { anthropic, textOf } = await import("./anthropic");
-  const resp = await anthropic.messages.create({
-    model: "claude-haiku-4-5-20251001",
-    max_tokens: 1024,
-    output_config: { format: { type: "json_schema", schema: SUMMARY_SCHEMA } },
-    messages: [
-      {
-        role: "user",
-        content:
-          `Claims about a person or organization, each with a method (self_reported/enriched/inferred/manual) ` +
-          `and confidence: ${JSON.stringify(attrs ?? [])}\n\n` +
-          `Write a 2-4 sentence prose summary suitable for embedding and semantic search. ` +
-          `Prefer self-reported and higher-confidence claims; mention low-confidence or contested claims only if nothing else is available.`,
-      },
-    ],
-  });
-
-  const parsed = JSON.parse(textOf(resp));
-  const summary: string = parsed.summary;
+  const { callClaude, MODELS } = await import("./llm");
+  const summary = await callClaude(
+    () =>
+      anthropic.messages.create({
+        model: MODELS.cheap,
+        max_tokens: 1024,
+        output_config: { format: { type: "json_schema", schema: SUMMARY_SCHEMA } },
+        messages: [
+          {
+            role: "user",
+            content:
+              `Claims about a person or organization, each with a method (self_reported/enriched/inferred/manual) ` +
+              `and confidence: ${JSON.stringify(attrs ?? [])}\n\n` +
+              `Write a 2-4 sentence prose summary suitable for embedding and semantic search. ` +
+              `Prefer self-reported and higher-confidence claims; mention low-confidence or contested claims only if nothing else is available.`,
+          },
+        ],
+      }),
+    (resp) => SummarySchema.parse(JSON.parse(textOf(resp))).summary,
+    { label: "[summarizeEntity]", retryParse: true },
+  );
   const embedding = await embed(summary);
 
   const { error: updateError } = await client

@@ -7,6 +7,12 @@ const SELECT_FIELDS =
   "id, name, headline, bio, offering, looking_for, goals, background, tags, industry, career_stage, location, meeting_format, ask_must_haves, ask_nice_to_haves, email, timezone, intro_cadence, paused";
 
 export async function GET() {
+  // Member data (emails, bios, goals) — signed-in members only, same gate as POST.
+  const auth = await requireUser();
+  if (!auth.ok) {
+    return NextResponse.json({ error: auth.error }, { status: auth.status });
+  }
+
   const { data, error } = await db.from("people").select(SELECT_FIELDS).order("name");
 
   if (error) {

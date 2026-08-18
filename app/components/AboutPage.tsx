@@ -242,7 +242,18 @@ function SiteFooter() {
   );
 }
 
-export async function AboutPage() {
+/** Shown when the allowlist bounced a sign-in (`/?error=AccessDenied`). Quiet on
+ *  purpose: it names neither the list nor the reason, just the path forward. */
+function InviteOnlyNotice() {
+  return (
+    <div className="mx-auto mt-6 max-w-[640px] rounded-md border border-border bg-card px-6 py-4 text-center text-[15px] leading-relaxed text-muted-foreground">
+      Dawn is invite-only right now — that Google account isn&apos;t on the pilot list. Ask
+      the operator to add you, then try again.
+    </div>
+  );
+}
+
+export async function AboutPage({ denied = false }: { denied?: boolean } = {}) {
   // Server component, so the rail renders in its signed-in state on first paint
   // rather than flashing the signed-out one.
   const session = await auth();
@@ -253,6 +264,7 @@ export async function AboutPage() {
     <DawnShell signedIn={signedIn} isAdmin={admin}>
       <div className="h-full overflow-y-auto">
         <TopBar />
+        {denied && <InviteOnlyNotice />}
         <main className={`mx-auto max-w-[980px] pb-[120px] max-[820px]:pb-20 ${GUTTER}`}>
           <Hero />
           <HowItWorks />

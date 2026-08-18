@@ -72,55 +72,9 @@ function startOfLocalDay(): Date {
   return d;
 }
 
-// ---- query rerank (mirrors app/api/find/route.ts) ---------------------------
+// ---- query rerank (shared with app/api/find/route.ts) -----------------------
 
-const QUERY_RERANK_SCHEMA = {
-  type: "object",
-  properties: {
-    people: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          id: { type: "string" },
-          name: { type: "string" },
-          score: { type: "number" },
-          rationale: { type: "string" },
-        },
-        required: ["id", "name", "score", "rationale"],
-        additionalProperties: false,
-      },
-    },
-  },
-  required: ["people"],
-  additionalProperties: false,
-} as const;
-
-async function rerankForQuery(
-  query: string,
-  candidates: Array<Record<string, unknown>>,
-): Promise<Array<{ id: string; name: string; score: number; rationale: string }>> {
-  const resp = await anthropic.messages.create(
-    {
-      model: "claude-opus-4-8",
-      max_tokens: 4000,
-      output_config: { format: { type: "json_schema", schema: QUERY_RERANK_SCHEMA } },
-      messages: [
-        {
-          role: "user",
-          content:
-            `A caller is looking for people matching this ask: "${query}"\n\n` +
-            `Candidates (with preliminary vector-similarity scores): ${JSON.stringify(candidates)}\n\n` +
-            `Rank the candidates who genuinely fit the ask, best first. For each, write a 1-3 sentence rationale that is specific about what this person offers that satisfies the ask — not just topical overlap. Assign a 0-1 score for strength of fit. Use the id and name values exactly as given. Omit candidates that don't actually fit.`,
-        },
-      ],
-    } as Parameters<typeof anthropic.messages.create>[0],
-    { timeout: 30_000 },
-  );
-  const parsed = JSON.parse(textOf(resp as never));
-  if (!Array.isArray(parsed?.people)) throw new Error("Claude returned malformed JSON — expected a `people` array.");
-  return parsed.people;
-}
+import { rerankForQuery } from "../lib/query-rerank";
 
 // ---- server & tools ---------------------------------------------------------
 
